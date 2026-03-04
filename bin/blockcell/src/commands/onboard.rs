@@ -423,7 +423,9 @@ fn ensure_auto_upgrade_defaults(json: &mut serde_json::Value) {
     if json["autoUpgrade"].get("channel").is_none() {
         json["autoUpgrade"]["channel"] = serde_json::json!("stable");
     }
-    if json["autoUpgrade"].get("manifestUrl").is_none() {
+    if json["autoUpgrade"].get("manifestUrl").is_none()
+        || json["autoUpgrade"]["manifestUrl"].as_str().unwrap_or("").is_empty()
+    {
         json["autoUpgrade"]["manifestUrl"] = serde_json::json!(
             "https://github.com/blockcell-labs/blockcell/releases/latest/download/manifest.json"
         );

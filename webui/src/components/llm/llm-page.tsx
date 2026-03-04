@@ -228,7 +228,7 @@ export function LLMPage() {
       const res = await testProvider({
         model,
         api_key: cfg.apiKey || '',
-        api_base: cfg.apiBase,
+        api_base: cfg.apiBase || kp?.defaultBase,
         proxy: cfg.proxy || undefined,
       });
       setTestResult({ ok: res.status === 'ok', msg: res.message });

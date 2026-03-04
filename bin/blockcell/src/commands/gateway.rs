@@ -945,7 +945,7 @@ async fn handle_config_test_provider(Json(req): Json<serde_json::Value>) -> impl
     }
 
     // Try a simple completion to test the connection
-    // Respect provider-specific proxy when provided by the WebUI.
+    // The WebUI sends the correct api_base (from form input with defaultBase fallback).
     let provider = blockcell_providers::OpenAIProvider::new_with_proxy(
         api_key,
         api_base,
@@ -2548,7 +2548,8 @@ async fn handle_channels_list(State(state): State<GatewayState>) -> impl IntoRes
             "configured": cfg.telegram.enabled && !cfg.telegram.token.is_empty(),
             "enabled": cfg.telegram.enabled,
             "fields": [
-                {"key": "token", "label": "Bot Token", "secret": true, "value": cfg.telegram.token.clone()}
+                {"key": "token", "label": "Bot Token", "secret": true, "value": cfg.telegram.token.clone()},
+                {"key": "proxy", "label": "Proxy (可选, 如 socks5://127.0.0.1:7890)", "secret": false, "value": cfg.telegram.proxy.clone().unwrap_or_default()}
             ]
         },
         {
@@ -2559,7 +2560,8 @@ async fn handle_channels_list(State(state): State<GatewayState>) -> impl IntoRes
             "configured": cfg.discord.enabled && !cfg.discord.bot_token.is_empty(),
             "enabled": cfg.discord.enabled,
             "fields": [
-                {"key": "botToken", "label": "Bot Token", "secret": true, "value": cfg.discord.bot_token.clone()}
+                {"key": "botToken", "label": "Bot Token", "secret": true, "value": cfg.discord.bot_token.clone()},
+                {"key": "channels", "label": "Channel IDs (逗号分隔)", "secret": false, "value": cfg.discord.channels.join(",")}
             ]
         },
         {
@@ -2571,7 +2573,9 @@ async fn handle_channels_list(State(state): State<GatewayState>) -> impl IntoRes
             "enabled": cfg.slack.enabled,
             "fields": [
                 {"key": "botToken", "label": "Bot Token", "secret": true, "value": cfg.slack.bot_token.clone()},
-                {"key": "appToken", "label": "App Token", "secret": true, "value": cfg.slack.app_token.clone()}
+                {"key": "appToken", "label": "App Token", "secret": true, "value": cfg.slack.app_token.clone()},
+                {"key": "channels", "label": "Channel IDs (逗号分隔)", "secret": false, "value": cfg.slack.channels.join(",")},
+                {"key": "pollIntervalSecs", "label": "轮询间隔 (秒)", "secret": false, "value": cfg.slack.poll_interval_secs.to_string()}
             ]
         },
         {
@@ -2583,7 +2587,9 @@ async fn handle_channels_list(State(state): State<GatewayState>) -> impl IntoRes
             "enabled": cfg.feishu.enabled,
             "fields": [
                 {"key": "appId", "label": "App ID", "secret": false, "value": cfg.feishu.app_id.clone()},
-                {"key": "appSecret", "label": "App Secret", "secret": true, "value": cfg.feishu.app_secret.clone()}
+                {"key": "appSecret", "label": "App Secret", "secret": true, "value": cfg.feishu.app_secret.clone()},
+                {"key": "encryptKey", "label": "Encrypt Key (事件加密密钥)", "secret": true, "value": cfg.feishu.encrypt_key.clone()},
+                {"key": "verificationToken", "label": "Verification Token (事件验证Token)", "secret": true, "value": cfg.feishu.verification_token.clone()}
             ]
         },
         {
@@ -2595,7 +2601,8 @@ async fn handle_channels_list(State(state): State<GatewayState>) -> impl IntoRes
             "enabled": cfg.dingtalk.enabled,
             "fields": [
                 {"key": "appKey", "label": "App Key", "secret": false, "value": cfg.dingtalk.app_key.clone()},
-                {"key": "appSecret", "label": "App Secret", "secret": true, "value": cfg.dingtalk.app_secret.clone()}
+                {"key": "appSecret", "label": "App Secret", "secret": true, "value": cfg.dingtalk.app_secret.clone()},
+                {"key": "robotCode", "label": "Robot Code (机器人编码, 用于主动发消息)", "secret": false, "value": cfg.dingtalk.robot_code.clone()}
             ]
         },
         {
@@ -2608,7 +2615,10 @@ async fn handle_channels_list(State(state): State<GatewayState>) -> impl IntoRes
             "fields": [
                 {"key": "corpId", "label": "Corp ID", "secret": false, "value": cfg.wecom.corp_id.clone()},
                 {"key": "corpSecret", "label": "Corp Secret", "secret": true, "value": cfg.wecom.corp_secret.clone()},
-                {"key": "agentId", "label": "Agent ID", "secret": false, "value": cfg.wecom.agent_id.to_string()}
+                {"key": "agentId", "label": "Agent ID", "secret": false, "value": cfg.wecom.agent_id.to_string()},
+                {"key": "callbackToken", "label": "Callback Token (回调Token, 可选)", "secret": true, "value": cfg.wecom.callback_token.clone()},
+                {"key": "encodingAesKey", "label": "EncodingAESKey (消息加解密密钥, 可选)", "secret": true, "value": cfg.wecom.encoding_aes_key.clone()},
+                {"key": "pollIntervalSecs", "label": "轮询间隔 (秒)", "secret": false, "value": cfg.wecom.poll_interval_secs.to_string()}
             ]
         },
         {
@@ -2631,7 +2641,9 @@ async fn handle_channels_list(State(state): State<GatewayState>) -> impl IntoRes
             "enabled": cfg.lark.enabled,
             "fields": [
                 {"key": "appId", "label": "App ID", "secret": false, "value": cfg.lark.app_id.clone()},
-                {"key": "appSecret", "label": "App Secret", "secret": true, "value": cfg.lark.app_secret.clone()}
+                {"key": "appSecret", "label": "App Secret", "secret": true, "value": cfg.lark.app_secret.clone()},
+                {"key": "encryptKey", "label": "Encrypt Key (Event encryption key)", "secret": true, "value": cfg.lark.encrypt_key.clone()},
+                {"key": "verificationToken", "label": "Verification Token (Event verification)", "secret": true, "value": cfg.lark.verification_token.clone()}
             ]
         }
     ]);
@@ -2666,9 +2678,33 @@ async fn handle_channel_update(
             .or_insert_with(|| serde_json::json!({}));
 
         if let Some(obj) = ch.as_object_mut() {
-            // Keep field keys as-is (camelCase) to match config struct serde attributes
+            // Insert fields with type coercion for non-string config fields
             for (k, v) in &req.fields {
-                obj.insert(k.clone(), v.clone());
+                let coerced = match k.as_str() {
+                    // Option<String>: empty string → null
+                    "proxy" => {
+                        let s = v.as_str().unwrap_or("");
+                        if s.is_empty() { serde_json::Value::Null } else { v.clone() }
+                    }
+                    // Vec<String>: comma-separated string → JSON array
+                    "channels" => {
+                        let s = v.as_str().unwrap_or("");
+                        let arr: Vec<&str> = if s.is_empty() {
+                            vec![]
+                        } else {
+                            s.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).collect()
+                        };
+                        serde_json::json!(arr)
+                    }
+                    // u32/i64 numeric fields: string → number
+                    "pollIntervalSecs" | "agentId" => {
+                        let s = v.as_str().unwrap_or("0");
+                        let n: i64 = s.parse().unwrap_or(0);
+                        serde_json::json!(n)
+                    }
+                    _ => v.clone(),
+                };
+                obj.insert(k.clone(), coerced);
             }
             if let Some(en) = req.enabled {
                 obj.insert("enabled".to_string(), serde_json::json!(en));
@@ -5409,6 +5445,14 @@ fn display_width(s: &str) -> usize {
 pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Result<()> {
     let paths = Paths::new();
     let mut config = Config::load_or_default(&paths)?;
+
+    // Ensure autoUpgrade.manifestUrl has a value (migrates old configs with empty string)
+    if config.auto_upgrade.manifest_url.is_empty() {
+        config.auto_upgrade.manifest_url =
+            "https://github.com/blockcell-labs/blockcell/releases/latest/download/manifest.json"
+                .to_string();
+        let _ = config.save(&paths.config_file());
+    }
 
     // Auto-generate and persist node_alias if not set (short 8-char hex, e.g. "54c6be7b").
     // This becomes the stable display name for this node in the community hub.
