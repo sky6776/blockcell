@@ -87,7 +87,6 @@ The directory structure looks like this:
 │   ├── memory/          # Memory database
 │   ├── skills/          # User-installed skills
 │   ├── media/           # Screenshots, audio, etc.
-│   └── tasks.json       # Shared background task snapshot
 └── agents/              # Non-default agents (created on demand)
     └── ops/
         ├── sessions/

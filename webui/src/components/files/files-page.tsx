@@ -10,6 +10,7 @@ import {
   type FileEntry, type FileContent,
 } from '@/lib/api';
 import { useT } from '@/lib/i18n';
+import { useAgentStore } from '@/lib/store';
 
 function fileIcon(entry: FileEntry) {
   if (entry.is_dir) return <Folder size={18} className="text-amber-500" />;
@@ -37,6 +38,7 @@ function formatSize(bytes: number): string {
 
 export function FilesPage() {
   const t = useT();
+  const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
   const [currentPath, setCurrentPath] = useState('.');
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -46,21 +48,33 @@ export function FilesPage() {
   const [uploadPath, setUploadPath] = useState('');
   const [uploadContent, setUploadContent] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const selectedAgentRef = useRef(selectedAgentId);
+
+  selectedAgentRef.current = selectedAgentId;
 
   useEffect(() => {
+    setPreview(null);
     fetchFiles(currentPath);
-  }, [currentPath]);
+  }, [currentPath, selectedAgentId]);
 
   async function fetchFiles(path: string) {
+    const agentId = selectedAgentId;
     setLoading(true);
     setPreview(null);
     try {
-      const data = await getFiles(path);
+      const data = await getFiles(path, agentId);
+      if (selectedAgentRef.current !== agentId) {
+        return;
+      }
       setEntries(data.entries || []);
     } catch {
-      setEntries([]);
+      if (selectedAgentRef.current === agentId) {
+        setEntries([]);
+      }
     } finally {
-      setLoading(false);
+      if (selectedAgentRef.current === agentId) {
+        setLoading(false);
+      }
     }
   }
 
@@ -84,14 +98,22 @@ export function FilesPage() {
   }
 
   async function previewFile(entry: FileEntry) {
+    const agentId = selectedAgentId;
     setPreviewLoading(true);
     try {
-      const data = await getFileContent(entry.path);
+      const data = await getFileContent(entry.path, agentId);
+      if (selectedAgentRef.current !== agentId) {
+        return;
+      }
       setPreview(data);
     } catch {
-      setPreview(null);
+      if (selectedAgentRef.current === agentId) {
+        setPreview(null);
+      }
     } finally {
-      setPreviewLoading(false);
+      if (selectedAgentRef.current === agentId) {
+        setPreviewLoading(false);
+      }
     }
   }
 
@@ -99,7 +121,7 @@ export function FilesPage() {
     if (!uploadPath || !uploadContent) return;
     const fullPath = currentPath === '.' ? uploadPath : `${currentPath}/${uploadPath}`;
     try {
-      await uploadFile(fullPath, uploadContent);
+      await uploadFile(fullPath, uploadContent, 'utf-8', selectedAgentId);
       setShowUpload(false);
       setUploadPath('');
       setUploadContent('');
@@ -117,7 +139,7 @@ export function FilesPage() {
       const base64 = (reader.result as string).split(',')[1];
       const fullPath = currentPath === '.' ? file.name : `${currentPath}/${file.name}`;
       try {
-        await uploadFile(fullPath, base64, 'base64');
+        await uploadFile(fullPath, base64, 'base64', selectedAgentId);
         fetchFiles(currentPath);
       } catch {
         // ignore
@@ -151,6 +173,7 @@ export function FilesPage() {
           <p className="text-sm text-muted-foreground">
             {dirCount} {t('files.folders')} · {fileCount} {t('files.fileCount')}
           </p>
+          <p className="text-xs text-muted-foreground">{t('common.agent')}: {selectedAgentId}</p>
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -265,7 +288,7 @@ export function FilesPage() {
                   </span>
                   {!entry.is_dir && (
                     <a
-                      href={downloadFileUrl(entry.path)}
+                      href={downloadFileUrl(entry.path, selectedAgentId)}
                       onClick={(e) => e.stopPropagation()}
                       className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-accent text-muted-foreground transition-opacity"
                       title={t('common.download')}
@@ -310,7 +333,7 @@ export function FilesPage() {
               </div>
               <div className="flex items-center gap-1 shrink-0">
                 <a
-                  href={downloadFileUrl(preview.path)}
+                  href={downloadFileUrl(preview.path, selectedAgentId)}
                   className="p-1.5 rounded hover:bg-accent text-muted-foreground"
                   title={t('common.download')}
                 >
@@ -344,7 +367,7 @@ export function FilesPage() {
                   <File size={32} className="mb-2 opacity-30" />
                   <p className="text-sm">{t('files.binaryFile', { mimeType: preview.mime_type })}</p>
                   <a
-                    href={downloadFileUrl(preview.path)}
+                    href={downloadFileUrl(preview.path, selectedAgentId)}
                     className="mt-2 text-xs text-rust hover:text-rust-light underline"
                   >
                     {t('files.downloadToView')}

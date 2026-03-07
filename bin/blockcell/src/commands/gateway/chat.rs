@@ -155,10 +155,44 @@ pub(super) async fn handle_health(State(state): State<GatewayState>) -> impl Int
     })
 }
 
-pub(super) async fn handle_tasks(State(state): State<GatewayState>) -> impl IntoResponse {
-    let (queued, running, completed, failed) = state.task_manager.summary().await;
+pub(super) async fn handle_tasks(
+    State(state): State<GatewayState>,
+    Query(agent): Query<AgentScopedQuery>,
+) -> impl IntoResponse {
+    let agent_id = match resolve_requested_agent_id(&state.config, agent.agent.as_deref()) {
+        Ok(agent_id) => agent_id,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": err })),
+            )
+                .into_response();
+        }
+    };
     let tasks = state.task_manager.list_tasks(None).await;
-    let tasks_json = serde_json::to_value(&tasks).unwrap_or(serde_json::Value::Array(vec![]));
+    let filtered_tasks: Vec<_> = tasks
+        .into_iter()
+        .filter(|task| task.agent_id.as_deref().unwrap_or("default") == agent_id)
+        .collect();
+    let (queued, running, completed, failed) = filtered_tasks.iter().fold(
+        (0usize, 0usize, 0usize, 0usize),
+        |(queued, running, completed, failed), task| match task.status {
+            blockcell_agent::task_manager::TaskStatus::Queued => {
+                (queued + 1, running, completed, failed)
+            }
+            blockcell_agent::task_manager::TaskStatus::Running => {
+                (queued, running + 1, completed, failed)
+            }
+            blockcell_agent::task_manager::TaskStatus::Completed => {
+                (queued, running, completed + 1, failed)
+            }
+            blockcell_agent::task_manager::TaskStatus::Failed
+            | blockcell_agent::task_manager::TaskStatus::Cancelled => {
+                (queued, running, completed, failed + 1)
+            }
+        },
+    );
+    let tasks_json = serde_json::to_value(&filtered_tasks).unwrap_or(serde_json::Value::Array(vec![]));
 
     Json(TasksResponse {
         queued,
@@ -167,4 +201,5 @@ pub(super) async fn handle_tasks(State(state): State<GatewayState>) -> impl Into
         failed,
         tasks: tasks_json,
     })
+    .into_response()
 }

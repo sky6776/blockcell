@@ -416,6 +416,7 @@ fn default_intent_router_profiles() -> HashMap<String, IntentToolProfileConfig> 
                 "memory_upsert".to_string(),
                 "toggle_manage".to_string(),
                 "message".to_string(),
+                "agent_status".to_string(),
             ],
             intent_tools: HashMap::from([
                 (

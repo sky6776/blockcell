@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { Plus, Trash2, Play, RefreshCw, Clock, Loader2, X, CheckCircle2, AlertCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { getCronJobs, createCronJob, deleteCronJob, runCronJob } from '@/lib/api';
@@ -107,6 +107,9 @@ export function CronPage() {
     variant: 'danger' | 'primary';
     onConfirm: () => void;
   }>({ open: false, title: '', description: '', confirmLabel: '', variant: 'primary', onConfirm: () => {} });
+  const selectedAgentRef = useRef(selectedAgentId);
+
+  selectedAgentRef.current = selectedAgentId;
 
   const addToast = useCallback((type: 'success' | 'error', message: string) => {
     const id = Date.now();
@@ -127,14 +130,20 @@ export function CronPage() {
   }, [selectedAgentId]);
 
   async function fetchJobs() {
+    const agentId = selectedAgentId;
     setLoading(true);
     try {
-      const data = await getCronJobs(selectedAgentId);
+      const data = await getCronJobs(agentId);
+      if (selectedAgentRef.current !== agentId) {
+        return;
+      }
       setJobs(data.jobs || []);
     } catch {
       // ignore
     } finally {
-      setLoading(false);
+      if (selectedAgentRef.current === agentId) {
+        setLoading(false);
+      }
     }
   }
 

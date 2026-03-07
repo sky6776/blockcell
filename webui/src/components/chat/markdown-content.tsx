@@ -5,8 +5,10 @@ import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { useState } from 'react';
 import { Copy, Check } from 'lucide-react';
 import { mediaFileUrl } from '@/lib/api';
+import { useAgentStore } from '@/lib/store';
 
 export function MarkdownContent({ content }: { content: string }) {
+  const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
   return (
     <div className="prose prose-sm dark:prose-invert max-w-none">
       <ReactMarkdown
@@ -34,7 +36,7 @@ export function MarkdownContent({ content }: { content: string }) {
           },
           img({ src, alt }) {
             // Route local file paths through the serve endpoint
-            const resolvedSrc = src && src.startsWith('/') ? mediaFileUrl(src) : src;
+            const resolvedSrc = src && src.startsWith('/') ? mediaFileUrl(src, selectedAgentId) : src;
             return (
               <img
                 src={resolvedSrc}

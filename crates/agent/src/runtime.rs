@@ -166,29 +166,37 @@ fn build_subagent_metadata(agent_id: Option<&str>) -> serde_json::Value {
     }
 }
 
-fn kernel_tool_names() -> Vec<String> {
-    blockcell_tools::registry::kernel_tool_names()
+fn global_core_tool_names() -> Vec<String> {
+    blockcell_tools::registry::global_core_tool_names()
         .iter()
         .map(|name| (*name).to_string())
         .collect()
 }
 
-fn active_tool_names_for_mode(
+fn resolve_effective_tool_names(
+    config: &Config,
     mode: InteractionMode,
+    agent_id: Option<&str>,
     active_skill: Option<&ActiveSkillContext>,
+    intents: &[IntentCategory],
     available_tools: &HashSet<String>,
 ) -> Vec<String> {
-    let mut tool_names: Vec<String> = match mode {
-        InteractionMode::Skill => {
-            let mut names = kernel_tool_names();
-            if let Some(skill) = active_skill {
-                names.extend(skill.tools.iter().cloned());
-            }
-            names
+    let mut tool_names = global_core_tool_names();
+
+    let mut profile_tools = match mode {
+        InteractionMode::Chat => {
+            resolve_profile_tool_names(config, agent_id, &[IntentCategory::Chat], available_tools)
         }
-        InteractionMode::Chat => vec![],
-        InteractionMode::General => kernel_tool_names(),
+        InteractionMode::General | InteractionMode::Skill => {
+            resolve_profile_tool_names(config, agent_id, intents, available_tools)
+        }
     };
+    tool_names.append(&mut profile_tools);
+
+    if let Some(skill) = active_skill {
+        tool_names.extend(skill.tools.iter().cloned());
+    }
+
     tool_names.retain(|name| available_tools.contains(name));
     tool_names.sort();
     tool_names.dedup();
@@ -1262,6 +1270,7 @@ impl AgentRuntime {
                     if let Some(ref event_tx) = self.event_tx {
                         let event = serde_json::json!({
                             "type": "session_renamed",
+                            "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                             "chat_id": msg.chat_id,
                             "name": new_name,
                         });
@@ -1300,23 +1309,17 @@ impl AgentRuntime {
         let available_tools: HashSet<String> =
             self.tool_registry.tool_names().into_iter().collect();
         let routed_agent_id = self.agent_id.as_deref();
-        let mut tool_names = match mode {
-            InteractionMode::Skill => {
-                active_tool_names_for_mode(mode, active_skill.as_ref(), &available_tools)
-            }
-            InteractionMode::Chat => resolve_profile_tool_names(
-                &self.config,
-                routed_agent_id,
-                &[IntentCategory::Chat],
-                &available_tools,
-            ),
-            InteractionMode::General => {
-                resolve_profile_tool_names(&self.config, routed_agent_id, &chat_intents, &available_tools)
-            }
-        };
+        let mut tool_names = resolve_effective_tool_names(
+            &self.config,
+            mode,
+            routed_agent_id,
+            active_skill.as_ref(),
+            &chat_intents,
+            &available_tools,
+        );
 
         if tool_names.is_empty() && !matches!(mode, InteractionMode::Chat) {
-            tool_names = kernel_tool_names();
+            tool_names = global_core_tool_names();
             tool_names.retain(|name| available_tools.contains(name));
         }
 
@@ -1384,6 +1387,7 @@ impl AgentRuntime {
                 &disabled_tools,
                 &msg.channel,
                 pending_intent,
+                &tool_names,
                 &tool_prompt_rules,
             );
 
@@ -1398,7 +1402,7 @@ impl AgentRuntime {
             let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
             let mut schemas = self
                 .tool_registry
-                .get_tiered_schemas(&tool_name_refs, blockcell_tools::registry::kernel_tool_names());
+                .get_tiered_schemas(&tool_name_refs, blockcell_tools::registry::global_core_tool_names());
             if !disabled_tools.is_empty() {
                 schemas.retain(|schema| {
                     let name = schema
@@ -1863,6 +1867,7 @@ impl AgentRuntime {
             if let Some(ref event_tx) = self.event_tx {
                 let event = serde_json::json!({
                     "type": "message_done",
+                    "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                     "chat_id": msg.chat_id,
                     "task_id": "",
                     "content": final_response,
@@ -2271,6 +2276,7 @@ impl AgentRuntime {
         if let Some(ref event_tx) = self.event_tx {
             let event = serde_json::json!({
                 "type": "tool_call_start",
+                "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                 "chat_id": msg.chat_id,
                 "task_id": "",
                 "tool": tool_call.name,
@@ -2386,6 +2392,7 @@ impl AgentRuntime {
         if let Some(ref event_tx) = self.event_tx {
             let event = serde_json::json!({
                 "type": "tool_call_result",
+                "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                 "chat_id": msg.chat_id,
                 "task_id": "",
                 "tool": tool_call.name,
@@ -2824,6 +2831,7 @@ impl AgentRuntime {
                                         let _ = event_tx.send(
                                             serde_json::json!({
                                                 "type": "message_done",
+                                                "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                                                 "chat_id": chat_id,
                                                 "task_id": "",
                                                 "content": "⏹️ 当前对话已终止",
@@ -3286,7 +3294,7 @@ mod tests {
 
     #[test]
     fn test_core_tools_contains_toggle_manage() {
-        assert!(kernel_tool_names().iter().any(|name| name == "toggle_manage"));
+        assert!(global_core_tool_names().iter().any(|name| name == "toggle_manage"));
     }
 
     #[test]
@@ -3354,8 +3362,8 @@ mod tests {
     }
 
     #[test]
-    fn test_kernel_tool_names_excludes_email() {
-        let names = kernel_tool_names();
+    fn test_global_core_tool_names_excludes_email() {
+        let names = global_core_tool_names();
 
         assert!(names.iter().any(|name| name == "toggle_manage"));
         assert!(names.iter().any(|name| name == "memory_query"));

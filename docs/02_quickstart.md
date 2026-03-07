@@ -119,7 +119,6 @@ blockcell onboard
 │   ├── memory/          # 记忆数据库
 │   ├── skills/          # 用户安装的技能
 │   ├── media/           # 截图、音频等媒体文件
-│   └── tasks.json       # 全局后台任务快照
 └── agents/              # 非 default agent 的独立目录（按需创建）
     └── ops/
         ├── sessions/

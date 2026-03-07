@@ -4,7 +4,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -64,63 +63,13 @@ pub struct TaskInfo {
 #[derive(Clone)]
 pub struct TaskManager {
     tasks: Arc<Mutex<HashMap<String, TaskInfo>>>,
-    persistence_file: Option<PathBuf>,
 }
 
 impl TaskManager {
     pub fn new() -> Self {
         Self {
             tasks: Arc::new(Mutex::new(HashMap::new())),
-            persistence_file: None,
         }
-    }
-
-    pub fn with_persistence(path: PathBuf) -> Self {
-        let loaded = Self::load_from_disk(&path);
-        Self {
-            tasks: Arc::new(Mutex::new(loaded)),
-            persistence_file: Some(path),
-        }
-    }
-
-    fn load_from_disk(path: &PathBuf) -> HashMap<String, TaskInfo> {
-        let content = match std::fs::read_to_string(path) {
-            Ok(content) => content,
-            Err(_) => return HashMap::new(),
-        };
-
-        let tasks: Vec<TaskInfo> = serde_json::from_str(&content).unwrap_or_default();
-        tasks
-            .into_iter()
-            .map(|task| (task.id.clone(), task))
-            .collect()
-    }
-
-    fn snapshot(tasks: &HashMap<String, TaskInfo>) -> Vec<TaskInfo> {
-        let mut snapshot: Vec<TaskInfo> = tasks.values().cloned().collect();
-        snapshot.sort_by(|left, right| right.created_at.cmp(&left.created_at));
-        snapshot
-    }
-
-    fn persist_snapshot(&self, snapshot: Vec<TaskInfo>) {
-        let Some(path) = self.persistence_file.as_ref() else {
-            return;
-        };
-
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(content) = serde_json::to_string_pretty(&snapshot) {
-            let _ = std::fs::write(path, content);
-        }
-    }
-
-    async fn persist(&self) {
-        let snapshot = {
-            let tasks = self.tasks.lock().await;
-            Self::snapshot(&tasks)
-        };
-        self.persist_snapshot(snapshot);
     }
 
     /// Register a new task and return its ID.
@@ -152,7 +101,6 @@ impl TaskManager {
             let mut tasks = self.tasks.lock().await;
             tasks.insert(task_id.to_string(), info.clone());
         }
-        self.persist().await;
         info
     }
 
@@ -165,7 +113,6 @@ impl TaskManager {
                 task.started_at = Some(Utc::now());
             }
         }
-        self.persist().await;
     }
 
     /// Update the progress note for a running task.
@@ -176,7 +123,6 @@ impl TaskManager {
                 task.progress = Some(progress.to_string());
             }
         }
-        self.persist().await;
     }
 
     /// Mark a task as completed with a result summary.
@@ -199,7 +145,6 @@ impl TaskManager {
                 task.result = Some(truncated);
             }
         }
-        self.persist().await;
     }
 
     /// Mark a task as failed with an error message.
@@ -212,7 +157,6 @@ impl TaskManager {
                 task.error = Some(error.to_string());
             }
         }
-        self.persist().await;
     }
 
     /// Get info for a specific task.
@@ -273,7 +217,6 @@ impl TaskManager {
         };
         if removed > 0 {
             tracing::debug!(removed, "Cleaned up old tasks");
-            self.persist().await;
         }
     }
 
@@ -283,7 +226,6 @@ impl TaskManager {
             let mut tasks = self.tasks.lock().await;
             tasks.remove(task_id);
         }
-        self.persist().await;
     }
 }
 
@@ -363,21 +305,9 @@ impl TaskManagerOps for TaskManager {
 mod tests {
     use super::*;
 
-    fn unique_temp_file(name: &str) -> std::path::PathBuf {
-        let unique = format!(
-            "blockcell-task-manager-{}-{}-{}.json",
-            name,
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        );
-        std::env::temp_dir().join(unique)
-    }
-
     #[tokio::test]
-    async fn test_task_manager_persists_agent_scoped_tasks() {
-        let path = unique_temp_file("persist");
-        let manager = TaskManager::with_persistence(path.clone());
-
+    async fn test_task_manager_tracks_agent_scoped_tasks_in_memory() {
+        let manager = TaskManager::new();
         manager
             .create_task(
                 "task-1",
@@ -389,26 +319,27 @@ mod tests {
             )
             .await;
 
-        let content = std::fs::read_to_string(&path).expect("tasks file should be written");
-        let persisted: Vec<TaskInfo> = serde_json::from_str(&content).expect("tasks file should be valid json");
-        assert_eq!(persisted.len(), 1);
-        assert_eq!(persisted[0].agent_id.as_deref(), Some("ops"));
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[tokio::test]
-    async fn test_task_manager_loads_existing_tasks_from_disk() {
-        let path = unique_temp_file("load");
-        std::fs::write(
-            &path,
-            r#"[{"id":"task-1","label":"demo","task_description":"do something","status":"queued","created_at":"2026-03-06T00:00:00Z","started_at":null,"completed_at":null,"progress":null,"result":null,"error":null,"origin_channel":"cli","origin_chat_id":"chat-1","agent_id":"ops"}]"#,
-        )
-        .expect("seed tasks file");
-
-        let manager = TaskManager::with_persistence(path.clone());
         let tasks = manager.list_tasks(None).await;
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].agent_id.as_deref(), Some("ops"));
-        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn test_task_manager_removes_task() {
+        let manager = TaskManager::new();
+        manager
+            .create_task(
+                "task-1",
+                "demo",
+                "do something",
+                "cli",
+                "chat-1",
+                Some("ops"),
+            )
+            .await;
+
+        manager.remove_task("task-1").await;
+        let tasks = manager.list_tasks(None).await;
+        assert!(tasks.is_empty());
     }
 }

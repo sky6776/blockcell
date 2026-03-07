@@ -114,12 +114,6 @@ enum Commands {
         command: ToolsCommands,
     },
 
-    /// View and manage background tasks
-    Tasks {
-        #[command(subcommand)]
-        command: TasksCommands,
-    },
-
     /// Execute a tool or agent message directly
     Run {
         #[command(subcommand)]
@@ -194,43 +188,6 @@ enum Commands {
     Logs {
         #[command(subcommand)]
         command: LogsCommands,
-    },
-}
-
-// ── P0: Tasks ───────────────────────────────────────────────────────────────
-
-#[derive(Subcommand)]
-enum TasksCommands {
-    /// List background tasks
-    List {
-        /// Show tasks from all agents
-        #[arg(long)]
-        all: bool,
-        /// Show tasks for a specific agent (default: default)
-        #[arg(short = 'a', long)]
-        agent: Option<String>,
-    },
-    /// Show details for a specific task
-    Show {
-        /// Task ID (prefix match)
-        task_id: String,
-        /// Search across all agents
-        #[arg(long)]
-        all: bool,
-        /// Search within a specific agent (default: default)
-        #[arg(short = 'a', long)]
-        agent: Option<String>,
-    },
-    /// Cancel a running task (if supported)
-    Cancel {
-        /// Task ID (prefix match)
-        task_id: String,
-        /// Search across all agents
-        #[arg(long)]
-        all: bool,
-        /// Search within a specific agent (default: default)
-        #[arg(short = 'a', long)]
-        agent: Option<String>,
     },
 }
 
@@ -886,27 +843,6 @@ async fn main() -> anyhow::Result<()> {
             }
         },
 
-        // ── Tasks ───────────────────────────────────────────────────────
-        Commands::Tasks { command } => match command {
-            TasksCommands::List { all, agent } => {
-                commands::tasks_cmd::list(agent.as_deref(), all).await?;
-            }
-            TasksCommands::Show {
-                task_id,
-                all,
-                agent,
-            } => {
-                commands::tasks_cmd::show(&task_id, agent.as_deref(), all).await?;
-            }
-            TasksCommands::Cancel {
-                task_id,
-                all,
-                agent,
-            } => {
-                commands::tasks_cmd::cancel(&task_id, agent.as_deref(), all).await?;
-            }
-        },
-
         // ── P0: Run ─────────────────────────────────────────────────────
         Commands::Run { command } => match command {
             RunCommands::Tool {
@@ -1282,24 +1218,6 @@ mod tests {
         }
     }
 
-
-    #[test]
-    fn test_tasks_list_accepts_all_flag() {
-        let cli = Cli::try_parse_from(["blockcell", "tasks", "list", "--all"])
-            .expect("tasks list --all should parse");
-
-        match cli.command {
-            Commands::Tasks { command } => match command {
-                TasksCommands::List { all, agent } => {
-                    assert!(all);
-                    assert!(agent.is_none());
-                }
-                other => panic!("unexpected tasks command: {:?}", std::mem::discriminant(&other)),
-            },
-            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
-        }
-    }
-
     #[test]
     fn test_channels_owner_set_accepts_account_flag() {
         let cli = Cli::try_parse_from([
@@ -1360,23 +1278,6 @@ mod tests {
                     other => panic!("unexpected owner command: {:?}", std::mem::discriminant(&other)),
                 },
                 other => panic!("unexpected channels command: {:?}", std::mem::discriminant(&other)),
-            },
-            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
-        }
-    }
-
-    #[test]
-    fn test_tasks_list_accepts_agent_flag() {
-        let cli = Cli::try_parse_from(["blockcell", "tasks", "list", "--agent", "ops"])
-            .expect("tasks list --agent should parse");
-
-        match cli.command {
-            Commands::Tasks { command } => match command {
-                TasksCommands::List { all, agent } => {
-                    assert!(!all);
-                    assert_eq!(agent.as_deref(), Some("ops"));
-                }
-                other => panic!("unexpected tasks command: {:?}", std::mem::discriminant(&other)),
             },
             other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
         }

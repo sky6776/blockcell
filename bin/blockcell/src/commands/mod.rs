@@ -18,6 +18,5 @@ pub mod setup;
 pub mod skills;
 pub mod status;
 pub mod streams_cmd;
-pub mod tasks_cmd;
 pub mod tools_cmd;
 pub mod upgrade;

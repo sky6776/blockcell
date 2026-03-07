@@ -351,9 +351,7 @@ pub async fn run(
         runtime.mount_mcp_servers().await;
         runtime.validate_intent_router()?;
         runtime.set_agent_id(Some(agent_id.clone()));
-        runtime.set_task_manager(TaskManager::with_persistence(
-            root_paths.workspace().join("tasks.json"),
-        ));
+        runtime.set_task_manager(TaskManager::new());
 
         // 如果配置了独立的 evolution_model 或 evolution_provider，创建独立的 evolution provider
         if config.agents.defaults.evolution_model.is_some()
@@ -411,7 +409,7 @@ pub async fn run(
         let (confirm_tx, mut confirm_rx) = mpsc::channel::<ConfirmRequest>(8);
 
         // Create shared task manager
-        let task_manager = TaskManager::with_persistence(root_paths.workspace().join("tasks.json"));
+        let task_manager = TaskManager::new();
 
         // Create channel manager for outbound message dispatch (before config is moved)
         let channel_manager =

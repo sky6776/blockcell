@@ -83,7 +83,11 @@ export function DashboardPage() {
   return (
     <div className="flex flex-col h-full overflow-y-auto">
       <div className="border-b border-border px-6 py-4 flex items-center justify-between">
-        <h1 className="text-lg font-semibold">{t('dashboard.title')}</h1>
+        <div>
+          <h1 className="text-lg font-semibold">{t('dashboard.title')}</h1>
+          <p className="text-xs text-muted-foreground">{t('dashboard.scopeGlobal')}</p>
+          <p className="text-xs text-muted-foreground">{t('dashboard.scopeHint')}</p>
+        </div>
         <button
           onClick={() => { setLoading(true); fetchAll(); }}
           className="p-2 rounded-lg hover:bg-accent text-muted-foreground"

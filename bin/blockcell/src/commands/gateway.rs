@@ -822,7 +822,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
     // ── Create shared task manager ──
-    let task_manager = TaskManager::with_persistence(paths.workspace().join("tasks.json"));
+    let task_manager = TaskManager::new();
 
     // ── Create tool registry (shared for listing tools) ──
     let tool_registry_shared = Arc::new(ToolRegistry::with_defaults());

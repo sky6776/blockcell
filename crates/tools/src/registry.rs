@@ -40,7 +40,7 @@ use crate::video_process::VideoProcessTool;
 use crate::web::{WebFetchTool, WebSearchTool};
 use crate::{Tool, ToolContext};
 
-pub const KERNEL_TOOL_NAMES: &[&str] = &[
+pub const GLOBAL_CORE_TOOL_NAMES: &[&str] = &[
     "memory_query",
     "memory_upsert",
     "memory_forget",
@@ -51,8 +51,8 @@ pub const KERNEL_TOOL_NAMES: &[&str] = &[
     "toggle_manage",
 ];
 
-pub fn kernel_tool_names() -> &'static [&'static str] {
-    KERNEL_TOOL_NAMES
+pub fn global_core_tool_names() -> &'static [&'static str] {
+    GLOBAL_CORE_TOOL_NAMES
 }
 
 #[derive(Clone)]

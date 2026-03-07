@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Image, Volume2, Download, Maximize2, X, FileAudio } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { mediaFileUrl, downloadFileUrl } from '@/lib/api';
+import { useAgentStore } from '@/lib/store';
 
 const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico', 'heic', 'heif', 'tiff', 'tif'];
 const AUDIO_EXTS = ['mp3', 'wav', 'm4a', 'aac', 'ogg', 'oga', 'flac', 'opus', 'weba'];
@@ -52,9 +53,10 @@ export function extractMediaPaths(text: string): string[] {
 }
 
 export function MediaAttachment({ path }: { path: string }) {
+  const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
   const type = isMediaPath(path);
-  const url = mediaFileUrl(path);
-  const dlUrl = downloadFileUrl(path);
+  const url = mediaFileUrl(path, selectedAgentId);
+  const dlUrl = downloadFileUrl(path, selectedAgentId);
   const filename = path.split('/').pop() || path;
 
   if (type === 'image') {

@@ -195,6 +195,7 @@ impl ContextBuilder {
             "",
             "",
             &[],
+            &[],
         )
     }
 
@@ -233,6 +234,7 @@ impl ContextBuilder {
         disabled_tools: &HashSet<String>,
         _channel: &str,
         user_query: &str,
+        available_tool_names: &[String],
         tool_prompt_rules: &[String],
     ) -> String {
         let mut prompt = String::new();
@@ -270,6 +272,15 @@ impl ContextBuilder {
             prompt.push_str(
                 "- Never hardcode credentials — ask the user or read from config/memory.\n",
             );
+            if available_tool_names.is_empty() {
+                prompt.push_str("- There are no callable tools available in the current agent scope for this interaction. Do not claim tools outside the current scope.\n");
+            } else {
+                prompt.push_str(&format!(
+                    "- Current callable tools in this interaction: {}\n",
+                    available_tool_names.join(", ")
+                ));
+                prompt.push_str("- When the user asks which tools/capabilities you have, answer only from the current callable tool list above. Do not mention globally registered tools that are not in the current agent scope.\n");
+            }
             for rule in tool_prompt_rules {
                 prompt.push_str(rule);
                 if !rule.ends_with('\n') {
@@ -393,6 +404,7 @@ impl ContextBuilder {
         disabled_tools: &HashSet<String>,
         channel: &str,
         pending_intent: bool,
+        available_tool_names: &[String],
         tool_prompt_rules: &[String],
     ) -> Vec<ChatMessage> {
         let mut messages = Vec::new();
@@ -415,6 +427,7 @@ impl ContextBuilder {
             disabled_tools,
             channel,
             user_content,
+            available_tool_names,
             tool_prompt_rules,
         );
         let system_tokens = estimate_tokens(&system_prompt);

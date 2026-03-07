@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { RefreshCw, CheckCircle, XCircle, Clock, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { getTasks } from '@/lib/api';
 import { useT } from '@/lib/i18n';
+import { useAgentStore } from '@/lib/store';
 
 interface TaskInfo {
   id: string;
@@ -19,25 +20,35 @@ interface TaskInfo {
 
 export function TasksPage() {
   const t = useT();
+  const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
   const [tasks, setTasks] = useState<TaskInfo[]>([]);
   const [summary, setSummary] = useState({ queued: 0, running: 0, completed: 0, failed: 0 });
   const [loading, setLoading] = useState(false);
+  const selectedAgentRef = useRef(selectedAgentId);
+
+  selectedAgentRef.current = selectedAgentId;
 
   useEffect(() => {
     fetchTasks();
     const interval = setInterval(fetchTasks, 5000);
     return () => clearInterval(interval);
-  }, []);
+  }, [selectedAgentId]);
 
   async function fetchTasks() {
+    const agentId = selectedAgentId;
     try {
-      const data = await getTasks();
+      const data = await getTasks(agentId);
+      if (selectedAgentRef.current !== agentId) {
+        return;
+      }
       setTasks(data.tasks || []);
       setSummary({ queued: data.queued, running: data.running, completed: data.completed, failed: data.failed });
     } catch {
       // ignore
     } finally {
-      setLoading(false);
+      if (selectedAgentRef.current === agentId) {
+        setLoading(false);
+      }
     }
   }
 
@@ -56,6 +67,7 @@ export function TasksPage() {
           <p className="text-sm text-muted-foreground">
             {summary.running} running · {summary.queued} queued · {summary.completed} completed · {summary.failed} failed
           </p>
+          <p className="text-xs text-muted-foreground">{t('common.agent')}: {selectedAgentId}</p>
         </div>
         <button
           onClick={() => { setLoading(true); fetchTasks(); }}

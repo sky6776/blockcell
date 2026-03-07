@@ -7,6 +7,8 @@ use super::*;
 pub(super) struct FileListQuery {
     #[serde(default = "default_file_path")]
     path: String,
+    #[serde(default)]
+    agent: Option<String>,
 }
 
 fn default_file_path() -> String {
@@ -18,7 +20,11 @@ pub(super) async fn handle_files_list(
     State(state): State<GatewayState>,
     Query(params): Query<FileListQuery>,
 ) -> impl IntoResponse {
-    let workspace = state.paths.workspace();
+    let agent_id = match resolve_requested_agent_id(&state.config, params.agent.as_deref()) {
+        Ok(agent_id) => agent_id,
+        Err(err) => return Json(serde_json::json!({ "error": err })),
+    };
+    let workspace = state.paths.for_agent(&agent_id).workspace();
     let target = if params.path == "." || params.path.is_empty() {
         workspace.to_path_buf()
     } else {
@@ -128,6 +134,8 @@ pub(super) async fn handle_files_list(
 #[derive(Deserialize)]
 pub(super) struct FileContentQuery {
     path: String,
+    #[serde(default)]
+    agent: Option<String>,
 }
 
 /// GET /v1/files/content — read file content
@@ -135,7 +143,11 @@ pub(super) async fn handle_files_content(
     State(state): State<GatewayState>,
     Query(params): Query<FileContentQuery>,
 ) -> Response {
-    let workspace = state.paths.workspace();
+    let agent_id = match resolve_requested_agent_id(&state.config, params.agent.as_deref()) {
+        Ok(agent_id) => agent_id,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+    };
+    let workspace = state.paths.for_agent(&agent_id).workspace();
     let target = workspace.join(&params.path);
 
     // Security check
@@ -253,7 +265,11 @@ pub(super) async fn handle_files_download(
     State(state): State<GatewayState>,
     Query(params): Query<FileContentQuery>,
 ) -> Response {
-    let workspace = state.paths.workspace();
+    let agent_id = match resolve_requested_agent_id(&state.config, params.agent.as_deref()) {
+        Ok(agent_id) => agent_id,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+    };
+    let workspace = state.paths.for_agent(&agent_id).workspace();
     let target = workspace.join(&params.path);
 
     let canonical = match target.canonicalize() {
@@ -297,7 +313,11 @@ pub(super) async fn handle_files_serve(
     Query(params): Query<FileContentQuery>,
 ) -> Response {
     let base_dir = state.paths.base.clone();
-    let workspace = state.paths.workspace();
+    let agent_id = match resolve_requested_agent_id(&state.config, params.agent.as_deref()) {
+        Ok(agent_id) => agent_id,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+    };
+    let workspace = state.paths.for_agent(&agent_id).workspace();
 
     // Determine target: absolute path or workspace-relative
     let target = if params.path.starts_with('/') {
@@ -382,8 +402,13 @@ pub(super) async fn handle_files_serve(
 /// POST /v1/files/upload — upload a file to workspace
 pub(super) async fn handle_files_upload(
     State(state): State<GatewayState>,
+    Query(agent): Query<AgentScopedQuery>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    let agent_id = match resolve_requested_agent_id(&state.config, agent.agent.as_deref()) {
+        Ok(agent_id) => agent_id,
+        Err(err) => return Json(serde_json::json!({ "error": err })),
+    };
     let path = req.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let content = req.get("content").and_then(|v| v.as_str()).unwrap_or("");
     let encoding = req
@@ -396,7 +421,7 @@ pub(super) async fn handle_files_upload(
         Err(e) => return Json(serde_json::json!({ "error": e })),
     };
 
-    let workspace = state.paths.workspace();
+    let workspace = state.paths.for_agent(&agent_id).workspace();
     let target = workspace.join(&rel);
     let path_echo = rel.to_string_lossy().to_string();
     let content = content.to_string();

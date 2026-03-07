@@ -30,20 +30,30 @@ export function ChatPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const selectedAgentRef = useRef(selectedAgentId);
+  const currentSessionRef = useRef(currentSessionId);
+
+  useEffect(() => {
+    selectedAgentRef.current = selectedAgentId;
+  }, [selectedAgentId]);
+
+  useEffect(() => {
+    currentSessionRef.current = currentSessionId;
+  }, [currentSessionId]);
 
   // Load session history when switching sessions
   useEffect(() => {
     if (currentSessionId) {
       const isPersistedSession = sessions.some((s) => s.id === currentSessionId);
       if (isPersistedSession) {
-        loadSessionHistory(currentSessionId);
+        loadSessionHistory(currentSessionId, selectedAgentId);
       }
     }
   }, [currentSessionId, selectedAgentId, sessions]);
 
   // Auto-scroll to bottom
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    messagesEndRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' });
   }, [messages]);
 
   // Auto-focus input
@@ -57,9 +67,12 @@ export function ChatPage() {
     }
   }, [isLoading]);
 
-  async function loadSessionHistory(sessionId: string) {
+  async function loadSessionHistory(sessionId: string, agentId: string) {
     try {
-      const data = await getSession(sessionId, selectedAgentId);
+      const data = await getSession(sessionId, agentId);
+      if (selectedAgentRef.current !== agentId || currentSessionRef.current !== sessionId) {
+        return;
+      }
       const uiMessages: UiMessage[] = data.messages
         .filter((m) => {
           // Skip system and tool messages
@@ -77,7 +90,9 @@ export function ChatPage() {
         }));
       setMessages(uiMessages);
     } catch {
-      setMessages([]);
+      if (selectedAgentRef.current === agentId && currentSessionRef.current === sessionId) {
+        setMessages([]);
+      }
     }
   }
 
@@ -158,7 +173,7 @@ export function ChatPage() {
             };
             reader.readAsDataURL(pf.file);
           });
-          await uploadFile(uploadPath, b64, 'base64');
+          await uploadFile(uploadPath, b64, 'base64', selectedAgentId);
           mediaPaths.push(uploadPath);
           URL.revokeObjectURL(pf.previewUrl);
         }

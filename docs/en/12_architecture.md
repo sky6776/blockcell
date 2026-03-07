@@ -61,9 +61,9 @@ The current blockcell architecture is no longer “one `AgentRuntime` for everyt
 - non-default agents live under `~/.blockcell/agents/<ID>/` with isolated `workspace / sessions / audit`
 - Gateway builds separate runtimes for enabled agents and routes external traffic with `channelAccountOwners.<channel>.<accountId>` first, then `channelOwners.<channel>` as fallback
 - `intentRouter` makes intent → tool resolution fully config-driven instead of hardcoded in runtime logic
-- background task snapshots are persisted centrally at `~/.blockcell/workspace/tasks.json`, and the CLI can inspect them with `blockcell tasks --agent/--all`
+- background tasks live only in the memory of running processes and are removed immediately on completion; use the WebUI for live task status
 
-This is what enables the current “multi-agent + configurable tool routing + shared task visibility” model.
+This is what enables the current “multi-agent + configurable tool routing + live WebUI task visibility” model.
 
 ---
 

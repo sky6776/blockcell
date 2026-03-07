@@ -14,6 +14,7 @@ export type WsEventType =
 
 export interface WsEvent {
   type: WsEventType;
+  agent_id?: string;
   chat_id?: string;
   task_id?: string;
   delta?: string;

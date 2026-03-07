@@ -67,8 +67,8 @@ export function getHealth() {
 }
 
 // P0: Tasks
-export function getTasks() {
-  return request<{ queued: number; running: number; completed: number; failed: number; tasks: any[] }>('/tasks');
+export function getTasks(agentId?: string) {
+  return request<{ queued: number; running: number; completed: number; failed: number; tasks: any[] }>(`/tasks${buildQuery({ agent: agentId })}`);
 }
 
 // P0: Sessions
@@ -272,28 +272,28 @@ export function updateToggle(category: 'skills' | 'tools', name: string, enabled
 }
 
 // P2: Files
-export function getFiles(path = '.') {
-  return request<{ path: string; entries: FileEntry[]; count: number }>(`/files?path=${encodeURIComponent(path)}`);
+export function getFiles(path = '.', agentId?: string) {
+  return request<{ path: string; entries: FileEntry[]; count: number }>(`/files${buildQuery({ path, agent: agentId })}`);
 }
 
-export function getFileContent(path: string) {
-  return request<FileContent>(`/files/content?path=${encodeURIComponent(path)}`);
+export function getFileContent(path: string, agentId?: string) {
+  return request<FileContent>(`/files/content${buildQuery({ path, agent: agentId })}`);
 }
 
-export function downloadFileUrl(path: string) {
+export function downloadFileUrl(path: string, agentId?: string) {
   const token = localStorage.getItem('blockcell_token');
-  const base = `${API_BASE}/v1/files/download?path=${encodeURIComponent(path)}`;
+  const base = `${API_BASE}/v1/files/download${buildQuery({ path, agent: agentId })}`;
   return token ? `${base}&token=${token}` : base;
 }
 
-export function mediaFileUrl(path: string) {
+export function mediaFileUrl(path: string, agentId?: string) {
   const token = localStorage.getItem('blockcell_token');
-  const base = `${API_BASE}/v1/files/serve?path=${encodeURIComponent(path)}`;
+  const base = `${API_BASE}/v1/files/serve${buildQuery({ path, agent: agentId })}`;
   return token ? `${base}&token=${token}` : base;
 }
 
-export function uploadFile(path: string, content: string, encoding: 'utf-8' | 'base64' = 'utf-8') {
-  return request<{ status: string; path: string }>('/files/upload', {
+export function uploadFile(path: string, content: string, encoding: 'utf-8' | 'base64' = 'utf-8', agentId?: string) {
+  return request<{ status: string; path: string }>(`/files/upload${buildQuery({ agent: agentId })}`, {
     method: 'POST',
     body: JSON.stringify({ path, content, encoding }),
   });

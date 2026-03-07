@@ -237,6 +237,8 @@ const translations: Record<Locale, Record<string, string>> = {
 
     // Dashboard
     'dashboard.title': 'Dashboard',
+    'dashboard.scopeGlobal': 'Global',
+    'dashboard.scopeHint': 'This page shows system-wide status and does not switch with the selected agent',
     'dashboard.status': 'Status',
     'dashboard.model': 'Model',
     'dashboard.uptime': 'Uptime',
@@ -823,6 +825,8 @@ const translations: Record<Locale, Record<string, string>> = {
 
     // Dashboard
     'dashboard.title': '仪表盘',
+    'dashboard.scopeGlobal': '全局',
+    'dashboard.scopeHint': '此页面展示系统级状态，不随当前选中的 Agent 切换',
     'dashboard.status': '状态',
     'dashboard.model': '模型',
     'dashboard.uptime': '运行时长',

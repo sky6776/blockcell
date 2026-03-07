@@ -61,9 +61,9 @@ blockcell 选择了 Rust。
 - 非 `default` agent 使用 `~/.blockcell/agents/<ID>/` 下的独立 `workspace / sessions / audit`
 - Gateway 会为启用的 agent 建立独立 runtime，并按 `channelAccountOwners.<channel>.<accountId>` → `channelOwners.<channel>` 的优先级路由外部消息
 - `intentRouter` 负责把“意图 → 工具集合”的映射完全放进配置，而不是写死在运行时代码里
-- 后台任务快照统一持久化到 `~/.blockcell/workspace/tasks.json`，CLI 可通过 `blockcell tasks --agent/--all` 做跨 agent 查看
+- 后台任务仅存在于运行中进程的内存里，完成后立即移除；实时任务状态以 WebUI 为准
 
-这套设计让“多 agent + 可配置工具路由 + 共享任务视图”成为默认能力，而不再是外部补丁。
+这套设计让“多 agent + 可配置工具路由 + WebUI 实时任务视图”成为默认能力，而不再依赖过期的文件快照。
 
 ---
 

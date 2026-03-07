@@ -43,10 +43,12 @@ export function Sidebar() {
   const [loadingMoreSessions, setLoadingMoreSessions] = useState(false);
   const [nextCursor, setNextCursor] = useState<number | null>(0);
   const sessionsRef = useRef<SessionInfo[]>(sessions);
+  const selectedAgentRef = useRef(selectedAgentId);
   const [deleteConfirm, setDeleteConfirm] = useState<{ id: string; name: string } | null>(null);
   const [logoutConfirm, setLogoutConfirm] = useState(false);
 
   sessionsRef.current = sessions;
+  selectedAgentRef.current = selectedAgentId;
 
   useEffect(() => {
     loadAgents();
@@ -80,15 +82,21 @@ export function Sidebar() {
   }
 
   async function loadSessions() {
+    const agentId = selectedAgentId;
     setLoadingSessions(true);
     try {
-      const data = await getSessionsPage({ limit: 12, cursor: 0, agent: selectedAgentId });
+      const data = await getSessionsPage({ limit: 12, cursor: 0, agent: agentId });
+      if (selectedAgentRef.current !== agentId) {
+        return;
+      }
       setSessions(data.sessions);
       setNextCursor(data.next_cursor);
     } catch {
       // ignore
     } finally {
-      setLoadingSessions(false);
+      if (selectedAgentRef.current === agentId) {
+        setLoadingSessions(false);
+      }
     }
   }
 
@@ -96,9 +104,14 @@ export function Sidebar() {
     if (loadingMoreSessions) return;
     if (nextCursor === null) return;
 
+    const agentId = selectedAgentId;
+    const cursor = nextCursor;
     setLoadingMoreSessions(true);
     try {
-      const data = await getSessionsPage({ limit: 12, cursor: nextCursor, agent: selectedAgentId });
+      const data = await getSessionsPage({ limit: 12, cursor, agent: agentId });
+      if (selectedAgentRef.current !== agentId) {
+        return;
+      }
       if (data.sessions?.length) {
         setSessions([...sessionsRef.current, ...data.sessions]);
       }
@@ -106,7 +119,9 @@ export function Sidebar() {
     } catch {
       // ignore
     } finally {
-      setLoadingMoreSessions(false);
+      if (selectedAgentRef.current === agentId) {
+        setLoadingMoreSessions(false);
+      }
     }
   }
 

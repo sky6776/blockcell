@@ -3,6 +3,14 @@ import type { SessionInfo, ChatMsg } from './api';
 import type { WsEvent, ConnectionState, DisconnectReason } from './ws';
 import { notifyTaskCompleted, notifyAlertTriggered } from './notifications';
 
+function normalizeSessionId(id: string) {
+  return id.replace(/:/g, '_');
+}
+
+function sessionStorageKey(agentId: string) {
+  return `blockcell_last_session_id:${agentId}`;
+}
+
 // ── Chat message with UI metadata ──
 export interface UiMessage {
   id: string;
@@ -49,15 +57,17 @@ function nextMsgId() {
   return `msg_${Date.now()}_${++msgCounter}`;
 }
 
-function resolveInitialSessionId(): string {
+function resolveInitialSessionId(agentId: string): string {
   if (typeof window === 'undefined') return 'ws_default';
-  const saved = localStorage.getItem('blockcell_last_session_id');
-  return saved || `ws_${Date.now()}`;
+  const saved = localStorage.getItem(sessionStorageKey(agentId));
+  return saved || `ws_${agentId}_${Date.now()}`;
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
   sessions: [],
-  currentSessionId: resolveInitialSessionId(),
+  currentSessionId: resolveInitialSessionId(
+    typeof window === 'undefined' ? 'default' : (localStorage.getItem('blockcell_selected_agent') || 'default')
+  ),
   messages: [],
   isConnected: false,
   isLoading: false,
@@ -65,7 +75,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setSessions: (sessions) => set({ sessions }),
   setCurrentSession: (id) => {
     if (typeof window !== 'undefined') {
-      localStorage.setItem('blockcell_last_session_id', id);
+      const agentId = localStorage.getItem('blockcell_selected_agent') || 'default';
+      localStorage.setItem(sessionStorageKey(agentId), id);
     }
     set({ currentSessionId: id, messages: [] });
   },
@@ -87,13 +98,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   handleWsEvent: (event) => {
     const state = get();
+    const selectedAgentId = typeof window === 'undefined'
+      ? 'default'
+      : (localStorage.getItem('blockcell_selected_agent') || 'default');
 
-    // Filter chat-specific events by chat_id to prevent cross-session leaking.
-    // Normalize both IDs: the server uses ':' separators, the UI uses '_'.
+    // Filter chat-specific events by both agent_id and chat_id to prevent
+    // cross-agent and cross-session leaking.
     const chatEventTypes: string[] = ['message_done', 'token', 'tool_call_start', 'tool_call_result', 'thinking'];
     if (chatEventTypes.includes(event.type) && event.chat_id) {
-      const normalize = (id: string) => id.replace(/:/g, '_');
-      if (normalize(event.chat_id) !== normalize(state.currentSessionId)) {
+      if (event.agent_id && event.agent_id !== selectedAgentId) {
+        return;
+      }
+      if (normalizeSessionId(event.chat_id) !== normalizeSessionId(state.currentSessionId)) {
         return; // Event belongs to a different chat session — ignore
       }
     }
@@ -101,8 +117,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     switch (event.type) {
       case 'session_renamed': {
         if (event.chat_id && event.name) {
-          const normalize = (id: string) => id.replace(/:/g, '_');
-          const normalizedId = normalize(event.chat_id);
+          if (event.agent_id && event.agent_id !== selectedAgentId) {
+            break;
+          }
+          const normalizedId = normalizeSessionId(event.chat_id);
           
           set((state) => {
             const exists = state.sessions.some(s => s.id === normalizedId);

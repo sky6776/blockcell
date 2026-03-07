@@ -389,22 +389,6 @@ blockcell run msg "你好" -a ops
 
 ---
 
-## tasks — 管理后台任务
-
-```
-blockcell tasks <SUBCOMMAND>
-```
-
-任务快照保存在共享文件 `~/.blockcell/workspace/tasks.json` 中；CLI 默认只显示 `default` agent 的任务。
-
-| 子命令 | 说明 |
-|--------|------|
-| `list [--all] [--agent <ID>]` | 列出后台任务；默认只看 `default` agent，`--all` 查看所有 agent |
-| `show <TASK_ID> [--all] [--agent <ID>]` | 显示指定任务详情（支持 ID 前缀匹配） |
-| `cancel <TASK_ID> [--all] [--agent <ID>]` | 取消运行中的任务（支持 ID 前缀匹配） |
-
----
-
 ## channels — 管理渠道
 
 ```

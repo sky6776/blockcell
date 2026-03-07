@@ -6,6 +6,7 @@ import {
 import { getFiles, downloadFileUrl, type FileEntry } from '@/lib/api';
 import { useT } from '@/lib/i18n';
 import { cn } from '@/lib/utils';
+import { useAgentStore } from '@/lib/store';
 
 interface DeliverableFile {
   name: string;
@@ -60,6 +61,7 @@ const OUTPUT_EXTS = ['pptx', 'docx', 'xlsx', 'csv', 'pdf', 'txt', 'md', 'png', '
 
 export function DeliverablesPage() {
   const t = useT();
+  const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
   const [files, setFiles] = useState<DeliverableFile[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
@@ -70,7 +72,7 @@ export function DeliverablesPage() {
     const found: DeliverableFile[] = [];
     for (const dir of OUTPUT_DIRS) {
       try {
-        const data = await getFiles(dir);
+        const data = await getFiles(dir, selectedAgentId);
         for (const entry of (data.entries || []) as FileEntry[]) {
           if (entry.is_dir) continue;
           const ext = entry.name.split('.').pop()?.toLowerCase() || '';
@@ -93,7 +95,7 @@ export function DeliverablesPage() {
     found.sort((a, b) => (b.modified || 0) - (a.modified || 0));
     setFiles(found);
     setLoading(false);
-  }, []);
+  }, [selectedAgentId]);
 
   useEffect(() => {
     fetchFiles();
@@ -108,7 +110,7 @@ export function DeliverablesPage() {
   });
 
   function handleDownload(file: DeliverableFile) {
-    const url = downloadFileUrl(file.path);
+    const url = downloadFileUrl(file.path, selectedAgentId);
     const a = document.createElement('a');
     a.href = url;
     a.download = file.name;
@@ -124,6 +126,7 @@ export function DeliverablesPage() {
           <span className="text-xs text-muted-foreground bg-muted px-2 py-0.5 rounded-full">
             {files.length} {t('deliverables.files')}
           </span>
+          <span className="text-xs text-muted-foreground">{t('common.agent')}: {selectedAgentId}</span>
         </div>
         <button
           onClick={fetchFiles}

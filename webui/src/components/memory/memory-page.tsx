@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Search, Plus, Trash2, RefreshCw, Brain, Loader2, AlertTriangle } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAgentStore } from '@/lib/store';
@@ -16,6 +16,9 @@ export function MemoryPage() {
   const [showCreate, setShowCreate] = useState(false);
   const [newMemory, setNewMemory] = useState({ title: '', content: '', scope: 'long_term', type: 'note', tags: '' });
   const [deleteConfirm, setDeleteConfirm] = useState<{ id: string; title: string } | null>(null);
+  const selectedAgentRef = useRef(selectedAgentId);
+
+  selectedAgentRef.current = selectedAgentId;
 
   useEffect(() => {
     fetchMemories();
@@ -23,22 +26,34 @@ export function MemoryPage() {
   }, [selectedAgentId]);
 
   async function fetchMemories() {
+    const agentId = selectedAgentId;
     setLoading(true);
     try {
-      const data = await getMemories({ q: query || undefined, scope: scope || undefined, limit: 50, agent: selectedAgentId });
+      const data = await getMemories({ q: query || undefined, scope: scope || undefined, limit: 50, agent: agentId });
+      if (selectedAgentRef.current !== agentId) {
+        return;
+      }
       const raw = Array.isArray(data) ? data : data.results || data.items || [];
       // API returns [{ item: {...}, score }] — unwrap .item if present
       setMemories(raw.map((entry: any) => entry.item ? { ...entry.item, _score: entry.score } : entry));
     } catch {
-      setMemories([]);
+      if (selectedAgentRef.current === agentId) {
+        setMemories([]);
+      }
     } finally {
-      setLoading(false);
+      if (selectedAgentRef.current === agentId) {
+        setLoading(false);
+      }
     }
   }
 
   async function fetchStats() {
+    const agentId = selectedAgentId;
     try {
-      const data = await getMemoryStats(selectedAgentId);
+      const data = await getMemoryStats(agentId);
+      if (selectedAgentRef.current !== agentId) {
+        return;
+      }
       setStats(data);
     } catch {
       // ignore
