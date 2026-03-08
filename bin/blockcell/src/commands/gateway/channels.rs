@@ -1,8 +1,21 @@
 use super::*;
+use blockcell_core::config::{parse_json5_value, write_json5_pretty};
 
 const SUPPORTED_OWNER_CHANNELS: [&str; 8] = [
     "telegram", "whatsapp", "feishu", "slack", "discord", "dingtalk", "wecom", "lark",
 ];
+
+fn load_config_or_state(state: &GatewayState) -> Config {
+    Config::load(&state.paths.config_file()).unwrap_or_else(|_| state.config.clone())
+}
+
+fn load_config_value_or_state(state: &GatewayState) -> anyhow::Result<serde_json::Value> {
+    let config_path = state.paths.config_file();
+    match std::fs::read_to_string(&config_path) {
+        Ok(content) => parse_json5_value(&content).map_err(Into::into),
+        Err(_) => Ok(serde_json::to_value(&state.config)?),
+    }
+}
 // ---------------------------------------------------------------------------
 // Channels status endpoint
 // ---------------------------------------------------------------------------
@@ -31,11 +44,7 @@ pub(super) async fn handle_channels_status(State(state): State<GatewayState>) ->
 pub(super) async fn handle_channels_list(State(state): State<GatewayState>) -> impl IntoResponse {
     // Read from disk each time so updates via PUT take effect immediately
     // without requiring a gateway restart.
-    let config_path = state.paths.config_file();
-    let loaded_config = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Config>(&s).ok())
-        .unwrap_or_else(|| state.config.clone());
+    let loaded_config = load_config_or_state(&state);
     let cfg = &loaded_config.channels;
     let owners = &loaded_config.channel_owners;
 
@@ -212,8 +221,7 @@ pub(super) async fn handle_channel_update(
 ) -> impl IntoResponse {
     let config_path = state.paths.config_file();
     let result: anyhow::Result<serde_json::Value> = (|| async {
-        let content = std::fs::read_to_string(&config_path)?;
-        let mut root: serde_json::Value = serde_json::from_str(&content)?;
+        let mut root = load_config_value_or_state(&state)?;
 
         let channels = root
             .get_mut("channels")
@@ -288,7 +296,7 @@ pub(super) async fn handle_channel_update(
             }
         }
 
-        std::fs::write(&config_path, serde_json::to_string_pretty(&root)?)?;
+        write_json5_pretty(&config_path, &root)?;
         Ok(serde_json::json!({ "status": "ok", "channel": ch_key }))
     })()
     .await;
@@ -301,14 +309,62 @@ pub(super) async fn handle_channel_update(
 
 fn known_account_ids(cfg: &Config, channel: &str) -> Vec<String> {
     let mut ids = match channel {
-        "telegram" => cfg.channels.telegram.accounts.keys().cloned().collect::<Vec<_>>(),
-        "whatsapp" => cfg.channels.whatsapp.accounts.keys().cloned().collect::<Vec<_>>(),
-        "feishu" => cfg.channels.feishu.accounts.keys().cloned().collect::<Vec<_>>(),
-        "slack" => cfg.channels.slack.accounts.keys().cloned().collect::<Vec<_>>(),
-        "discord" => cfg.channels.discord.accounts.keys().cloned().collect::<Vec<_>>(),
-        "dingtalk" => cfg.channels.dingtalk.accounts.keys().cloned().collect::<Vec<_>>(),
-        "wecom" => cfg.channels.wecom.accounts.keys().cloned().collect::<Vec<_>>(),
-        "lark" => cfg.channels.lark.accounts.keys().cloned().collect::<Vec<_>>(),
+        "telegram" => cfg
+            .channels
+            .telegram
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "whatsapp" => cfg
+            .channels
+            .whatsapp
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "feishu" => cfg
+            .channels
+            .feishu
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "slack" => cfg
+            .channels
+            .slack
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "discord" => cfg
+            .channels
+            .discord
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "dingtalk" => cfg
+            .channels
+            .dingtalk
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "wecom" => cfg
+            .channels
+            .wecom
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "lark" => cfg
+            .channels
+            .lark
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
         _ => Vec::new(),
     };
     ids.sort();
@@ -358,7 +414,8 @@ fn set_owner_binding(
             "agent": agent,
         }))
     } else {
-        cfg.channel_owners.insert(channel.to_string(), agent.to_string());
+        cfg.channel_owners
+            .insert(channel.to_string(), agent.to_string());
         Ok(serde_json::json!({
             "status": "ok",
             "channel": channel,
@@ -398,11 +455,7 @@ fn clear_owner_binding(
 pub(super) async fn handle_channel_owners_get(
     State(state): State<GatewayState>,
 ) -> impl IntoResponse {
-    let config_path = state.paths.config_file();
-    let cfg = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Config>(&s).ok())
-        .unwrap_or_else(|| state.config.clone());
+    let cfg = load_config_or_state(&state);
     Json(channel_owner_bindings_payload(&cfg))
 }
 
@@ -420,10 +473,7 @@ pub(super) async fn handle_channel_owner_put(
 ) -> impl IntoResponse {
     let config_path = state.paths.config_file();
     let result: anyhow::Result<serde_json::Value> = (|| async {
-        let mut cfg = std::fs::read_to_string(&config_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Config>(&s).ok())
-            .unwrap_or_else(|| state.config.clone());
+        let mut cfg = load_config_or_state(&state);
 
         let payload = set_owner_binding(&mut cfg, &channel, None, &req.agent)?;
         cfg.save(&config_path)?;
@@ -445,10 +495,7 @@ pub(super) async fn handle_channel_account_owner_put(
 ) -> impl IntoResponse {
     let config_path = state.paths.config_file();
     let result: anyhow::Result<serde_json::Value> = (|| async {
-        let mut cfg = std::fs::read_to_string(&config_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Config>(&s).ok())
-            .unwrap_or_else(|| state.config.clone());
+        let mut cfg = load_config_or_state(&state);
 
         let payload = set_owner_binding(&mut cfg, &channel, Some(&account_id), &req.agent)?;
         cfg.save(&config_path)?;
@@ -469,10 +516,7 @@ pub(super) async fn handle_channel_owner_delete(
 ) -> impl IntoResponse {
     let config_path = state.paths.config_file();
     let result: anyhow::Result<serde_json::Value> = (|| async {
-        let mut cfg = std::fs::read_to_string(&config_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Config>(&s).ok())
-            .unwrap_or_else(|| state.config.clone());
+        let mut cfg = load_config_or_state(&state);
         let payload = clear_owner_binding(&mut cfg, &channel, None)?;
         cfg.save(&config_path)?;
         Ok(payload)
@@ -492,10 +536,7 @@ pub(super) async fn handle_channel_account_owner_delete(
 ) -> impl IntoResponse {
     let config_path = state.paths.config_file();
     let result: anyhow::Result<serde_json::Value> = (|| async {
-        let mut cfg = std::fs::read_to_string(&config_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Config>(&s).ok())
-            .unwrap_or_else(|| state.config.clone());
+        let mut cfg = load_config_or_state(&state);
         let payload = clear_owner_binding(&mut cfg, &channel, Some(&account_id))?;
         cfg.save(&config_path)?;
         Ok(payload)
@@ -507,7 +548,6 @@ pub(super) async fn handle_channel_account_owner_delete(
         Err(e) => Json(serde_json::json!({ "status": "error", "message": e.to_string() })),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -524,7 +564,10 @@ mod tests {
         );
 
         let payload = channel_owner_bindings_payload(&cfg);
-        assert_eq!(payload["channelOwners"]["telegram"], serde_json::json!("default"));
+        assert_eq!(
+            payload["channelOwners"]["telegram"],
+            serde_json::json!("default")
+        );
         assert_eq!(
             payload["channelAccountOwners"]["telegram"]["bot2"],
             serde_json::json!("ops")
@@ -534,11 +577,13 @@ mod tests {
     #[test]
     fn test_set_owner_binding_updates_account_override() {
         let mut cfg = Config::default();
-        cfg.agents.list.push(blockcell_core::config::AgentProfileConfig {
-            id: "ops".to_string(),
-            enabled: true,
-            ..Default::default()
-        });
+        cfg.agents
+            .list
+            .push(blockcell_core::config::AgentProfileConfig {
+                id: "ops".to_string(),
+                enabled: true,
+                ..Default::default()
+            });
         cfg.channels.telegram.accounts.insert(
             "bot2".to_string(),
             blockcell_core::config::TelegramAccountConfig {
@@ -550,7 +595,10 @@ mod tests {
         );
 
         let payload = set_owner_binding(&mut cfg, "telegram", Some("bot2"), "ops").unwrap();
-        assert_eq!(cfg.resolve_channel_account_owner("telegram", "bot2"), Some("ops"));
+        assert_eq!(
+            cfg.resolve_channel_account_owner("telegram", "bot2"),
+            Some("ops")
+        );
         assert_eq!(payload["accountId"], serde_json::json!("bot2"));
         assert_eq!(payload["agent"], serde_json::json!("ops"));
     }

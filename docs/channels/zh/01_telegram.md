@@ -18,7 +18,7 @@ Blockcell 支持通过 Telegram 机器人与智能体进行交互。Telegram 渠
 
 ## 3. 配置 Blockcell
 
-在 Blockcell 的配置文件（如 `~/.blockcell/config.json` 或项目目录下的 `config.json`）中，找到 `channels` 配置块，修改 `telegram` 部分：
+在 Blockcell 的配置文件（如 `~/.blockcell/config.json5` 或项目目录下的 `config.json5`）中，找到 `channels` 配置块，修改 `telegram` 部分：
 
 ```json
 {
@@ -38,7 +38,7 @@ Blockcell 支持通过 Telegram 机器人与智能体进行交互。Telegram 渠
 - `token`: 在 BotFather 处获取的 API Token。
 - `allowFrom`: 允许访问的用户 ID 列表（字符串数组）。如果留空 `[]`，则允许任何人在群聊或私聊中调用机器人。建议在生产环境中配置特定的 ID。
 
-> 如果你通过 `blockcell gateway` 启用 Telegram，还需要在 `config.json` 中补一条 owner 绑定，例如：
+> 如果你通过 `blockcell gateway` 启用 Telegram，还需要在 `config.json5` 中补一条 owner 绑定，例如：
 >
 > ```json
 > { "channelOwners": { "telegram": "default" } }

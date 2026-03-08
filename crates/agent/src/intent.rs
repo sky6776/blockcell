@@ -423,7 +423,7 @@ mod tests {
             vec![IntentCategory::Unknown]
         );
         assert_eq!(
-            classifier.classify("帮我读一下 config.json"),
+            classifier.classify("帮我读一下 config.json5"),
             vec![IntentCategory::Unknown]
         );
         assert_eq!(

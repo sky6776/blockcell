@@ -31,7 +31,7 @@ Core implementation:
 
 ---
 
-## Configuration (`config.json`)
+## Configuration (`config.json5`)
 
 Ghost configuration lives under `agents.ghost`:
 

@@ -49,9 +49,9 @@ Ghost Agent 是一个**按计划运行**的后台例行维护服务：
 
 ---
 
-## 配置方式（config.json）
+## 配置方式（config.json5）
 
-Ghost 的配置位于 `config.json` 的 `agents.ghost`：
+Ghost 的配置位于 `config.json5` 的 `agents.ghost`：
 
 ```json
 {

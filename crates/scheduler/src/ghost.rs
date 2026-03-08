@@ -13,7 +13,7 @@ Rules: NEVER save routine logs to memory. Only save genuine user-relevant discov
 Output: respond with a brief JSON summary at the end (see routine prompt for format).
 "#;
 
-/// Configuration for the Ghost Agent, read from config.json agents.ghost.
+/// Configuration for the Ghost Agent, read from config.json5 agents.ghost.
 #[derive(Debug, Clone)]
 pub struct GhostServiceConfig {
     pub enabled: bool,

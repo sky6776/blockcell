@@ -106,13 +106,13 @@ blockcell setup --force
 blockcell onboard
 ```
 
-这个命令会创建目录结构和默认配置文件,但需要手动编辑 `config.json`
+这个命令会创建目录结构和默认配置文件,但需要手动编辑 `config.json5`
 
 目录结构长这样：
 
 ```
 ~/.blockcell/
-├── config.json          # 主配置文件
+├── config.json5          # 主配置文件
 ├── sessions/            # default agent 的会话历史
 ├── audit/               # default agent 的审计日志
 ├── workspace/           # default agent 的工作目录
@@ -136,10 +136,10 @@ blockcell onboard
 
 ```bash
 # macOS
-open ~/.blockcell/config.json
+open ~/.blockcell/config.json5
 
 # 或者用命令行编辑器
-nano ~/.blockcell/config.json
+nano ~/.blockcell/config.json5
 ```
 
 找到 `providers` 部分,填入你的 API Key。
@@ -386,7 +386,7 @@ blockcell doctor
 
 ## 配置文件完整说明
 
-`~/.blockcell/config.json` 的主要字段：
+`~/.blockcell/config.json5` 的主要字段：
 
 ```json
 {
@@ -490,7 +490,7 @@ blockcell doctor
 
 ### 问题3：想换模型
 
-直接修改 `config.json` 里的 `agents.defaults.model`，重启 `blockcell agent` 即可。
+直接修改 `config.json5` 里的 `agents.defaults.model`，重启 `blockcell agent` 即可。
 
 ### 问题4：想看 AI 调用了哪些工具
 

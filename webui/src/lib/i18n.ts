@@ -67,7 +67,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'login.password': 'Password',
     'login.signIn': 'Sign In',
     'login.signingIn': 'Signing in...',
-    'login.hint': 'Set gateway.webuiPass in config.json for a stable password, or check the gateway console for the temporary one-time password',
+    'login.hint': 'Set gateway.webuiPass in config.json5 for a stable password, or check the gateway console for the temporary one-time password',
     'login.invalidPassword': 'Invalid password',
     'login.cannotConnect': 'Cannot connect to gateway',
 
@@ -664,7 +664,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'login.password': '密码',
     'login.signIn': '登录',
     'login.signingIn': '登录中...',
-    'login.hint': '在 config.json 中设置 gateway.webuiPass 可固定密码，否则每次启动会生成临时密码显示在控制台',
+    'login.hint': '在 config.json5 中设置 gateway.webuiPass 可固定密码，否则每次启动会生成临时密码显示在控制台',
     'login.invalidPassword': '密码错误',
     'login.cannotConnect': '无法连接到 Gateway',
 

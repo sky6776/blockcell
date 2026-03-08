@@ -5,7 +5,7 @@
 ## 配置文件位置
 
 ```
-~/.blockcell/config.json
+~/.blockcell/config.json5
 ```
 
 首次运行 `blockcell onboard` 会自动生成此文件。也可以用 `blockcell config edit` 直接编辑。

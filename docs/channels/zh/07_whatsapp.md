@@ -23,7 +23,7 @@ ws://localhost:3001
 
 ## 2. 配置 Blockcell
 
-编辑 `~/.blockcell/config.json`：
+编辑 `~/.blockcell/config.json5`：
 
 ```json
 {

@@ -1,11 +1,11 @@
 use anyhow::Result;
-use blockcell_core::config::Config;
+use blockcell_core::config::{validate_config_json5_str, Config};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// 配置文件监听器，支持热加载
 pub struct ConfigWatcher {
@@ -27,20 +27,24 @@ impl ConfigWatcher {
         let config_path = self.config_path.clone();
 
         // 创建文件监听器
-        let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-            if let Ok(event) = res {
-                if event.kind.is_modify() || event.kind.is_create() {
-                    let _ = tx.blocking_send(());
+        let mut watcher: RecommendedWatcher =
+            notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+                if let Ok(event) = res {
+                    if event.kind.is_modify() || event.kind.is_create() {
+                        let _ = tx.blocking_send(());
+                    }
                 }
-            }
-        })?;
+            })?;
 
         // 监听配置文件目录
         if let Some(parent) = config_path.parent() {
             watcher.watch(parent, RecursiveMode::NonRecursive)?;
         }
 
-        info!("📡 Config watcher started, monitoring: {}", config_path.display());
+        info!(
+            "📡 Config watcher started, monitoring: {}",
+            config_path.display()
+        );
 
         // 防抖：避免短时间内多次重载
         let mut last_reload = std::time::Instant::now();
@@ -73,16 +77,9 @@ impl ConfigWatcher {
 
     /// 重新加载配置文件
     async fn reload_config(&self) -> Result<()> {
-        // 读取文件内容
         let content = tokio::fs::read_to_string(&self.config_path).await?;
-
-        // 先验证JSON格式
-        let json_val: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| anyhow::anyhow!("Invalid JSON format: {}", e))?;
-
-        // 再验证配置结构
-        let new_config: Config = serde_json::from_value(json_val)
-            .map_err(|e| anyhow::anyhow!("Invalid config structure: {}", e))?;
+        let new_config: Config = validate_config_json5_str(&content)
+            .map_err(|e| anyhow::anyhow!("Invalid JSON5 config: {}", e))?;
 
         // 验证通过，更新内存中的配置
         let mut config = self.config.write().await;

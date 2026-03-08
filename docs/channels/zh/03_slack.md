@@ -76,7 +76,7 @@ Blockcell 支持通过 Slack 机器人与智能体进行交互。默认情况下
 - `channels`: 允许机器人响应的频道 ID 列表（字符串数组）。如果留空 `[]`，则机器人在所有已加入的频道中都会响应。
 - `allowFrom`: 允许访问的用户 ID 列表（字符串数组）。如果留空 `[]`，则允许任何人在群聊或私聊中调用机器人。
 
-> 如果你通过 `blockcell gateway` 启用这个外部渠道，还需要在 `config.json` 中补一条 owner 绑定，例如：
+> 如果你通过 `blockcell gateway` 启用这个外部渠道，还需要在 `config.json5` 中补一条 owner 绑定，例如：
 >
 > ```json
 > { "channelOwners": { "slack": "default" } }

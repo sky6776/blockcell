@@ -20,7 +20,7 @@ pub(super) async fn handle_webui_static(uri: axum::http::Uri) -> impl IntoRespon
             let mut body: Vec<u8> = content.data.into();
 
             // Runtime injection: make WebUI load /env.js before the main bundle.
-            // This allows changing backend address via config.json without rebuilding dist.
+            // This allows changing backend address via config.json5 without rebuilding dist.
             if file_path == "index.html" {
                 let html = String::from_utf8_lossy(&body);
                 let injected = inject_env_js_into_index_html(&html);

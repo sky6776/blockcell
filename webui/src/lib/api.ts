@@ -37,6 +37,13 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return res.json();
 }
 
+function ensureStatusOk<T extends { status?: string; message?: string }>(result: T): T {
+  if (result?.status === 'error') {
+    throw new Error(result.message || 'Request failed');
+  }
+  return result;
+}
+
 // Auth
 export async function login(password: string): Promise<{ token?: string; error?: string }> {
   const url = `${API_BASE}/v1/auth/login`;
@@ -113,17 +120,28 @@ export function updateConfig(config: any) {
   });
 }
 
-export function testProvider(params: { model: string; api_key: string; api_base?: string; proxy?: string }) {
+export function getConfigRaw() {
+  return request<{ status: string; content: string; path: string }>('/config/raw').then(ensureStatusOk);
+}
+
+export function updateConfigRaw(content: string) {
+  return request<{ status: string; message: string }>('/config/raw', {
+    method: 'PUT',
+    body: JSON.stringify({ content }),
+  }).then(ensureStatusOk);
+}
+
+export function testProvider(params: { model?: string; api_key?: string; api_base?: string; proxy?: string; content?: string; provider?: string }) {
   return request<{ status: string; message: string }>('/config/test-provider', {
     method: 'POST',
     body: JSON.stringify(params),
-  });
+  }).then(ensureStatusOk);
 }
 
 export function reloadConfig() {
   return request<{ status: string; message: string }>('/config/reload', {
     method: 'POST',
-  });
+  }).then(ensureStatusOk);
 }
 
 // P1: Memory

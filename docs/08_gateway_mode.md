@@ -202,7 +202,7 @@ WebUI 的主要功能：
 
 ## API 认证
 
-当前版本里，`gateway.apiToken` 如果为空，Gateway 会在首次启动时**自动生成并写回 `config.json`**。这意味着 API 默认不会以“完全无密码”的状态运行，但在公网场景下你仍然应该手动设置一个长期稳定的 token。
+当前版本里，`gateway.apiToken` 如果为空，Gateway 会在首次启动时**自动生成并写回 `config.json5`**。这意味着 API 默认不会以“完全无密码”的状态运行，但在公网场景下你仍然应该手动设置一个长期稳定的 token。
 
 ```json
 {
@@ -305,7 +305,7 @@ sudo systemctl status blockcell
 FROM ubuntu:22.04
 RUN apt-get update && apt-get install -y curl
 RUN curl -fsSL https://raw.githubusercontent.com/blockcell-labs/blockcell/refs/heads/main/install.sh | sh
-COPY config.json /root/.blockcell/config.json
+COPY config.json5 /root/.blockcell/config.json5
 EXPOSE 18790 18791
 CMD ["blockcell", "gateway"]
 ```

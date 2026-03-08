@@ -134,7 +134,7 @@ blockcell channels owner set --channel telegram --account bot2 --agent ops
 
 ### 第三步：配置 blockcell
 
-编辑 `~/.blockcell/config.json`：
+编辑 `~/.blockcell/config.json5`：
 
 ```json
 {
@@ -450,7 +450,7 @@ blockcell channels owner clear --channel slack
 
 ### 3. API Token 与 WebUI 密码
 
-如果 `gateway.apiToken` 为空，Gateway 会在启动时自动生成一个 token 并写回 `config.json`，这样 API 不会处于“完全裸奔”状态。
+如果 `gateway.apiToken` 为空，Gateway 会在启动时自动生成一个 token 并写回 `config.json5`，这样 API 不会处于“完全裸奔”状态。
 
 如果你希望 WebUI 使用固定密码，请显式配置 `gateway.webuiPass`；否则启动时会打印一个临时密码。
 

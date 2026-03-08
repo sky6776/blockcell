@@ -80,7 +80,7 @@ The directory structure looks like this:
 
 ```
 ~/.blockcell/
-├── config.json          # Main config
+├── config.json5          # Main config
 ├── sessions/            # Session history for the default agent
 ├── audit/               # Audit logs for the default agent
 ├── workspace/           # Default agent workspace
@@ -110,10 +110,10 @@ If you already completed `blockcell setup`, you can skip this step. Otherwise, o
 
 ```bash
 # macOS
-open ~/.blockcell/config.json
+open ~/.blockcell/config.json5
 
 # Or use a terminal editor
-nano ~/.blockcell/config.json
+nano ~/.blockcell/config.json5
 ```
 
 Find the `providers` section and fill in your API key.
@@ -322,7 +322,7 @@ blockcell doctor
 
 ## Full config field overview
 
-Key fields in `~/.blockcell/config.json`:
+Key fields in `~/.blockcell/config.json5`:
 
 ```json
 {
@@ -387,7 +387,7 @@ blockcell doctor
 
 ### Issue 3: Want to switch models
 
-Edit `agents.defaults.model` in `config.json`, then restart `blockcell agent`.
+Edit `agents.defaults.model` in `config.json5`, then restart `blockcell agent`.
 
 ### Issue 4: Want to see which tools the AI used
 

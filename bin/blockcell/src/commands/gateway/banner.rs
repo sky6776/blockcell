@@ -109,10 +109,10 @@ pub(super) fn print_startup_banner(
             ansi::YELLOW,
             ansi::RESET,
         );
-        let hint2 = "  in config.json for a stable password.";
+        let hint2 = "  in config.json5 for a stable password.";
         let hint2_pad = box_w.saturating_sub(hint2.len());
         eprintln!(
-            "  {}│{}  {}in config.json for a stable password.{}{}{}│{}",
+            "  {}│{}  {}in config.json5 for a stable password.{}{}{}│{}",
             ansi::YELLOW,
             ansi::RESET,
             ansi::DIM,
@@ -139,10 +139,10 @@ pub(super) fn print_startup_banner(
             ansi::RESET,
             " ".repeat(pw_pad),
         );
-        let hint = "  Configured via gateway.webuiPass in config.json";
+        let hint = "  Configured via gateway.webuiPass in config.json5";
         let hint_pad = box_w.saturating_sub(hint.len());
         eprintln!(
-            "  {}│{}  {}Configured via gateway.webuiPass in config.json{}{}{}│{}",
+            "  {}│{}  {}Configured via gateway.webuiPass in config.json5{}{}{}│{}",
             ansi::GREEN,
             ansi::RESET,
             ansi::DIM,
@@ -165,7 +165,7 @@ pub(super) fn print_startup_banner(
             ansi::RESET
         );
         eprintln!(
-            "  {}   Review gateway.apiToken in config.json before exposing to the network.{}",
+            "  {}   Review gateway.apiToken in config.json5 before exposing to the network.{}",
             ansi::YELLOW,
             ansi::RESET
         );
@@ -210,7 +210,10 @@ pub(super) fn print_startup_banner(
             .unwrap_or_else(|| "default".to_string())
     }
 
-    fn default_marker(default_account_id: Option<&String>, account_id: Option<&str>) -> &'static str {
+    fn default_marker(
+        default_account_id: Option<&String>,
+        account_id: Option<&str>,
+    ) -> &'static str {
         if default_account_id.map(|s| s.as_str()) == account_id {
             " [default]"
         } else {
@@ -218,7 +221,13 @@ pub(super) fn print_startup_banner(
         }
     }
 
-    fn route_text(channel_name: &str, account_id: Option<&str>, owner: &str, detail: &str, suffix: &str) -> String {
+    fn route_text(
+        channel_name: &str,
+        account_id: Option<&str>,
+        owner: &str,
+        detail: &str,
+        suffix: &str,
+    ) -> String {
         match account_id {
             Some(account) => format!(
                 "● {}:{}{} -> agent={}{}{}",
@@ -346,41 +355,97 @@ pub(super) fn print_startup_banner(
                     let account_id = label.split_once(':').map(|(_, account)| account);
                     let owner = owner_for(config, ch_info.id, account_id);
                     let detail = match (ch_info.id, account_id) {
-                        ("telegram", Some(account)) => config.channels.telegram.accounts.get(account)
+                        ("telegram", Some(account)) => config
+                            .channels
+                            .telegram
+                            .accounts
+                            .get(account)
                             .map(|acc| format!("allow_from: {:?}", acc.allow_from))
                             .unwrap_or_else(|| ch_info.detail.clone()),
-                        ("slack", Some(account)) => config.channels.slack.accounts.get(account)
+                        ("slack", Some(account)) => config
+                            .channels
+                            .slack
+                            .accounts
+                            .get(account)
                             .map(|acc| format!("channels: {:?}", acc.channels))
                             .unwrap_or_else(|| ch_info.detail.clone()),
-                        ("discord", Some(account)) => config.channels.discord.accounts.get(account)
+                        ("discord", Some(account)) => config
+                            .channels
+                            .discord
+                            .accounts
+                            .get(account)
                             .map(|acc| format!("channels: {:?}", acc.channels))
                             .unwrap_or_else(|| ch_info.detail.clone()),
-                        ("feishu", Some(account)) => config.channels.feishu.accounts.get(account)
+                        ("feishu", Some(account)) => config
+                            .channels
+                            .feishu
+                            .accounts
+                            .get(account)
                             .map(|acc| format!("app_id: {}", acc.app_id))
                             .unwrap_or_else(|| ch_info.detail.clone()),
-                        ("lark", Some(account)) => config.channels.lark.accounts.get(account)
+                        ("lark", Some(account)) => config
+                            .channels
+                            .lark
+                            .accounts
+                            .get(account)
                             .map(|acc| format!("app_id: {}", acc.app_id))
                             .unwrap_or_else(|| ch_info.detail.clone()),
-                        ("dingtalk", Some(account)) => config.channels.dingtalk.accounts.get(account)
+                        ("dingtalk", Some(account)) => config
+                            .channels
+                            .dingtalk
+                            .accounts
+                            .get(account)
                             .map(|acc| format!("robot_code: {}", acc.robot_code))
                             .unwrap_or_else(|| ch_info.detail.clone()),
-                        ("wecom", Some(account)) => config.channels.wecom.accounts.get(account)
+                        ("wecom", Some(account)) => config
+                            .channels
+                            .wecom
+                            .accounts
+                            .get(account)
                             .map(|acc| format!("agent_id: {}", acc.agent_id))
                             .unwrap_or_else(|| ch_info.detail.clone()),
-                        ("whatsapp", Some(account)) => config.channels.whatsapp.accounts.get(account)
+                        ("whatsapp", Some(account)) => config
+                            .channels
+                            .whatsapp
+                            .accounts
+                            .get(account)
                             .map(|acc| format!("bridge: {}", acc.bridge_url))
                             .unwrap_or_else(|| ch_info.detail.clone()),
                         _ => ch_info.detail.clone(),
                     };
                     let suffix = match ch_info.id {
-                        "telegram" => default_marker(config.channels.telegram.default_account_id.as_ref(), account_id),
-                        "slack" => default_marker(config.channels.slack.default_account_id.as_ref(), account_id),
-                        "discord" => default_marker(config.channels.discord.default_account_id.as_ref(), account_id),
-                        "feishu" => default_marker(config.channels.feishu.default_account_id.as_ref(), account_id),
-                        "lark" => default_marker(config.channels.lark.default_account_id.as_ref(), account_id),
-                        "dingtalk" => default_marker(config.channels.dingtalk.default_account_id.as_ref(), account_id),
-                        "wecom" => default_marker(config.channels.wecom.default_account_id.as_ref(), account_id),
-                        "whatsapp" => default_marker(config.channels.whatsapp.default_account_id.as_ref(), account_id),
+                        "telegram" => default_marker(
+                            config.channels.telegram.default_account_id.as_ref(),
+                            account_id,
+                        ),
+                        "slack" => default_marker(
+                            config.channels.slack.default_account_id.as_ref(),
+                            account_id,
+                        ),
+                        "discord" => default_marker(
+                            config.channels.discord.default_account_id.as_ref(),
+                            account_id,
+                        ),
+                        "feishu" => default_marker(
+                            config.channels.feishu.default_account_id.as_ref(),
+                            account_id,
+                        ),
+                        "lark" => default_marker(
+                            config.channels.lark.default_account_id.as_ref(),
+                            account_id,
+                        ),
+                        "dingtalk" => default_marker(
+                            config.channels.dingtalk.default_account_id.as_ref(),
+                            account_id,
+                        ),
+                        "wecom" => default_marker(
+                            config.channels.wecom.default_account_id.as_ref(),
+                            account_id,
+                        ),
+                        "whatsapp" => default_marker(
+                            config.channels.whatsapp.default_account_id.as_ref(),
+                            account_id,
+                        ),
                         _ => "",
                     };
                     enabled_routes.push(ChannelRouteLine {

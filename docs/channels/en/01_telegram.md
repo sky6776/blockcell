@@ -18,7 +18,7 @@ For security reasons, it's recommended to configure an allowlist (`allowFrom`) t
 
 ## 3. Configure Blockcell
 
-In Blockcell's configuration file (e.g., `~/.blockcell/config.json` or `config.json` in the project directory), find the `channels` configuration block and modify the `telegram` section:
+In Blockcell's configuration file (e.g., `~/.blockcell/config.json5` or `config.json5` in the project directory), find the `channels` configuration block and modify the `telegram` section:
 
 ```json
 {
@@ -38,7 +38,7 @@ In Blockcell's configuration file (e.g., `~/.blockcell/config.json` or `config.j
 - `token`: The API Token obtained from BotFather.
 - `allowFrom`: List of allowed user IDs (string array). If left empty `[]`, anyone can call the bot in group chats or private messages. It's recommended to configure specific IDs in production environments.
 
-> If you enable Telegram through `blockcell gateway`, you also need an owner binding in `config.json`, for example:
+> If you enable Telegram through `blockcell gateway`, you also need an owner binding in `config.json5`, for example:
 >
 > ```json
 > { "channelOwners": { "telegram": "default" } }

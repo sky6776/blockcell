@@ -199,7 +199,7 @@ blockcell gateway
 
 ## ⚙️ Configuration
 
-Minimal configuration example (`~/.blockcell/config.json`):
+Minimal configuration example (`~/.blockcell/config.json5`):
 
 ```json
 {

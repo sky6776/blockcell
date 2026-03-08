@@ -59,7 +59,7 @@ Go to **Permissions & Scopes**, search for and add the following permissions:
 
 ### 6. Configure Blockcell
 
-Edit `~/.blockcell/config.json`:
+Edit `~/.blockcell/config.json5`:
 
 ```json
 {
@@ -84,7 +84,7 @@ Edit `~/.blockcell/config.json`:
 | `verificationToken` | Verification Token (currently for recording, will be used for request verification in future versions) |
 | `allowFrom` | Allowed user open_id allowlist, empty array allows everyone |
 
-> If you enable this external channel through `blockcell gateway`, you also need an owner binding in `config.json`, for example:
+> If you enable this external channel through `blockcell gateway`, you also need an owner binding in `config.json5`, for example:
 >
 > ```json
 > { "channelOwners": { "lark": "default" } }
@@ -267,7 +267,7 @@ Blockcell gateway default ports:
 | `18790` | API + Webhook (HTTP) | Expose `/webhook/lark` via Nginx/ngrok proxy |
 | `18791` | WebUI (local access only) | Not recommended for public exposure |
 
-To modify ports, configure in `~/.blockcell/config.json`:
+To modify ports, configure in `~/.blockcell/config.json5`:
 
 ```json
 {

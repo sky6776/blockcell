@@ -174,7 +174,9 @@ fn compact_json_value(value: &serde_json::Value, depth: usize) -> serde_json::Va
         serde_json::Value::Null => serde_json::Value::Null,
         serde_json::Value::Bool(v) => serde_json::Value::Bool(*v),
         serde_json::Value::Number(v) => serde_json::Value::Number(v.clone()),
-        serde_json::Value::String(s) => serde_json::Value::String(truncate_str(s, MAX_STRING_CHARS)),
+        serde_json::Value::String(s) => {
+            serde_json::Value::String(truncate_str(s, MAX_STRING_CHARS))
+        }
         serde_json::Value::Array(arr) => {
             let items = arr
                 .iter()
@@ -192,7 +194,15 @@ fn compact_json_value(value: &serde_json::Value, depth: usize) -> serde_json::Va
             }
         }
         serde_json::Value::Object(map) => {
-            let heavy_keys = ["content", "body", "html", "markdown", "raw", "text", "full_text"];
+            let heavy_keys = [
+                "content",
+                "body",
+                "html",
+                "markdown",
+                "raw",
+                "text",
+                "full_text",
+            ];
             let mut result = serde_json::Map::new();
 
             for (key, value) in map.iter() {
@@ -292,8 +302,8 @@ fn prepare_skill_result_for_presentation(
         serde_json::Value::Object(compact)
     };
 
-    let llm_payload = serde_json::to_string_pretty(&llm_source)
-        .unwrap_or_else(|_| truncate_str(output, 4000));
+    let llm_payload =
+        serde_json::to_string_pretty(&llm_source).unwrap_or_else(|_| truncate_str(output, 4000));
 
     let fallback_text = if let Some(summary) = obj.get("summary_data") {
         let compact = serde_json::to_string_pretty(&compact_json_value(summary, 0))
@@ -799,7 +809,7 @@ fn is_sensitive_filename(path: &str) -> bool {
     let name = p.rsplit('/').next().unwrap_or("").to_lowercase();
     matches!(
         name.as_str(),
-        "config.json" | "config.toml" | "config.yaml" | "config.yml"
+        "config.json5" | "config.json" | "config.toml" | "config.yaml" | "config.yml"
     )
 }
 
@@ -1604,14 +1614,15 @@ impl AgentRuntime {
                             )),
                         ];
 
-                        let llm_result = if let Some((pidx, provider)) = self.provider_pool.acquire() {
+                        let llm_result = if let Some((pidx, provider)) =
+                            self.provider_pool.acquire()
+                        {
                             let r = provider.chat(&summarize_messages, &[]).await;
                             match &r {
                                 Ok(_) => self.provider_pool.report(pidx, CallResult::Success),
-                                Err(e) => self.provider_pool.report(
-                                    pidx,
-                                    ProviderPool::classify_error(&format!("{}", e)),
-                                ),
+                                Err(e) => self
+                                    .provider_pool
+                                    .report(pidx, ProviderPool::classify_error(&format!("{}", e))),
                             }
                             r
                         } else {
@@ -1641,22 +1652,23 @@ impl AgentRuntime {
                 }
             };
 
-            let deliver_target = if let Some(true) = msg.metadata.get("deliver").and_then(|v| v.as_bool()) {
-                if let (Some(channel), Some(to)) = (
-                    msg.metadata.get("deliver_channel").and_then(|v| v.as_str()),
-                    msg.metadata.get("deliver_to").and_then(|v| v.as_str()),
-                ) {
-                    if !channel.is_empty() && !to.is_empty() {
-                        Some((channel.to_string(), to.to_string()))
+            let deliver_target =
+                if let Some(true) = msg.metadata.get("deliver").and_then(|v| v.as_bool()) {
+                    if let (Some(channel), Some(to)) = (
+                        msg.metadata.get("deliver_channel").and_then(|v| v.as_str()),
+                        msg.metadata.get("deliver_to").and_then(|v| v.as_str()),
+                    ) {
+                        if !channel.is_empty() && !to.is_empty() {
+                            Some((channel.to_string(), to.to_string()))
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
 
             let persist_session_key = if let Some((channel, to)) = &deliver_target {
                 blockcell_core::build_session_key(channel, to)
@@ -1722,22 +1734,23 @@ impl AgentRuntime {
             let final_response = format!("⏰ [{}] {}", job_name, reminder_msg);
             info!(job_name = %job_name, "Cron reminder delivered directly (bypassing LLM)");
 
-            let persist_session_key = if let Some(true) = msg.metadata.get("deliver").and_then(|v| v.as_bool()) {
-                if let (Some(channel), Some(to)) = (
-                    msg.metadata.get("deliver_channel").and_then(|v| v.as_str()),
-                    msg.metadata.get("deliver_to").and_then(|v| v.as_str()),
-                ) {
-                    if !channel.is_empty() && !to.is_empty() {
-                        blockcell_core::build_session_key(channel, to)
+            let persist_session_key =
+                if let Some(true) = msg.metadata.get("deliver").and_then(|v| v.as_bool()) {
+                    if let (Some(channel), Some(to)) = (
+                        msg.metadata.get("deliver_channel").and_then(|v| v.as_str()),
+                        msg.metadata.get("deliver_to").and_then(|v| v.as_str()),
+                    ) {
+                        if !channel.is_empty() && !to.is_empty() {
+                            blockcell_core::build_session_key(channel, to)
+                        } else {
+                            session_key.clone()
+                        }
                     } else {
                         session_key.clone()
                     }
                 } else {
                     session_key.clone()
-                }
-            } else {
-                session_key.clone()
-            };
+                };
 
             let reminder_history_message = ChatMessage::assistant(&final_response);
             let _ = self
@@ -1823,7 +1836,10 @@ impl AgentRuntime {
         let active_skill = self
             .context_builder
             .resolve_active_skill_by_name(forced_skill_name, &disabled_skills)
-            .or_else(|| self.context_builder.resolve_active_skill(&msg.content, &disabled_skills));
+            .or_else(|| {
+                self.context_builder
+                    .resolve_active_skill(&msg.content, &disabled_skills)
+            });
         let chat_intents = classifier.classify(&msg.content);
         let is_chat = active_skill.is_none()
             && chat_intents.len() == 1
@@ -3077,7 +3093,10 @@ impl AgentRuntime {
             obj.remove("skill_script");
             obj.remove("skill_script_kind");
             obj.remove("skill_markdown");
-            obj.insert("forced_skill_name".to_string(), serde_json::json!(skill_name));
+            obj.insert(
+                "forced_skill_name".to_string(),
+                serde_json::json!(skill_name),
+            );
         }
 
         info!(skill = %skill_name, "SKILL.md execution routed through normal LLM skill flow");
@@ -3818,7 +3837,10 @@ async fn run_subagent_task(
                 if let Some(obj) = metadata.as_object_mut() {
                     obj.insert("skill_script".to_string(), serde_json::json!(true));
                     obj.insert("skill_name".to_string(), serde_json::json!(skill_name));
-                    obj.insert("subagent_session_key".to_string(), serde_json::json!(session_key.clone()));
+                    obj.insert(
+                        "subagent_session_key".to_string(),
+                        serde_json::json!(session_key.clone()),
+                    );
                 }
                 metadata
             },
@@ -3837,7 +3859,10 @@ async fn run_subagent_task(
             metadata: {
                 let mut metadata = subagent_metadata.clone();
                 if let Some(obj) = metadata.as_object_mut() {
-                    obj.insert("subagent_session_key".to_string(), serde_json::json!(session_key.clone()));
+                    obj.insert(
+                        "subagent_session_key".to_string(),
+                        serde_json::json!(session_key.clone()),
+                    );
                 }
                 metadata
             },
@@ -4310,5 +4335,10 @@ mod tests {
             resolve_profile_tool_names(&config, None, &[IntentCategory::Chat], &available);
 
         assert!(tool_names.is_empty());
+    }
+    #[test]
+    fn test_is_sensitive_filename_matches_json5_config() {
+        assert!(is_sensitive_filename("config.json5"));
+        assert!(is_sensitive_filename("/tmp/.blockcell/config.json5"));
     }
 }

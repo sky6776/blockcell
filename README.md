@@ -199,7 +199,7 @@ blockcell gateway
 
 ## ⚙️ 配置说明
 
-最小配置示例（`~/.blockcell/config.json`）：
+最小配置示例（`~/.blockcell/config.json5`）：
 
 ```json
 {

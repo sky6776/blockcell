@@ -15,7 +15,7 @@
 
 ## 当前架构
 
-现在的 blockcell 不再把 MCP 配置塞进 `config.json` 的 `mcpServers` 字段，而是改成**独立 MCP 配置层**：
+现在的 blockcell 不再把 MCP 配置塞进 `config.json5` 的 `mcpServers` 字段，而是改成**独立 MCP 配置层**：
 
 - `~/.blockcell/mcp.json`：全局 MCP 元配置
 - `~/.blockcell/mcp.d/*.json`：按 server 拆分的独立文件

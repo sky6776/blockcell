@@ -23,7 +23,7 @@ If your bridge runs elsewhere, set `bridgeUrl` accordingly in config.
 
 ## 2. Configure Blockcell
 
-Edit `~/.blockcell/config.json`:
+Edit `~/.blockcell/config.json5`:
 
 ```json
 {

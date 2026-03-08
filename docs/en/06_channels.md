@@ -134,7 +134,7 @@ blockcell channels owner set --channel telegram --account bot2 --agent ops
 
 ### Step 3: configure blockcell
 
-Edit `~/.blockcell/config.json`:
+Edit `~/.blockcell/config.json5`:
 
 ```json
 {
@@ -451,7 +451,7 @@ In Gateway mode (`blockcell gateway`), the AI cannot access files outside the wo
 
 ### 3) API token and WebUI password
 
-If `gateway.apiToken` is empty, Gateway now auto-generates one on startup and persists it to `config.json`, so the API is not left completely open.
+If `gateway.apiToken` is empty, Gateway now auto-generates one on startup and persists it to `config.json5`, so the API is not left completely open.
 
 If you want a stable WebUI password, set `gateway.webuiPass`; otherwise Gateway prints a temporary password at startup.
 

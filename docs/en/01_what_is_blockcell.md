@@ -166,7 +166,7 @@ curl -fsSL https://raw.githubusercontent.com/blockcell-labs/blockcell/refs/heads
 blockcell onboard
 
 # Edit config and add your API key
-# ~/.blockcell/config.json
+# ~/.blockcell/config.json5
 
 # Start chatting
 blockcell agent

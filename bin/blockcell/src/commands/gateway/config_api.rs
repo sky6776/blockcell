@@ -1,4 +1,18 @@
 use super::*;
+
+fn load_config_or_state(state: &GatewayState) -> Config {
+    Config::load(&state.paths.config_file()).unwrap_or_else(|_| state.config.clone())
+}
+
+fn load_config_value_or_state(state: &GatewayState) -> serde_json::Value {
+    let config_path = state.paths.config_file();
+    match std::fs::read_to_string(&config_path) {
+        Ok(content) => blockcell_core::config::parse_json5_value(&content)
+            .unwrap_or_else(|_| serde_json::to_value(&state.config).unwrap_or_default()),
+        Err(_) => serde_json::to_value(&state.config).unwrap_or_default(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // P1: Config management endpoints
 // ---------------------------------------------------------------------------
@@ -6,12 +20,23 @@ use super::*;
 /// GET /v1/config — get config (returns plaintext API keys)
 /// Always reads from disk so edits via PUT are immediately reflected.
 pub(super) async fn handle_config_get(State(state): State<GatewayState>) -> impl IntoResponse {
+    Json(load_config_value_or_state(&state))
+}
+
+/// GET /v1/config/raw — get raw config.json5 text
+pub(super) async fn handle_config_raw_get(State(state): State<GatewayState>) -> impl IntoResponse {
     let config_path = state.paths.config_file();
-    let config_val = match tokio::fs::read_to_string(&config_path).await {
-        Ok(content) => serde_json::from_str::<serde_json::Value>(&content).unwrap_or_default(),
-        Err(_) => serde_json::to_value(&state.config).unwrap_or_default(),
+    let content = match tokio::fs::read_to_string(&config_path).await {
+        Ok(content) => content,
+        Err(_) => blockcell_core::config::stringify_json5_pretty(&state.config)
+            .unwrap_or_else(|_| "{}".to_string()),
     };
-    Json(config_val)
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "path": config_path.display().to_string(),
+        "content": content,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -20,7 +45,12 @@ pub(super) struct ConfigUpdateRequest {
     config: serde_json::Value,
 }
 
-/// PUT /v1/config — update config
+#[derive(Deserialize)]
+pub(super) struct ConfigRawUpdateRequest {
+    content: String,
+}
+
+/// PUT /v1/config — update config with structured JSON payload
 pub(super) async fn handle_config_update(
     State(state): State<GatewayState>,
     Json(req): Json<ConfigUpdateRequest>,
@@ -40,37 +70,42 @@ pub(super) async fn handle_config_update(
     }
 }
 
-/// POST /v1/config/reload — reload config from disk (validates JSON format)
+/// PUT /v1/config/raw — validate and write raw config.json5 text as-is
+pub(super) async fn handle_config_raw_put(
+    State(state): State<GatewayState>,
+    Json(req): Json<ConfigRawUpdateRequest>,
+) -> impl IntoResponse {
+    let config_path = state.paths.config_file();
+    match blockcell_core::config::write_raw_validated_config_json5(&config_path, &req.content) {
+        Ok(_) => Json(serde_json::json!({
+            "status": "ok",
+            "message": "Config updated. Restart gateway to apply changes.",
+        })),
+        Err(e) => Json(serde_json::json!({
+            "status": "error",
+            "message": format!("Invalid config.json5: {}", e),
+        })),
+    }
+}
+
+/// POST /v1/config/reload — validate config.json5 from disk
 pub(super) async fn handle_config_reload(State(state): State<GatewayState>) -> impl IntoResponse {
     let config_path = state.paths.config_file();
 
-    // 读取并验证配置文件
     match tokio::fs::read_to_string(&config_path).await {
-        Ok(content) => {
-            // 验证JSON格式
-            match serde_json::from_str::<serde_json::Value>(&content) {
-                Ok(json_val) => {
-                    // 验证配置结构
-                    match serde_json::from_value::<Config>(json_val) {
-                        Ok(_) => Json(serde_json::json!({
-                            "status": "ok",
-                            "message": "Config validated successfully. Note: Full reload requires gateway restart for some settings."
-                        })),
-                        Err(e) => Json(serde_json::json!({
-                            "status": "error",
-                            "message": format!("Invalid config structure: {}", e)
-                        })),
-                    }
-                }
-                Err(e) => Json(serde_json::json!({
-                    "status": "error",
-                    "message": format!("Invalid JSON format: {}", e)
-                })),
-            }
-        }
+        Ok(content) => match blockcell_core::config::validate_config_json5_str(&content) {
+            Ok(_) => Json(serde_json::json!({
+                "status": "ok",
+                "message": "Config.json5 validated successfully. Note: Full reload still requires gateway restart for some settings.",
+            })),
+            Err(e) => Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Invalid config.json5: {}", e),
+            })),
+        },
         Err(e) => Json(serde_json::json!({
             "status": "error",
-            "message": format!("Failed to read config file: {}", e)
+            "message": format!("Failed to read config file: {}", e),
         })),
     }
 }
@@ -79,6 +114,51 @@ pub(super) async fn handle_config_reload(State(state): State<GatewayState>) -> i
 pub(super) async fn handle_config_test_provider(
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    use blockcell_providers::Provider;
+
+    let test_messages = vec![blockcell_core::types::ChatMessage::user("Say 'ok'")];
+
+    if let Some(content) = req.get("content").and_then(|v| v.as_str()) {
+        let config = match blockcell_core::config::validate_config_json5_str(content) {
+            Ok(config) => config,
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("Invalid config.json5: {}", e),
+                }))
+            }
+        };
+
+        let model = req
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(config.agents.defaults.model.as_str());
+        let explicit_provider = req
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .or(config.agents.defaults.provider.as_deref());
+
+        let provider = match blockcell_providers::create_provider(&config, model, explicit_provider)
+        {
+            Ok(provider) => provider,
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("{}", e),
+                }))
+            }
+        };
+
+        return match provider.chat(&test_messages, &[]).await {
+            Ok(_) => Json(
+                serde_json::json!({ "status": "ok", "message": "Provider connection successful" }),
+            ),
+            Err(e) => Json(serde_json::json!({ "status": "error", "message": format!("{}", e) })),
+        };
+    }
+
     let model = req
         .get("model")
         .and_then(|v| v.as_str())
@@ -91,8 +171,6 @@ pub(super) async fn handle_config_test_provider(
         return Json(serde_json::json!({ "status": "error", "message": "api_key is required" }));
     }
 
-    // Try a simple completion to test the connection
-    // The WebUI sends the correct api_base (from form input with defaultBase fallback).
     let provider = blockcell_providers::OpenAIProvider::new_with_proxy(
         api_key,
         api_base,
@@ -104,8 +182,6 @@ pub(super) async fn handle_config_test_provider(
         &[],
     );
 
-    use blockcell_providers::Provider;
-    let test_messages = vec![blockcell_core::types::ChatMessage::user("Say 'ok'")];
     match provider.chat(&test_messages, &[]).await {
         Ok(_) => {
             Json(serde_json::json!({ "status": "ok", "message": "Provider connection successful" }))
@@ -113,21 +189,12 @@ pub(super) async fn handle_config_test_provider(
         Err(e) => Json(serde_json::json!({ "status": "error", "message": format!("{}", e) })),
     }
 }
+
 /// GET /v1/ghost/config — get ghost agent configuration
 pub(super) async fn handle_ghost_config_get(
     State(state): State<GatewayState>,
 ) -> impl IntoResponse {
-    // Read from disk each time so updates via PUT take effect immediately
-    // without requiring a gateway restart.
-    let config_path = state.paths.config_file();
-    let ghost = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Config>(&s).ok())
-        .map(|c| c.agents.ghost)
-        .unwrap_or_else(|| state.config.agents.ghost.clone());
-
-    // GhostConfig has #[serde(rename_all = "camelCase")], so this serialization
-    // automatically handles maxSyncsPerDay and autoSocial keys correctly.
+    let ghost = load_config_or_state(&state).agents.ghost;
     Json(ghost)
 }
 
@@ -137,13 +204,7 @@ pub(super) async fn handle_ghost_config_update(
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let config_path = state.paths.config_file();
-    let mut config: Config = match std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-    {
-        Some(c) => c,
-        None => state.config.clone(),
-    };
+    let mut config = load_config_or_state(&state);
 
     if let Some(v) = req.get("enabled").and_then(|v| v.as_bool()) {
         config.agents.ghost.enabled = v;
@@ -188,7 +249,6 @@ pub(super) async fn handle_ghost_activity(
 
     let mut activities: Vec<serde_json::Value> = Vec::new();
 
-    // Scan session files for ghost sessions (chat_id starts with "ghost_")
     if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
         let mut ghost_files: Vec<_> = entries
             .flatten()
@@ -201,7 +261,6 @@ pub(super) async fn handle_ghost_activity(
             })
             .collect();
 
-        // Sort by modification time, newest first
         ghost_files.sort_by(|a, b| {
             let ta = a.metadata().and_then(|m| m.modified()).ok();
             let tb = b.metadata().and_then(|m| m.modified()).ok();
@@ -220,8 +279,6 @@ pub(super) async fn handle_ghost_activity(
                 let lines: Vec<&str> = content.lines().collect();
                 let message_count = lines.len();
 
-                // Extract timestamp from session_id (ghost_YYYYMMDD_HHMMSS)
-                // and normalize to "YYYY-MM-DD HH:MM" for display.
                 let raw_ts = session_id
                     .strip_prefix("ghost_")
                     .unwrap_or(&session_id)
@@ -230,7 +287,6 @@ pub(super) async fn handle_ghost_activity(
                     .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or(raw_ts);
 
-                // Get first user message (the routine prompt) and last assistant message (summary)
                 let mut routine_prompt = String::new();
                 let mut summary = String::new();
                 let mut tool_calls: Vec<String> = Vec::new();
@@ -293,11 +349,7 @@ pub(super) async fn handle_ghost_activity(
 pub(super) async fn handle_ghost_model_options_get(
     State(state): State<GatewayState>,
 ) -> impl IntoResponse {
-    let config_path = state.paths.config_file();
-    let config: Config = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| state.config.clone());
+    let config = load_config_or_state(&state);
 
     let mut providers: Vec<String> = config
         .providers

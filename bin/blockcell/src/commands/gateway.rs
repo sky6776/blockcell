@@ -775,9 +775,9 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         let alias = uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string();
         config.community_hub.node_alias = Some(alias.clone());
         if let Err(e) = config.save(&paths.config_file()) {
-            warn!("Failed to persist node_alias to config.json: {}", e);
+            warn!("Failed to persist node_alias to config.json5: {}", e);
         } else {
-            info!(node_alias = %alias, "Generated and persisted node_alias to config.json");
+            info!(node_alias = %alias, "Generated and persisted node_alias to config.json5");
         }
     }
 
@@ -862,11 +862,11 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
             config.gateway.api_token = Some(generated);
             if let Err(e) = config.save(&paths.config_file()) {
                 warn!(
-                    "Failed to persist auto-generated apiToken to config.json: {}",
+                    "Failed to persist auto-generated apiToken to config.json5: {}",
                     e
                 );
             } else {
-                info!("Auto-generated apiToken persisted to config.json");
+                info!("Auto-generated apiToken persisted to config.json5");
             }
         }
     }
@@ -1365,6 +1365,10 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         .route(
             "/v1/config",
             get(handle_config_get).put(handle_config_update),
+        )
+        .route(
+            "/v1/config/raw",
+            get(handle_config_raw_get).put(handle_config_raw_put),
         )
         .route("/v1/config/reload", post(handle_config_reload))
         .route(

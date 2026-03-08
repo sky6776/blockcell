@@ -1,4 +1,6 @@
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -1281,10 +1283,54 @@ impl Default for Config {
     }
 }
 
+pub fn parse_json5_str<T>(content: &str) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    json5::from_str(content)
+        .map_err(|e| crate::error::Error::Config(format!("Invalid JSON5 format: {}", e)))
+}
+
+pub fn parse_json5_value(content: &str) -> Result<Value> {
+    parse_json5_str(content)
+}
+
+pub fn stringify_json5_pretty<T>(value: &T) -> Result<String>
+where
+    T: Serialize,
+{
+    Ok(serde_json::to_string_pretty(value)?)
+}
+
+pub fn write_json5_pretty<T>(path: &Path, value: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    let content = stringify_json5_pretty(value)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
+pub fn validate_config_json5_str(content: &str) -> Result<Config> {
+    parse_json5_str(content)
+}
+
+pub fn write_raw_validated_config_json5(path: &Path, content: &str) -> Result<Config> {
+    let config = validate_config_json5_str(content)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)?;
+    Ok(config)
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: Config = serde_json::from_str(&content)?;
+        let config: Config = parse_json5_str(&content)?;
         Ok(config)
     }
 
@@ -1298,12 +1344,7 @@ impl Config {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        let content = serde_json::to_string_pretty(self)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, content)?;
-        Ok(())
+        write_json5_pretty(path, self)
     }
 
     pub fn get_api_key(&self) -> Option<(&str, &ProviderConfig)> {
@@ -1567,6 +1608,57 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn temp_config_path(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("blockcell-config-tests-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+        dir.join(name)
+    }
+
+    #[test]
+    fn test_config_load_accepts_json5_comments_and_trailing_commas() {
+        let path = temp_config_path("config.json5");
+        fs::write(
+            &path,
+            r#"{
+  // provider config in JSON5
+  providers: {
+    openai: {
+      apiKey: 'sk-test',
+    },
+  },
+  agents: {
+    defaults: {
+      model: 'gpt-4.1',
+    },
+  },
+}"#,
+        )
+        .expect("write config.json5");
+
+        let cfg = Config::load(&path).expect("load json5 config");
+        assert_eq!(cfg.agents.defaults.model, "gpt-4.1");
+        assert_eq!(
+            cfg.providers.get("openai").map(|p| p.api_key.as_str()),
+            Some("sk-test")
+        );
+    }
+
+    #[test]
+    fn test_config_save_round_trips_via_json5_loader() {
+        let path = temp_config_path("config.json5");
+        let mut cfg = Config::default();
+        cfg.agents.defaults.model = "deepseek-chat".to_string();
+
+        cfg.save(&path).expect("save config json5");
+        let content = fs::read_to_string(&path).expect("read saved config");
+        assert!(content.contains("deepseek-chat"));
+
+        let loaded = Config::load(&path).expect("reload saved config");
+        assert_eq!(loaded.agents.defaults.model, "deepseek-chat");
+    }
 
     #[test]
     fn test_community_hub_top_level() {

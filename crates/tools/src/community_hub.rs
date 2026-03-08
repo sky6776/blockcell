@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use blockcell_core::Result;
+use blockcell_core::{Config, Paths, Result};
 use reqwest::Url;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
@@ -50,7 +50,7 @@ fn resolve_hub_url(ctx: &ToolContext, params: &Value) -> Option<String> {
     if let Some(url) = ctx.config.community_hub_url() {
         return Some(url);
     }
-    // 1b. Fallback: reload config.json from disk (runtime may have stale config)
+    // 1b. Fallback: reload config.json5 from disk (runtime may have stale config)
     if let Some(url) = load_config_from_disk(ctx).and_then(|cfg| cfg.community_hub_url()) {
         return Some(url);
     }
@@ -79,13 +79,12 @@ fn resolve_api_key(ctx: &ToolContext, params: &Value) -> Option<String> {
     None
 }
 
-fn load_config_from_disk(ctx: &ToolContext) -> Option<blockcell_core::Config> {
+fn load_config_from_disk(ctx: &ToolContext) -> Option<Config> {
     // ctx.workspace is typically ~/.blockcell/workspace
-    // Config lives at ~/.blockcell/config.json
+    // Main config lives at ~/.blockcell/config.json5
     let base_dir = ctx.workspace.parent()?.to_path_buf();
-    let config_path = base_dir.join("config.json");
-    let content = std::fs::read_to_string(&config_path).ok()?;
-    serde_json::from_str::<blockcell_core::Config>(&content).ok()
+    let paths = Paths::with_base(base_dir);
+    Config::load(&paths.config_file()).ok()
 }
 
 async fn hub_get(client: &reqwest::Client, url: &str, api_key: &Option<String>) -> Result<Value> {

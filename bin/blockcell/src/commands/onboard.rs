@@ -1,4 +1,7 @@
-use blockcell_core::Paths;
+use blockcell_core::{
+    config::{parse_json5_value, stringify_json5_pretty, write_raw_validated_config_json5},
+    Paths,
+};
 use std::io::{self, Write};
 use std::process::Command;
 
@@ -254,8 +257,9 @@ pub async fn run(
             EXAMPLE_CONFIG.to_string()
         };
 
-        let mut json: serde_json::Value = serde_json::from_str(&config_str)
-            .unwrap_or_else(|_| serde_json::from_str(EXAMPLE_CONFIG).unwrap());
+        let mut json: serde_json::Value = parse_json5_value(&config_str).unwrap_or_else(|_| {
+            parse_json5_value(EXAMPLE_CONFIG).expect("parse bundled example config")
+        });
 
         ensure_auto_upgrade_defaults(&mut json);
 
@@ -276,7 +280,7 @@ pub async fn run(
         if let Some(parent) = paths.config_file().parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(paths.config_file(), serde_json::to_string_pretty(&json)?)?;
+        std::fs::write(paths.config_file(), stringify_json5_pretty(&json)?)?;
 
         println!("✓ Provider configured: {}", prov);
         if api_key.is_some() {
@@ -296,7 +300,7 @@ pub async fn run(
     if let Some(parent) = paths.config_file().parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(paths.config_file(), EXAMPLE_CONFIG)?;
+    write_raw_validated_config_json5(&paths.config_file(), EXAMPLE_CONFIG)?;
     println!("✓ Created config: {}", paths.config_file().display());
 
     // Create workspace files

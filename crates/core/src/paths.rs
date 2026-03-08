@@ -20,7 +20,7 @@ impl Paths {
     }
 
     pub fn config_file(&self) -> PathBuf {
-        self.base.join("config.json")
+        self.base.join("config.json5")
     }
 
     pub fn mcp_config_file(&self) -> PathBuf {
@@ -209,6 +209,15 @@ mod tests {
         assert_eq!(
             default_paths.audit_dir(),
             PathBuf::from("/tmp/blockcell/audit")
+        );
+    }
+
+    #[test]
+    fn test_config_file_uses_json5_extension() {
+        let paths = Paths::with_base(PathBuf::from("/tmp/blockcell"));
+        assert_eq!(
+            paths.config_file(),
+            PathBuf::from("/tmp/blockcell/config.json5")
         );
     }
 

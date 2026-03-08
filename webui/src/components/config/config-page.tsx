@@ -5,7 +5,7 @@ import {
   ToggleLeft, ToggleRight,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { getConfig, updateConfig, testProvider, getHealth, logout, reloadConfig } from '@/lib/api';
+import { getConfig, getConfigRaw, updateConfig, updateConfigRaw, testProvider, getHealth, logout, reloadConfig } from '@/lib/api';
 import { useThemeStore } from '@/lib/store';
 import { useI18nStore, useT, type Locale } from '@/lib/i18n';
 
@@ -85,8 +85,8 @@ function ConfigEditor({ onBack, t }: { onBack: () => void; t: (k: string, p?: Re
   async function fetchConfig() {
     setLoading(true);
     try {
-      const data = await getConfig();
-      setEditJson(JSON.stringify(data, null, 2));
+      const data = await getConfigRaw();
+      setEditJson(data.content);
     } catch (e: any) {
       setMessage({ type: 'error', text: e.message });
     } finally {
@@ -98,9 +98,8 @@ function ConfigEditor({ onBack, t }: { onBack: () => void; t: (k: string, p?: Re
     setSaving(true);
     setMessage(null);
     try {
-      const parsed = JSON.parse(editJson);
-      await updateConfig(parsed);
-      setMessage({ type: 'success', text: t('settings.configSaved') });
+      const result = await updateConfigRaw(editJson);
+      setMessage({ type: 'success', text: result.message || t('settings.configSaved') });
       setRestartNoticeOpen(true);
     } catch (e: any) {
       setMessage({ type: 'error', text: e.message });
@@ -113,15 +112,7 @@ function ConfigEditor({ onBack, t }: { onBack: () => void; t: (k: string, p?: Re
     setTesting(true);
     setMessage(null);
     try {
-      const parsed = JSON.parse(editJson);
-      const model = parsed?.agents?.defaults?.model || '';
-      const providerName = Object.keys(parsed?.providers || {})[0] || 'openai';
-      const providerConf = parsed?.providers?.[providerName] || {};
-      const result = await testProvider({
-        model,
-        api_key: providerConf.apiKey || providerConf.api_key || '',
-        api_base: providerConf.apiBase || providerConf.api_base,
-      });
+      const result = await testProvider({ content: editJson });
       setMessage({ type: 'success', text: result.message || 'Provider test passed' });
     } catch (e: any) {
       setMessage({ type: 'error', text: e.message });

@@ -165,7 +165,7 @@ curl -fsSL https://raw.githubusercontent.com/blockcell-labs/blockcell/refs/heads
 blockcell onboard
 
 # 编辑配置，填入你的 API Key
-# ~/.blockcell/config.json
+# ~/.blockcell/config.json5
 
 # 启动对话
 blockcell agent

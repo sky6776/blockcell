@@ -222,7 +222,7 @@ pub async fn run() -> anyhow::Result<()> {
     } else {
         print_err(
             "No API key configured",
-            "Edit config.json to add a provider API key",
+            "Edit config.json5 to add a provider API key",
         );
         err_count += 1;
         println!("  Model: {}", config.agents.defaults.model);

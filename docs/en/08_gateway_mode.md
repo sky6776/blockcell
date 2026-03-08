@@ -203,7 +203,7 @@ Main features:
 
 ## API authentication
 
-In the current implementation, if `gateway.apiToken` is empty, Gateway **auto-generates one on first startup and persists it to `config.json`**. That means the API is not left fully open by default, but for public deployments you should still set a deliberate long-lived token yourself.
+In the current implementation, if `gateway.apiToken` is empty, Gateway **auto-generates one on first startup and persists it to `config.json5`**. That means the API is not left fully open by default, but for public deployments you should still set a deliberate long-lived token yourself.
 
 ```json
 {
@@ -306,7 +306,7 @@ sudo systemctl status blockcell
 FROM ubuntu:22.04
 RUN apt-get update && apt-get install -y curl
 RUN curl -fsSL https://raw.githubusercontent.com/blockcell-labs/blockcell/refs/heads/main/install.sh | sh
-COPY config.json /root/.blockcell/config.json
+COPY config.json5 /root/.blockcell/config.json5
 EXPOSE 18790 18791
 CMD ["blockcell", "gateway"]
 ```

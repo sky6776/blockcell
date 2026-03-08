@@ -70,7 +70,7 @@ In Blockcell's configuration file, modify the `dingtalk` section:
 - `robotCode`: Unique identifier for the bot (usually the same as appKey).
 - `allowFrom`: List of allowed user `staffId`s (string array). If left empty `[]`, anyone within the enterprise's visibility range can interact with the bot.
 
-> If you enable this external channel through `blockcell gateway`, you also need an owner binding in `config.json`, for example:
+> If you enable this external channel through `blockcell gateway`, you also need an owner binding in `config.json5`, for example:
 >
 > ```json
 > { "channelOwners": { "dingtalk": "default" } }

@@ -52,7 +52,7 @@ WeCom's `sender_id` is usually the enterprise's account (UserID).
 
 ## 5. Configure Blockcell
 
-Edit `~/.blockcell/config.json` and modify the `wecom` section:
+Edit `~/.blockcell/config.json5` and modify the `wecom` section:
 
 ```json
 {
@@ -84,7 +84,7 @@ Edit `~/.blockcell/config.json` and modify the `wecom` section:
 | `encodingAesKey` | For callback mode message encryption/decryption. Can be empty if using polling |
 | `allowFrom` | List of allowed user `UserID`s. If left empty `[]`, anyone within the enterprise's visibility range can interact with the bot |
 
-> If you enable this external channel through `blockcell gateway`, you also need an owner binding in `config.json`, for example:
+> If you enable this external channel through `blockcell gateway`, you also need an owner binding in `config.json5`, for example:
 >
 > ```json
 > { "channelOwners": { "wecom": "default" } }
