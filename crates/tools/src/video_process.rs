@@ -273,6 +273,45 @@ impl VideoProcessTool {
         Ok((stdout, stderr))
     }
 
+    async fn ensure_ffmpeg_filter_available(filter_name: &str) -> Result<()> {
+        let arg = format!("filter={}", filter_name);
+        let output = tokio::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-h", &arg])
+            .output()
+            .await
+            .map_err(|e| {
+                Error::Tool(format!(
+                    "Failed to check ffmpeg filter '{}': {}",
+                    filter_name, e
+                ))
+            })?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let combined = if stderr.is_empty() {
+            stdout
+        } else {
+            format!("{}\n{}", stdout, stderr)
+        };
+        let lower = combined.to_lowercase();
+        if lower.contains("unknown filter") || lower.contains("no such filter") {
+            return Err(Error::Tool(format!(
+                "ffmpeg filter '{}' is unavailable in the current build. Subtitle burn-in requires ffmpeg with libass support. Check `ffmpeg -filters | rg subtitles` and `ffmpeg -buildconf | rg libass`. On macOS, make sure you are using an ffmpeg build that includes libass, then retry.",
+                filter_name
+            )));
+        }
+
+        Err(Error::Tool(format!(
+            "Failed to verify ffmpeg filter '{}': {}",
+            filter_name,
+            combined.trim()
+        )))
+    }
+
     async fn run_ffprobe(input: &str) -> Result<Value> {
         let output = tokio::process::Command::new("ffprobe")
             .args([
@@ -428,6 +467,8 @@ impl VideoProcessTool {
     }
 
     async fn action_subtitle(&self, ctx: &ToolContext, params: &Value) -> Result<Value> {
+        Self::ensure_ffmpeg_filter_available("subtitles").await?;
+
         let input = Self::resolve_input(ctx, params);
         let output = Self::resolve_output(ctx, params, "mp4");
         let sub_file = params
