@@ -418,20 +418,33 @@ impl ChannelManager {
             "wecom" => {
                 #[cfg(feature = "wecom")]
                 {
+                    let wecom_mode = send_config.channels.wecom.mode.trim().to_lowercase();
+                    let is_long_conn = wecom_mode == "long_connection"
+                        || wecom_mode == "long-connection"
+                        || wecom_mode == "stream";
                     if !msg.media.is_empty() {
+                        // In long_connection mode we combine text + image into one message to
+                        // avoid sending two finish:true replies for the same req_id.
+                        // Pass content as caption to the first media file; clear it for the rest.
+                        let mut remaining_caption = msg.content.as_str();
                         for file_path in &msg.media {
                             if let Err(e) = crate::wecom::send_media_message(
                                 &send_config,
                                 &msg.chat_id,
                                 file_path,
+                                if is_long_conn { remaining_caption } else { "" },
                             )
                             .await
                             {
                                 error!(error = %e, file = %file_path, "WeCom: failed to send media");
                             }
+                            remaining_caption = "";
                         }
                     }
-                    if !msg.content.is_empty() {
+                    // For long_connection mode skip the separate text send when media was present
+                    // (the caption was already included in the image message above).
+                    let skip_text = is_long_conn && !msg.media.is_empty();
+                    if !msg.content.is_empty() && !skip_text {
                         crate::wecom::send_message(&send_config, &msg.chat_id, &msg.content)
                             .await?;
                     }

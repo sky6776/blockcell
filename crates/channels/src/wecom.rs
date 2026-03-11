@@ -27,10 +27,8 @@ static SEEN_MSG_IDS: std::sync::LazyLock<Mutex<HashSet<String>>> =
 /// Outbound message for the long connection WebSocket channel.
 #[derive(Debug)]
 enum LongConnOutbound {
-    /// Plain text reply.
+    /// Plain text reply (stream msgtype).
     Text { chat_id: String, content: String },
-    /// Pre-uploaded media reply.  `media_type` is one of: image / voice / video / file.
-    Media { chat_id: String, media_id: String, media_type: String, filename: String },
 }
 
 /// Registry of active long connection outbound senders keyed by bot_id.
@@ -42,6 +40,11 @@ static LONGCONN_REGISTRY: std::sync::LazyLock<Mutex<HashMap<String, mpsc::Sender
 /// aibot_respond_msg must echo back the original req_id so WeCom routes the reply correctly.
 static CHAT_REQID_REGISTRY: std::sync::LazyLock<Mutex<HashMap<String, String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+
+/// Shared REST access_token cache for WeCom corp APIs.
+static WECOM_TOKEN_CACHE: std::sync::LazyLock<tokio::sync::Mutex<CachedToken>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(CachedToken::default()));
 
 const SEEN_MSG_IDS_MAX: usize = 512;
 
@@ -90,6 +93,12 @@ struct TokenResponse {
 struct WeComResponse {
     errcode: i32,
     errmsg: String,
+}
+
+impl WeComResponse {
+    fn is_invalid_token(&self) -> bool {
+        matches!(self.errcode, 40014 | 42001)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -270,45 +279,10 @@ impl WeComChannel {
     }
 
     pub async fn get_access_token(&self) -> Result<String> {
+        let token = fetch_access_token_static(&self.client, &self.config).await?;
         let mut cache = self.token_cache.lock().await;
-        if cache.is_valid() {
-            return Ok(cache.token.clone());
-        }
-
-        let corp_id = &self.config.channels.wecom.corp_id;
-        let corp_secret = &self.config.channels.wecom.corp_secret;
-
-        let resp = self
-            .client
-            .get(format!("{}/gettoken", WECOM_API_BASE))
-            .query(&[
-                ("corpid", corp_id.as_str()),
-                ("corpsecret", corp_secret.as_str()),
-            ])
-            .send()
-            .await
-            .map_err(|e| Error::Channel(format!("WeCom gettoken request failed: {}", e)))?;
-
-        let body: TokenResponse = resp
-            .json()
-            .await
-            .map_err(|e| Error::Channel(format!("Failed to parse WeCom token response: {}", e)))?;
-
-        if body.errcode != 0 {
-            return Err(Error::Channel(format!(
-                "WeCom gettoken error {}: {}",
-                body.errcode, body.errmsg
-            )));
-        }
-
-        let token = body
-            .access_token
-            .ok_or_else(|| Error::Channel("No access_token in WeCom response".to_string()))?;
-        let expires_in = body.expires_in.unwrap_or(7200);
-
         cache.token = token.clone();
-        cache.expires_at = chrono::Utc::now().timestamp() + expires_in;
-        info!("WeCom access_token refreshed (expires in {}s)", expires_in);
+        cache.expires_at = chrono::Utc::now().timestamp() + 7200;
         Ok(token)
     }
 
@@ -449,7 +423,6 @@ impl WeComChannel {
                     if let Some(outbound_msg) = outbound {
                         let chat_id = match &outbound_msg {
                             LongConnOutbound::Text { chat_id, .. } => chat_id.clone(),
-                            LongConnOutbound::Media { chat_id, .. } => chat_id.clone(),
                         };
                         // Echo back the original req_id so WeCom routes the reply correctly.
                         let req_id = {
@@ -458,9 +431,9 @@ impl WeComChannel {
                                 .cloned()
                                 .unwrap_or_else(|| format!("blockcell-out-{}", chrono::Utc::now().timestamp_millis()))
                         };
+                        let stream_id = format!("blockcell-s-{}", chrono::Utc::now().timestamp_millis());
                         let msg = match outbound_msg {
                             LongConnOutbound::Text { content, .. } => {
-                                let stream_id = format!("blockcell-s-{}", chrono::Utc::now().timestamp_millis());
                                 info!(chat_id = %chat_id, req_id = %req_id, content_len = content.len(), "WeCom longconn: sending text reply");
                                 serde_json::json!({
                                     "cmd": "aibot_respond_msg",
@@ -471,34 +444,10 @@ impl WeComChannel {
                                     }
                                 })
                             }
-                            LongConnOutbound::Media { media_id, media_type, filename, .. } => {
-                                info!(chat_id = %chat_id, req_id = %req_id, media_type = %media_type, filename = %filename, "WeCom longconn: sending media reply");
-                                let body = match media_type.as_str() {
-                                    "image" => serde_json::json!({
-                                        "msgtype": "image",
-                                        "image": { "media_id": media_id }
-                                    }),
-                                    "voice" => serde_json::json!({
-                                        "msgtype": "voice",
-                                        "voice": { "media_id": media_id }
-                                    }),
-                                    "video" => serde_json::json!({
-                                        "msgtype": "video",
-                                        "video": { "media_id": media_id, "title": filename, "description": "" }
-                                    }),
-                                    _ => serde_json::json!({
-                                        "msgtype": "file",
-                                        "file": { "media_id": media_id }
-                                    }),
-                                };
-                                serde_json::json!({
-                                    "cmd": "aibot_respond_msg",
-                                    "headers": { "req_id": req_id },
-                                    "body": body
-                                })
-                            }
                         };
-                        if let Err(e) = write.send(WsMessage::Text(msg.to_string())).await {
+                        let msg_str = msg.to_string();
+                        info!(payload = %msg_str, "WeCom longconn: outbound WS payload");
+                        if let Err(e) = write.send(WsMessage::Text(msg_str)).await {
                             warn!(error = %e, "WeCom longconn: failed to send outbound reply");
                         }
                     }
@@ -602,14 +551,16 @@ impl WeComChannel {
                     });
                 // Store effective_chat_id -> req_id using the same logic as
                 // build_inbound_from_long_connection so the registry key always matches.
-                if let Some(req_id) = headers.req_id.as_deref() {
+                {
                     let chatid = envelope.body.get("chatid").and_then(|v| v.as_str()).unwrap_or("");
                     let from_user = envelope.body
                         .get("from").and_then(|v| v.get("userid")).and_then(|v| v.as_str()).unwrap_or("");
                     let effective_chat_id = if chatid.is_empty() { from_user } else { chatid };
                     if !effective_chat_id.is_empty() {
-                        let mut reg = CHAT_REQID_REGISTRY.lock().unwrap();
-                        reg.insert(effective_chat_id.to_string(), req_id.to_string());
+                        if let Some(req_id) = headers.req_id.as_deref() {
+                            let mut reg = CHAT_REQID_REGISTRY.lock().unwrap();
+                            reg.insert(effective_chat_id.to_string(), req_id.to_string());
+                        }
                     }
                 }
                 if let Some(inbound) = self.build_inbound_from_long_connection(&envelope.body).await? {
@@ -653,7 +604,14 @@ impl WeComChannel {
             }
             "pong" => {}
             other => {
-                debug!(cmd = %other, payload = %text, "WeCom long connection: ignoring unknown cmd");
+                // WeCom sends empty-cmd acks (heartbeat responses, subscribe acks, etc.).
+                // Only warn if the payload actually contains an error code.
+                let errcode = envelope.errcode.unwrap_or(0);
+                if errcode != 0 {
+                    warn!(cmd = %other, errcode, payload = %text, "WeCom long connection: received error response");
+                } else {
+                    debug!(cmd = %other, "WeCom long connection: received ack");
+                }
             }
         }
 
@@ -1535,22 +1493,45 @@ async fn download_wecom_media(
     media_type: &str,
     ext_hint: Option<&str>,
 ) -> Result<String> {
-    let token = {
-        let client = shared_client();
-        fetch_access_token_static(&client, config).await?
-    };
-
-    let url = format!(
-        "{}/media/get?access_token={}&media_id={}",
-        WECOM_API_BASE, token, media_id
-    );
-
     let client = shared_client();
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| Error::Channel(format!("WeCom media/get request failed: {}", e)))?;
+    let mut retried = false;
+    let resp = loop {
+        let token = fetch_access_token_static(&client, config).await?;
+        let url = format!(
+            "{}/media/get?access_token={}&media_id={}",
+            WECOM_API_BASE, token, media_id
+        );
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| Error::Channel(format!("WeCom media/get request failed: {}", e)))?;
+
+        if let Some(ct) = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+        {
+            if ct.contains("application/json") {
+                let err: WeComResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| Error::Channel(format!("WeCom media/get parse failed: {}", e)))?;
+                if err.is_invalid_token() && !retried {
+                    warn!(errcode = err.errcode, errmsg = %err.errmsg, "WeCom media/get token invalid, refreshing and retrying once");
+                    clear_access_token_cache().await;
+                    retried = true;
+                    continue;
+                }
+                return Err(Error::Channel(format!(
+                    "WeCom media/get error {}: {}",
+                    err.errcode, err.errmsg
+                )));
+            }
+        }
+
+        break resp;
+    };
 
     if !resp.status().is_success() {
         return Err(Error::Channel(format!(
@@ -1804,13 +1785,6 @@ fn decrypt_wecom_msg(
 /// `media_type` must be one of: image / voice / video / file
 pub async fn upload_media(config: &Config, file_path: &str, media_type: &str) -> Result<String> {
     let client = shared_client();
-    let token = fetch_access_token_static(&client, config).await?;
-
-    let url = format!(
-        "{}/media/upload?access_token={}&type={}",
-        WECOM_API_BASE, token, media_type
-    );
-
     let path = std::path::Path::new(file_path);
     let file_name = path
         .file_name()
@@ -1823,19 +1797,6 @@ pub async fn upload_media(config: &Config, file_path: &str, media_type: &str) ->
         .map_err(|e| Error::Channel(format!("Failed to read media file {}: {}", file_path, e)))?;
 
     let mime = mime_for_path(file_path);
-    let part = reqwest::multipart::Part::bytes(bytes)
-        .file_name(file_name)
-        .mime_str(mime)
-        .map_err(|e| Error::Channel(format!("Invalid MIME type: {}", e)))?;
-    let form = reqwest::multipart::Form::new().part("media", part);
-
-    let resp = client
-        .post(&url)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|e| Error::Channel(format!("WeCom media/upload failed: {}", e)))?;
-
     #[derive(Deserialize)]
     struct UploadResp {
         errcode: i32,
@@ -1844,10 +1805,36 @@ pub async fn upload_media(config: &Config, file_path: &str, media_type: &str) ->
         media_id: Option<String>,
     }
 
-    let result: UploadResp = resp
-        .json()
-        .await
-        .map_err(|e| Error::Channel(format!("WeCom media/upload parse failed: {}", e)))?;
+    let mut retried = false;
+    let result: UploadResp = loop {
+        let token = fetch_access_token_static(&client, config).await?;
+        let url = format!(
+            "{}/media/upload?access_token={}&type={}",
+            WECOM_API_BASE, token, media_type
+        );
+        let part = reqwest::multipart::Part::bytes(bytes.clone())
+            .file_name(file_name.clone())
+            .mime_str(mime)
+            .map_err(|e| Error::Channel(format!("Invalid MIME type: {}", e)))?;
+        let form = reqwest::multipart::Form::new().part("media", part);
+        let resp = client
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| Error::Channel(format!("WeCom media/upload failed: {}", e)))?;
+        let result: UploadResp = resp
+            .json()
+            .await
+            .map_err(|e| Error::Channel(format!("WeCom media/upload parse failed: {}", e)))?;
+        if matches!(result.errcode, 40014 | 42001) && !retried {
+            warn!(errcode = result.errcode, errmsg = %result.errmsg, "WeCom media/upload token invalid, refreshing and retrying once");
+            clear_access_token_cache().await;
+            retried = true;
+            continue;
+        }
+        break result;
+    };
 
     if result.errcode != 0 {
         return Err(Error::Channel(format!(
@@ -1888,59 +1875,18 @@ fn mime_for_path(path: &str) -> &'static str {
 }
 
 /// Send a media message (image/voice/video/file) to a WeCom user or group.
-/// `file_path` is a local file path; it will be uploaded first to get a media_id.
-pub async fn send_media_message(config: &Config, chat_id: &str, file_path: &str) -> Result<()> {
-    // Long connection mode: upload temp media via REST API (requires corp_id + corp_secret),
-    // then send the media_id over the WebSocket.  Falls back to a text label when corp
-    // credentials are not configured.
+/// `file_path` is a local file path.  `caption` is an optional text shown alongside the image
+/// (long_connection mode only; ignored for REST API mode).
+pub async fn send_media_message(
+    config: &Config,
+    chat_id: &str,
+    file_path: &str,
+    _caption: &str,
+) -> Result<()> {
+    // Long connection (AI bot) mode does not support sending any media files.
     let mode = config.channels.wecom.mode.trim().to_lowercase();
     if mode == "long_connection" || mode == "long-connection" || mode == "stream" {
-        let filename = std::path::Path::new(file_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(file_path)
-            .to_string();
-        let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
-        let (media_type_for_upload, _) = media_type_for_ext(&ext);
-
-        let has_corp_creds = !config.channels.wecom.corp_id.trim().is_empty()
-            && !config.channels.wecom.corp_secret.trim().is_empty();
-
-        if has_corp_creds {
-            match upload_media(config, file_path, media_type_for_upload).await {
-                Ok(media_id) => {
-                    info!(media_id = %media_id, filename = %filename, media_type = %media_type_for_upload, "WeCom longconn: media uploaded");
-                    let bot_id = config.channels.wecom.bot_id.trim().to_string();
-                    let registry = LONGCONN_REGISTRY.lock().unwrap();
-                    if let Some(tx) = registry.get(&bot_id) {
-                        let msg = LongConnOutbound::Media {
-                            chat_id: chat_id.to_string(),
-                            media_id,
-                            media_type: media_type_for_upload.to_string(),
-                            filename,
-                        };
-                        if let Err(e) = tx.try_send(msg) {
-                            warn!(error = %e, "WeCom longconn: failed to queue media reply");
-                        }
-                    } else {
-                        warn!(bot_id = %bot_id, "WeCom long connection not active; media dropped");
-                    }
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!(error = %e, file_path = %file_path, "WeCom longconn: media upload failed, falling back to text label");
-                }
-            }
-        }
-
-        // Fallback: no corp credentials or upload failed — send a typed text label.
-        let label = match ext.as_str() {
-            "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" => format!("[图片: {}]", filename),
-            "mp3" | "wav" | "amr" | "m4a" | "ogg" => format!("[语音: {}]", filename),
-            "mp4" | "avi" | "mov" | "mkv" => format!("[视频: {}]", filename),
-            _ => format!("[文件: {}]", filename),
-        };
-        return send_message(config, chat_id, &label).await;
+        return send_message(config, chat_id, "企业微信长连接机器人暂不支持发送图片或文件，请使用文字回复。").await;
     }
 
     crate::rate_limit::wecom_limiter().acquire().await;
@@ -2200,11 +2146,9 @@ pub async fn send_message(config: &Config, chat_id: &str, text: &str) -> Result<
     crate::rate_limit::wecom_limiter().acquire().await;
 
     let client = shared_client();
-    let token = fetch_access_token_static(&client, config).await?;
-
     let chunks = split_message(text, WECOM_MSG_LIMIT);
     for (i, chunk) in chunks.iter().enumerate() {
-        do_send_message(&client, &token, config, chat_id, chunk).await?;
+        do_send_message(&client, config, chat_id, chunk).await?;
         if i + 1 < chunks.len() {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
@@ -2213,6 +2157,11 @@ pub async fn send_message(config: &Config, chat_id: &str, text: &str) -> Result<
 }
 
 async fn fetch_access_token_static(client: &Client, config: &Config) -> Result<String> {
+    let mut cache = WECOM_TOKEN_CACHE.lock().await;
+    if cache.is_valid() {
+        return Ok(cache.token.clone());
+    }
+
     let corp_id = &config.channels.wecom.corp_id;
     let corp_secret = &config.channels.wecom.corp_secret;
 
@@ -2238,13 +2187,24 @@ async fn fetch_access_token_static(client: &Client, config: &Config) -> Result<S
         )));
     }
 
-    body.access_token
-        .ok_or_else(|| Error::Channel("No access_token in WeCom response".to_string()))
+    let token = body
+        .access_token
+        .ok_or_else(|| Error::Channel("No access_token in WeCom response".to_string()))?;
+    let expires_in = body.expires_in.unwrap_or(7200);
+    cache.token = token.clone();
+    cache.expires_at = chrono::Utc::now().timestamp() + expires_in;
+    info!("WeCom access_token refreshed (expires in {}s)", expires_in);
+    Ok(token)
+}
+
+async fn clear_access_token_cache() {
+    let mut cache = WECOM_TOKEN_CACHE.lock().await;
+    cache.token.clear();
+    cache.expires_at = 0;
 }
 
 async fn do_send_message(
     client: &Client,
-    token: &str,
     config: &Config,
     chat_id: &str,
     text: &str,
@@ -2282,18 +2242,29 @@ async fn do_send_message(
         format!("{}/message/send", WECOM_API_BASE)
     };
 
-    let resp = client
-        .post(&endpoint)
-        .query(&[("access_token", token)])
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| Error::Channel(format!("Failed to send WeCom message: {}", e)))?;
+    let mut retried = false;
+    let result: WeComResponse = loop {
+        let token = fetch_access_token_static(client, config).await?;
+        let resp = client
+            .post(&endpoint)
+            .query(&[("access_token", token.as_str())])
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::Channel(format!("Failed to send WeCom message: {}", e)))?;
 
-    let result: WeComResponse = resp
-        .json()
-        .await
-        .map_err(|e| Error::Channel(format!("Failed to parse WeCom send response: {}", e)))?;
+        let result: WeComResponse = resp
+            .json()
+            .await
+            .map_err(|e| Error::Channel(format!("Failed to parse WeCom send response: {}", e)))?;
+        if result.is_invalid_token() && !retried {
+            warn!(errcode = result.errcode, errmsg = %result.errmsg, "WeCom send token invalid, refreshing and retrying once");
+            clear_access_token_cache().await;
+            retried = true;
+            continue;
+        }
+        break result;
+    };
 
     if result.errcode != 0 {
         return Err(Error::Channel(format!(

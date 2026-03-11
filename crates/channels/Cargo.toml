@@ -21,6 +21,7 @@ aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 sha2 = "0.10"
 base64 = "0.22"
+md5 = "0.7"
 
 [features]
 default = ["telegram", "whatsapp", "feishu", "slack", "discord", "dingtalk", "wecom", "lark"]
