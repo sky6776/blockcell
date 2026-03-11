@@ -36,7 +36,7 @@ cargo build -p blockcell --release
 blockcell setup
 ```
 
-然后把 `~/.blockcell/config.json` 调整成类似下面的多 agent 结构：
+然后把 `~/.blockcell/config.json5` 调整成类似下面的多 agent 结构：
 
 ```json
 {

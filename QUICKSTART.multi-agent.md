@@ -36,7 +36,7 @@ For first-time setup, you can still start with:
 blockcell setup
 ```
 
-Then edit `~/.blockcell/config.json` into a multi-agent layout like this:
+Then edit `~/.blockcell/config.json5` into a multi-agent layout like this:
 
 ```json
 {
