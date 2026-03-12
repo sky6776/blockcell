@@ -1399,12 +1399,36 @@ impl Default for Config {
     }
 }
 
+fn format_json5_parse_error(
+    path: Option<&Path>,
+    context: &str,
+    error: &json5::Error,
+) -> crate::error::Error {
+    let path_text = path
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<inline>".to_string());
+    crate::error::Error::Config(format!(
+        "{} parse error in {}: {}",
+        context, path_text, error
+    ))
+}
+
 pub fn parse_json5_str<T>(content: &str) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    json5::from_str(content)
-        .map_err(|e| crate::error::Error::Config(format!("Invalid JSON5 format: {}", e)))
+    parse_json5_str_with_context(content, None, "JSON5")
+}
+
+pub fn parse_json5_str_with_context<T>(
+    content: &str,
+    path: Option<&Path>,
+    context: &str,
+) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    json5::from_str(content).map_err(|e| format_json5_parse_error(path, context, &e))
 }
 
 pub fn parse_json5_value(content: &str) -> Result<Value> {
@@ -1434,6 +1458,10 @@ pub fn validate_config_json5_str(content: &str) -> Result<Config> {
     parse_json5_str(content)
 }
 
+pub fn validate_config_json5_file(path: &Path, content: &str) -> Result<Config> {
+    parse_json5_str_with_context(content, Some(path), "Config JSON5")
+}
+
 pub fn write_raw_validated_config_json5(path: &Path, content: &str) -> Result<Config> {
     let config = validate_config_json5_str(content)?;
     if let Some(parent) = path.parent() {
@@ -1446,7 +1474,7 @@ pub fn write_raw_validated_config_json5(path: &Path, content: &str) -> Result<Co
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: Config = parse_json5_str(&content)?;
+        let config: Config = validate_config_json5_file(path, &content)?;
         Ok(config)
     }
 

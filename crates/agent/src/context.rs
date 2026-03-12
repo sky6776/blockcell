@@ -587,7 +587,7 @@ impl ContextBuilder {
     }
 
     /// Method E: Smart history compression with dynamic token budget.
-    /// - Recent 2 rounds: kept in full (trimmed per-message)
+    /// - Recent 15 rounds: kept in full (trimmed per-message)
     /// - Older rounds: compressed to user question + final assistant answer (tool calls stripped)
     /// - Fills from newest to oldest, stopping when token budget is exhausted
     /// - Falls back to hard cap of 30 messages as safety net
@@ -613,9 +613,9 @@ impl ContextBuilder {
 
         let total_rounds = rounds.len();
 
-        // Phase 1: Build recent rounds (last 2) in full, with per-message trim
+        // Phase 1: Build recent rounds (last 15) in full, with per-message trim
         let mut recent_msgs: Vec<ChatMessage> = Vec::new();
-        let recent_start = total_rounds.saturating_sub(2);
+        let recent_start = total_rounds.saturating_sub(15);
         for round in &rounds[recent_start..] {
             for msg in round {
                 recent_msgs.push(Self::trim_chat_message(msg));
