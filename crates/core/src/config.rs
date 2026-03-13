@@ -1456,6 +1456,50 @@ fn format_json5_parse_error(
     ))
 }
 
+fn expand_env_vars_in_text(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut index = 0usize;
+
+    while let Some(relative_start) = content[index..].find("${") {
+        let start = index + relative_start;
+        out.push_str(&content[index..start]);
+
+        let expr_start = start + 2;
+        if let Some(relative_end) = content[expr_start..].find('}') {
+            let end = expr_start + relative_end;
+            let expr = &content[expr_start..end];
+            out.push_str(&expand_env_expr(expr));
+            index = end + 1;
+        } else {
+            out.push_str(&content[start..]);
+            return out;
+        }
+    }
+
+    out.push_str(&content[index..]);
+    out
+}
+
+fn expand_env_expr(expr: &str) -> String {
+    if let Some((name, default)) = expr.split_once(":-") {
+        let name = name.trim();
+        if name.is_empty() {
+            return String::new();
+        }
+        return std::env::var(name)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| default.to_string());
+    }
+
+    let name = expr.trim();
+    if name.is_empty() {
+        return String::new();
+    }
+
+    std::env::var(name).unwrap_or_default()
+}
+
 pub fn parse_json5_str<T>(content: &str) -> Result<T>
 where
     T: DeserializeOwned,
@@ -1471,7 +1515,8 @@ pub fn parse_json5_str_with_context<T>(
 where
     T: DeserializeOwned,
 {
-    json5::from_str(content).map_err(|e| format_json5_parse_error(path, context, &e))
+    let expanded = expand_env_vars_in_text(content);
+    json5::from_str(&expanded).map_err(|e| format_json5_parse_error(path, context, &e))
 }
 
 pub fn parse_json5_value(content: &str) -> Result<Value> {
@@ -1845,6 +1890,44 @@ mod tests {
 
         let loaded = Config::load(&path).expect("reload saved config");
         assert_eq!(loaded.agents.defaults.model, "deepseek-chat");
+    }
+
+    #[test]
+    fn test_config_load_expands_env_vars_in_json5() {
+        let path = temp_config_path("config.json5");
+        unsafe {
+            std::env::set_var("BLOCKCELL_TEST_OPENAI_KEY", "sk-from-env");
+            std::env::remove_var("BLOCKCELL_TEST_MODEL");
+        }
+
+        fs::write(
+            &path,
+            r#"{
+  providers: {
+    openai: {
+      apiKey: "${BLOCKCELL_TEST_OPENAI_KEY}",
+    },
+  },
+  agents: {
+    defaults: {
+      model: "${BLOCKCELL_TEST_MODEL:-gpt-4.1}",
+    },
+  },
+}"#,
+        )
+        .expect("write config.json5");
+
+        let cfg = Config::load(&path).expect("load env-expanded json5 config");
+        assert_eq!(
+            cfg.providers.get("openai").map(|p| p.api_key.as_str()),
+            Some("sk-from-env")
+        );
+        assert_eq!(cfg.agents.defaults.model, "gpt-4.1");
+
+        unsafe {
+            std::env::remove_var("BLOCKCELL_TEST_OPENAI_KEY");
+            std::env::remove_var("BLOCKCELL_TEST_MODEL");
+        }
     }
 
     #[test]

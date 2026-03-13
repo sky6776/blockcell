@@ -1,6 +1,5 @@
 use blockcell_agent::intent::IntentToolResolver;
 use blockcell_channels::account::{channel_configured, listener_labels};
-use blockcell_core::config::ToolCallMode;
 use blockcell_core::{Config, Paths};
 use std::sync::Arc;
 
@@ -356,20 +355,6 @@ pub async fn run() -> anyhow::Result<()> {
             "✗ not configured".to_string()
         }
     );
-    println!(
-        "  qq:        {}",
-        if config.channels.qq.enabled && channel_configured(&config, "qq") {
-            format!(
-                "✓ enabled (app_id: {}){}",
-                config.channels.qq.app_id,
-                owner_suffix("qq", config.channels.qq.enabled)
-            )
-        } else if channel_configured(&config, "qq") {
-            "configured (disabled)".to_string()
-        } else {
-            "✗ not configured".to_string()
-        }
-    );
 
     Ok(())
 }
@@ -485,7 +470,7 @@ mod tests {
             priority: 1,
             input_price: None,
             output_price: None,
-            tool_call_mode: ToolCallMode::Native,
+            tool_call_mode: blockcell_core::config::ToolCallMode::Native,
         }];
         config.agents.defaults.provider = Some("deepseek".to_string());
         config.agents.defaults.model = "deepseek-chat".to_string();
@@ -511,7 +496,7 @@ mod tests {
             priority: 1,
             input_price: None,
             output_price: None,
-            tool_call_mode: ToolCallMode::Native,
+            tool_call_mode: blockcell_core::config::ToolCallMode::Native,
         }];
         config.agents.defaults.provider = Some("ollama".to_string());
         config.agents.defaults.model = "llama3".to_string();

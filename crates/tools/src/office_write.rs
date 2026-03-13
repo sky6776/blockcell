@@ -46,8 +46,17 @@ impl Tool for OfficeWriteTool {
                         "description": "For XLSX: array of sheets. Each: {name, headers, rows, column_widths, bold_header}"
                     },
                     "style": {
-                        "type": "object",
-                        "description": "Style options: {font, font_size, theme_color, author}"
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "description": "Style options: {font, font_size, theme_color, author}"
+                            },
+                            {
+                                "type": "string",
+                                "description": "Preset style name, e.g. 'professional' or 'modern'"
+                            }
+                        ],
+                        "description": "Style options as an object or a preset string"
                     }
                 },
                 "required": ["action"]
@@ -187,7 +196,7 @@ async fn action_create_pptx(ctx: &ToolContext, params: &Value) -> Result<Value> 
         .get("title")
         .and_then(|v| v.as_str())
         .unwrap_or("Presentation");
-    let style = params.get("style").cloned().unwrap_or(json!({}));
+    let style = normalize_style(params.get("style"));
 
     let output_path = resolve_output_path(params, ctx, "pptx", "presentation");
 
@@ -335,7 +344,7 @@ async fn action_create_docx(ctx: &ToolContext, params: &Value) -> Result<Value> 
         .and_then(|v| v.as_array())
         .ok_or_else(|| Error::Tool("'sections' is required".into()))?;
     let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("");
-    let style = params.get("style").cloned().unwrap_or(json!({}));
+    let style = normalize_style(params.get("style"));
 
     let output_path = resolve_output_path(params, ctx, "docx", "document");
 
@@ -447,7 +456,7 @@ async fn action_create_xlsx(ctx: &ToolContext, params: &Value) -> Result<Value> 
         .get("sheets")
         .and_then(|v| v.as_array())
         .ok_or_else(|| Error::Tool("'sheets' is required".into()))?;
-    let style = params.get("style").cloned().unwrap_or(json!({}));
+    let style = normalize_style(params.get("style"));
 
     let output_path = resolve_output_path(params, ctx, "xlsx", "spreadsheet");
 
@@ -651,6 +660,32 @@ fn quote_python_str(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
+fn normalize_style(style: Option<&Value>) -> Value {
+    match style {
+        Some(Value::Object(map)) => Value::Object(map.clone()),
+        Some(Value::String(name)) => style_preset(name),
+        _ => json!({}),
+    }
+}
+
+fn style_preset(name: &str) -> Value {
+    let preset = name.trim().to_ascii_lowercase();
+    match preset.as_str() {
+        "professional" => json!({
+            "font": "Calibri",
+            "theme_color": "2F5597"
+        }),
+        "modern" => json!({
+            "font": "Aptos",
+            "theme_color": "4472C4"
+        }),
+        "minimal" => json!({
+            "font": "Calibri"
+        }),
+        _ => json!({}),
+    }
+}
+
 fn truncate_str(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
@@ -725,5 +760,28 @@ mod tests {
     fn test_quote_python_str() {
         assert_eq!(quote_python_str("hello"), "'hello'");
         assert_eq!(quote_python_str("it's a \"test\""), "'it\\'s a \"test\"'");
+    }
+
+    #[test]
+    fn test_normalize_style_object_passthrough() {
+        let style = normalize_style(Some(&json!({
+            "font": "Arial",
+            "font_size": 20
+        })));
+        assert_eq!(style["font"], "Arial");
+        assert_eq!(style["font_size"], 20);
+    }
+
+    #[test]
+    fn test_normalize_style_string_preset() {
+        let style = normalize_style(Some(&json!("professional")));
+        assert_eq!(style["font"], "Calibri");
+        assert_eq!(style["theme_color"], "2F5597");
+    }
+
+    #[test]
+    fn test_normalize_style_unknown_string() {
+        let style = normalize_style(Some(&json!("unknown")));
+        assert_eq!(style, json!({}));
     }
 }
