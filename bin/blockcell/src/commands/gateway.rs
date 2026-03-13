@@ -31,7 +31,10 @@ use blockcell_tools::{
     CapabilityRegistryHandle, CoreEvolutionHandle, EventEmitterHandle, MemoryStoreHandle,
     ToolRegistry,
 };
+use anyhow::Context;
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{debug, error, info, warn};
@@ -757,8 +760,75 @@ async fn auth_middleware(
 // Main gateway entry point
 // ---------------------------------------------------------------------------
 
+fn default_env_template() -> &'static str {
+    "BLOCKCELL_API_TOKEN=\nOPENAI_API_KEY=\nANTHROPIC_API_KEY=\nGEMINI_API_KEY=\n"
+}
+
+fn parse_env_assignment(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+
+    let body = trimmed.strip_prefix("export ").unwrap_or(trimmed).trim();
+    let (key, value) = body.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+
+    let mut value = value.trim().to_string();
+    if value.len() >= 2 {
+        let quoted = (value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\''));
+        if quoted {
+            value = value[1..value.len() - 1].to_string();
+        }
+    }
+
+    Some((key.to_string(), value))
+}
+
+fn ensure_and_load_gateway_env(paths: &Paths) -> anyhow::Result<()> {
+    paths
+        .ensure_dirs()
+        .with_context(|| format!("failed to create blockcell dirs at {}", paths.base.display()))?;
+
+    let env_path = paths.env_file();
+    if !env_path.exists() {
+        fs::write(&env_path, default_env_template()).with_context(|| {
+            format!(
+                "failed to create default env file at {}",
+                env_path.display()
+            )
+        })?;
+        info!(path = %env_path.display(), "Created default gateway .env file");
+    }
+
+    load_env_file(&env_path)
+}
+
+fn load_env_file(path: &Path) -> anyhow::Result<()> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read env file {}", path.display()))?;
+
+    let mut loaded = 0usize;
+    for line in content.lines() {
+        if let Some((key, value)) = parse_env_assignment(line) {
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            loaded += 1;
+        }
+    }
+
+    info!(path = %path.display(), loaded, "Loaded gateway env file");
+    Ok(())
+}
+
 pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Result<()> {
     let paths = Paths::new();
+    ensure_and_load_gateway_env(&paths)?;
     let mut config = Config::load_or_default(&paths)?;
 
     // Ensure autoUpgrade.manifestUrl has a value (migrates old configs with empty string)

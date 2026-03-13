@@ -1,11 +1,19 @@
 use std::sync::Arc;
 
 use serde_json::Value;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::mcp::client::{McpClient, McpTool};
 use crate::{Tool, ToolContext, ToolSchema};
 use blockcell_core::Result;
+
+fn summarize_json(value: &Value, max_len: usize) -> String {
+    let raw = serde_json::to_string(value).unwrap_or_else(|_| "<json-serialize-error>".to_string());
+    if raw.chars().count() <= max_len {
+        return raw;
+    }
+    raw.chars().take(max_len).collect::<String>() + "..."
+}
 
 /// A single MCP tool exposed as a local `Tool` implementation.
 /// The qualified tool name uses `<server>__<tool>` format.
@@ -51,8 +59,23 @@ impl Tool for McpToolWrapper {
     }
 
     async fn execute(&self, _ctx: ToolContext, params: Value) -> Result<Value> {
-        info!(tool = %self.mcp_tool_name, "Executing MCP tool");
-        self.client.call_tool(&self.mcp_tool_name, params).await
+        let params_preview = summarize_json(&params, 800);
+        info!(
+            local_tool = %self.schema_name,
+            remote_tool = %self.mcp_tool_name,
+            params = %params_preview,
+            "Executing MCP tool wrapper"
+        );
+        let result = self.client.call_tool(&self.mcp_tool_name, params).await;
+        if let Err(error) = &result {
+            warn!(
+                local_tool = %self.schema_name,
+                remote_tool = %self.mcp_tool_name,
+                error = %error.to_string(),
+                "MCP tool wrapper failed"
+            );
+        }
+        result
     }
 }
 
@@ -80,15 +103,13 @@ impl McpToolProvider {
     /// Return all tools from this provider as `Arc<dyn Tool>` instances.
     pub async fn tools(&self) -> Vec<Arc<dyn Tool>> {
         let mcp_tools = self.client.list_tools().await;
-        let mut result: Vec<Arc<dyn Tool>> = Vec::new();
-        for t in mcp_tools {
-            let wrapper: Arc<dyn Tool> = Arc::new(McpToolWrapper::new(
-                &self.server_name,
-                t,
-                self.client.clone(),
-            ));
-            result.push(wrapper);
-        }
-        result
+        mcp_tools
+            .into_iter()
+            .map(|t| -> Arc<dyn Tool> {
+                let wrapper: Arc<dyn Tool> =
+                    Arc::new(McpToolWrapper::new(&self.server_name, t, self.client.clone()));
+                wrapper
+            })
+            .collect()
     }
 }

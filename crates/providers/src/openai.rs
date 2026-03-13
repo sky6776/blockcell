@@ -35,6 +35,65 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
+    fn sanitize_messages_for_native_tools(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        let mut sanitized = Vec::with_capacity(messages.len());
+        let mut i = 0;
+
+        while i < messages.len() {
+            let msg = &messages[i];
+
+            if msg.role == "tool" {
+                i += 1;
+                continue;
+            }
+
+            if msg.role == "assistant" {
+                if let Some(tool_calls) = &msg.tool_calls {
+                    if !tool_calls.is_empty() {
+                        let expected_ids: std::collections::HashSet<&str> =
+                            tool_calls.iter().map(|tc| tc.id.as_str()).collect();
+                        let mut found_ids = std::collections::HashSet::new();
+                        let mut j = i + 1;
+
+                        while j < messages.len() && messages[j].role == "tool" {
+                            if let Some(id) = messages[j].tool_call_id.as_deref() {
+                                if expected_ids.contains(id) {
+                                    found_ids.insert(id);
+                                }
+                            }
+                            j += 1;
+                        }
+
+                        if expected_ids.iter().all(|id| found_ids.contains(id)) {
+                            sanitized.push(msg.clone());
+                            for tool_msg in &messages[(i + 1)..j] {
+                                if let Some(id) = tool_msg.tool_call_id.as_deref() {
+                                    if expected_ids.contains(id) {
+                                        sanitized.push(tool_msg.clone());
+                                    }
+                                }
+                            }
+                        } else {
+                            debug!(
+                                expected = expected_ids.len(),
+                                found = found_ids.len(),
+                                "Dropping incomplete assistant tool-call round before native tool request"
+                            );
+                        }
+
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+
+            sanitized.push(msg.clone());
+            i += 1;
+        }
+
+        sanitized
+    }
+
     pub fn new(
         api_key: &str,
         api_base: Option<&str>,
@@ -699,7 +758,10 @@ impl OpenAIProvider {
         let url = format!("{}/chat/completions", self.api_base);
 
         let (api_messages, api_tools) = if use_native_tools && !tools.is_empty() {
-            (messages.to_vec(), tools.to_vec())
+            (
+                Self::sanitize_messages_for_native_tools(messages),
+                tools.to_vec(),
+            )
         } else if !tools.is_empty() {
             // Text-based tool mode: inject tools into system prompt, don't send tools param
             (Self::inject_tools_into_messages(messages, tools), vec![])

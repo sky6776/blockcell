@@ -150,6 +150,100 @@ fn summarize_result(result: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedSkillScriptKind {
+    Rhai,
+    Python,
+    Markdown,
+}
+
+impl ResolvedSkillScriptKind {
+    fn as_metadata_kind(self) -> &'static str {
+        match self {
+            Self::Rhai => "rhai",
+            Self::Python => "python",
+            Self::Markdown => "markdown",
+        }
+    }
+
+    fn as_runtime_kind(self) -> SkillScriptKind {
+        match self {
+            Self::Rhai => SkillScriptKind::Rhai,
+            Self::Python => SkillScriptKind::Python,
+            Self::Markdown => SkillScriptKind::Markdown,
+        }
+    }
+}
+
+fn infer_skill_script_kind(paths: &Paths, skill_name: &str) -> Option<ResolvedSkillScriptKind> {
+    for base_dir in [paths.skills_dir(), paths.builtin_skills_dir()] {
+        let skill_dir = base_dir.join(skill_name);
+        if !skill_dir.exists() {
+            continue;
+        }
+
+        if skill_dir.join("SKILL.rhai").exists() {
+            return Some(ResolvedSkillScriptKind::Rhai);
+        }
+        if skill_dir.join("SKILL.py").exists() {
+            return Some(ResolvedSkillScriptKind::Python);
+        }
+        if skill_dir.join("SKILL.md").exists() {
+            return Some(ResolvedSkillScriptKind::Markdown);
+        }
+    }
+
+    None
+}
+
+fn resolve_skill_script_kind_from_metadata(
+    metadata: &serde_json::Value,
+    paths: Option<&Paths>,
+    skill_name: Option<&str>,
+) -> Option<SkillScriptKind> {
+    if metadata
+        .get("skill_rhai")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Some(SkillScriptKind::Rhai);
+    }
+    if metadata
+        .get("skill_python")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Some(SkillScriptKind::Python);
+    }
+    if metadata
+        .get("skill_markdown")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Some(SkillScriptKind::Markdown);
+    }
+    if metadata
+        .get("skill_script")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        match metadata.get("skill_script_kind").and_then(|v| v.as_str()) {
+            Some("rhai") => return Some(SkillScriptKind::Rhai),
+            Some("python") => return Some(SkillScriptKind::Python),
+            Some("markdown") => return Some(SkillScriptKind::Markdown),
+            _ => {}
+        }
+
+        if let (Some(paths), Some(skill_name)) = (paths, skill_name) {
+            if let Some(kind) = infer_skill_script_kind(paths, skill_name) {
+                return Some(kind.as_runtime_kind());
+            }
+        }
+    }
+
+    None
+}
+
 /// Compact JSON value for presentation.
 fn compact_json_value(value: &serde_json::Value, depth: usize) -> serde_json::Value {
     const MAX_DEPTH: usize = 4;
@@ -1633,45 +1727,15 @@ impl AgentRuntime {
         }
 
         // ── skill script fast path: execute SKILL.rhai / SKILL.py directly without LLM ──
-        let scripted_kind = if msg
+        let metadata_skill_name = msg
             .metadata
-            .get("skill_rhai")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            Some(SkillScriptKind::Rhai)
-        } else if msg
-            .metadata
-            .get("skill_python")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            Some(SkillScriptKind::Python)
-        } else if msg
-            .metadata
-            .get("skill_markdown")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            Some(SkillScriptKind::Markdown)
-        } else if msg
-            .metadata
-            .get("skill_script")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            match msg
-                .metadata
-                .get("skill_script_kind")
-                .and_then(|v| v.as_str())
-            {
-                Some("python") => Some(SkillScriptKind::Python),
-                Some("markdown") => Some(SkillScriptKind::Markdown),
-                _ => Some(SkillScriptKind::Rhai),
-            }
-        } else {
-            None
-        };
+            .get("skill_name")
+            .and_then(|v| v.as_str());
+        let scripted_kind = resolve_skill_script_kind_from_metadata(
+            &msg.metadata,
+            Some(&self.paths),
+            metadata_skill_name,
+        );
 
         if let Some(script_kind) = scripted_kind {
             let skill_name = msg
@@ -4003,6 +4067,15 @@ async fn run_subagent_task(
     task_manager.set_running(&task_id).await;
     task_manager.set_progress(&task_id, "Processing...").await;
 
+    let inferred_skill_exec_kind = if task_str.starts_with("__SKILL_EXEC__:") {
+        let rest = &task_str["__SKILL_EXEC__:".len()..];
+        let parts: Vec<&str> = rest.splitn(3, ':').collect();
+        let skill_name = parts.first().unwrap_or(&"");
+        infer_skill_script_kind(&paths, skill_name)
+    } else {
+        None
+    };
+
     // Create isolated runtime with restricted tools
     let tool_registry = AgentRuntime::subagent_tool_registry();
     let mut sub_runtime = match AgentRuntime::new(config, paths, provider_pool, tool_registry) {
@@ -4054,6 +4127,23 @@ async fn run_subagent_task(
                 if let Some(obj) = metadata.as_object_mut() {
                     obj.insert("skill_script".to_string(), serde_json::json!(true));
                     obj.insert("skill_name".to_string(), serde_json::json!(skill_name));
+                    if let Some(kind) = inferred_skill_exec_kind {
+                        obj.insert(
+                            "skill_script_kind".to_string(),
+                            serde_json::json!(kind.as_metadata_kind()),
+                        );
+                        match kind {
+                            ResolvedSkillScriptKind::Rhai => {
+                                obj.insert("skill_rhai".to_string(), serde_json::json!(true));
+                            }
+                            ResolvedSkillScriptKind::Python => {
+                                obj.insert("skill_python".to_string(), serde_json::json!(true));
+                            }
+                            ResolvedSkillScriptKind::Markdown => {
+                                obj.insert("skill_markdown".to_string(), serde_json::json!(true));
+                            }
+                        }
+                    }
                     obj.insert(
                         "subagent_session_key".to_string(),
                         serde_json::json!(session_key.clone()),

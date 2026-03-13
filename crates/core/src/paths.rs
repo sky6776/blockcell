@@ -23,6 +23,10 @@ impl Paths {
         self.base.join("config.json5")
     }
 
+    pub fn env_file(&self) -> PathBuf {
+        self.base.join(".env")
+    }
+
     pub fn mcp_config_file(&self) -> PathBuf {
         self.base.join("mcp.json")
     }

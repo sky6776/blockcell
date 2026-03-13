@@ -2,6 +2,14 @@ use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 use tracing::{info, warn};
 
+fn format_policy_parse_error(policy_file: &Path, error: &json5::Error) -> String {
+    format!(
+        "Path access policy JSON5 parse error in {}: {}",
+        policy_file.display(),
+        error
+    )
+}
+
 /// Which operation is being performed on a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -163,7 +171,7 @@ impl PathPolicy {
                 Err(e) => {
                     warn!(
                         path = %policy_file.display(),
-                        error = %e,
+                        error = %format_policy_parse_error(policy_file, &e),
                         "Failed to parse path access policy file — using safe defaults"
                     );
                     Self::safe_default()

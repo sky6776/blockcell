@@ -9,7 +9,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
+
+fn summarize_json(value: &Value, max_len: usize) -> String {
+    let raw = serde_json::to_string(value).unwrap_or_else(|_| "<json-serialize-error>".to_string());
+    if raw.chars().count() <= max_len {
+        return raw;
+    }
+    raw.chars().take(max_len).collect::<String>() + "..."
+}
+
+fn summarize_text(text: &str, max_len: usize) -> String {
+    if text.chars().count() <= max_len {
+        return text.to_string();
+    }
+    text.chars().take(max_len).collect::<String>() + "..."
+}
 
 // ─── JSON-RPC types ──────────────────────────────────────────────────────────
 
@@ -271,6 +286,13 @@ impl McpClient {
         tool_name: &str,
         arguments: Value,
     ) -> blockcell_core::Result<Value> {
+        let args_preview = summarize_json(&arguments, 800);
+        info!(
+            server = %self.server_name,
+            tool = %tool_name,
+            args = %args_preview,
+            "MCP tool call start"
+        );
         let params = serde_json::json!({
             "name": tool_name,
             "arguments": arguments
@@ -285,6 +307,12 @@ impl McpClient {
                 .and_then(|item| item.get("text"))
                 .and_then(|t| t.as_str())
                 .unwrap_or("MCP tool returned an error");
+            warn!(
+                server = %self.server_name,
+                tool = %tool_name,
+                error = %summarize_text(msg, 800),
+                "MCP tool call failed"
+            );
             return Err(blockcell_core::Error::Tool(msg.to_string()));
         }
 
@@ -304,9 +332,21 @@ impl McpClient {
                 .collect::<Vec<_>>()
                 .join("\n");
             if !text.is_empty() {
+                info!(
+                    server = %self.server_name,
+                    tool = %tool_name,
+                    result = %summarize_text(&text, 800),
+                    "MCP tool call success"
+                );
                 return Ok(Value::String(text));
             }
         }
+        info!(
+            server = %self.server_name,
+            tool = %tool_name,
+            result = %summarize_json(&content, 800),
+            "MCP tool call success"
+        );
         Ok(content)
     }
 
