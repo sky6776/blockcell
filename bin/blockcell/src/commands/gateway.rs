@@ -268,8 +268,8 @@ fn active_model_and_provider(config: &Config) -> (String, Option<String>, &'stat
     )
 }
 
-const EXTERNAL_CHANNELS: [&str; 8] = [
-    "telegram", "whatsapp", "feishu", "slack", "discord", "dingtalk", "wecom", "lark",
+const EXTERNAL_CHANNELS: [&str; 9] = [
+    "telegram", "whatsapp", "feishu", "slack", "discord", "dingtalk", "wecom", "lark", "qq",
 ];
 
 fn known_channel_account_ids(config: &Config, channel: &str) -> Vec<String> {
@@ -1491,6 +1491,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
             "/webhook/wecom",
             get(handle_wecom_webhook).post(handle_wecom_webhook),
         )
+        .route("/webhook/qq", post(handle_qq_webhook))
         .with_state(gateway_state);
 
     let bind_addr = format!("{}:{}", host, port);

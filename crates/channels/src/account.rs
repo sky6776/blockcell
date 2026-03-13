@@ -2,6 +2,8 @@ use blockcell_core::config::{
     DingTalkAccountConfig, DiscordAccountConfig, FeishuAccountConfig, LarkAccountConfig,
     SlackAccountConfig, TelegramAccountConfig, WeComAccountConfig, WhatsAppAccountConfig,
 };
+#[cfg(feature = "qq")]
+use blockcell_core::config::QQAccountConfig;
 use blockcell_core::Config;
 use std::collections::HashMap;
 
@@ -117,6 +119,16 @@ pub(crate) fn lark_account_id(config: &Config) -> Option<String> {
         &lark.accounts,
         |account| account.enabled,
         |account| !lark.app_id.is_empty() && account.app_id == lark.app_id,
+    )
+}
+
+#[cfg(feature = "qq")]
+pub(crate) fn qq_account_id(config: &Config) -> Option<String> {
+    let qq = &config.channels.qq;
+    resolve_account_id(
+        &qq.accounts,
+        |account| account.enabled,
+        |account| !qq.app_id.is_empty() && account.app_id == qq.app_id,
     )
 }
 
@@ -328,6 +340,26 @@ pub fn lark_scoped_configs(config: &Config) -> Vec<ListenerConfig> {
     )
 }
 
+#[cfg(feature = "qq")]
+pub fn qq_listener_configs(config: &Config) -> Vec<ListenerConfig> {
+    scoped_listener_configs(
+        "qq",
+        config,
+        &config.channels.qq.accounts,
+        |account| account.enabled && !account.app_id.is_empty(),
+        |cfg| !cfg.channels.qq.app_id.is_empty(),
+        |scoped, account_id, account: &QQAccountConfig| {
+            scoped.channels.qq.enabled = account.enabled;
+            scoped.channels.qq.app_id = account.app_id.clone();
+            scoped.channels.qq.app_secret = account.app_secret.clone();
+            scoped.channels.qq.environment = account.environment.clone();
+            scoped.channels.qq.allow_from = account.allow_from.clone();
+            scoped.channels.qq.accounts = HashMap::from([(account_id.to_string(), account.clone())]);
+            scoped.channels.qq.default_account_id = Some(account_id.to_string());
+        },
+    )
+}
+
 fn has_enabled_account<T>(accounts: &HashMap<String, T>, is_enabled: impl Fn(&T) -> bool) -> bool {
     accounts.values().any(is_enabled)
 }
@@ -382,6 +414,12 @@ pub fn channel_configured(config: &Config, channel: &str) -> bool {
                     account.enabled && !account.app_id.is_empty()
                 })
         }
+        "qq" => {
+            !config.channels.qq.app_id.is_empty()
+                || has_enabled_account(&config.channels.qq.accounts, |account| {
+                    account.enabled && !account.app_id.is_empty()
+                })
+        }
         _ => false,
     }
 }
@@ -389,6 +427,16 @@ pub fn channel_configured(config: &Config, channel: &str) -> bool {
 pub fn listener_labels(config: &Config, channel: &str) -> Vec<String> {
     if !config.is_external_channel_enabled(channel) || !channel_configured(config, channel) {
         return Vec::new();
+    }
+
+    #[cfg(feature = "qq")]
+    if channel == "qq" {
+        let mut labels: Vec<String> = qq_listener_configs(config)
+            .into_iter()
+            .map(|listener| listener.label)
+            .collect();
+        labels.sort();
+        return labels;
     }
 
     let mut labels = match channel {

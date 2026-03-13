@@ -1,0 +1,90 @@
+// QQ频道配置示例
+// QQ Official Bot Channel Configuration Example
+//
+// 配置说明 / Configuration Instructions:
+// 1. 在QQ机器人开放平台创建机器人: https://bot.q.qq.com/
+// 2. 获取App ID和App Secret
+// 3. 配置webhook URL到你的服务器: https://your-domain.com/webhook/qq
+// 4. 根据需要选择环境 (production 或 sandbox)
+
+{
+  channels: {
+    // QQ频道配置 / QQ Channel Configuration
+    qq: {
+      // 启用QQ频道 / Enable QQ channel
+      enabled: true,
+
+      // QQ机器人App ID (从QQ机器人开放平台获取)
+      // QQ Bot App ID (obtained from QQ Bot Developer Console)
+      app_id: "your_qq_bot_app_id_here",
+
+      // QQ机器人App Secret (从QQ机器人开放平台获取)
+      // QQ Bot App Secret (obtained from QQ Bot Developer Console)
+      app_secret: "your_qq_bot_app_secret_here",
+
+      // 环境选择: "production" 或 "sandbox"
+      // Environment: "production" or "sandbox"
+      environment: "production",
+
+      // 用户白名单 (可选) - 留空表示允许所有用户
+      // User whitelist (optional) - empty means allow all users
+      // 可以使用 "*" 允许所有用户,或指定特定用户ID
+      // Use "*" to allow all users, or specify specific user IDs
+      allow_from: [
+        // "*",
+        // "specific_user_id_1",
+        // "specific_user_id_2",
+      ],
+
+      // 多账号配置 (可选) / Multi-account configuration (optional)
+      accounts: {
+        // default: {
+        //   enabled: true,
+        //   app_id: "another_app_id",
+        //   app_secret: "another_app_secret",
+        //   environment: "production",
+        //   allow_from: [],
+        // },
+      },
+
+      // 默认账号ID (可选) / Default account ID (optional)
+      default_account_id: null, // 或 "default"
+    },
+
+    // 其他channel配置保持不变...
+    // Other channel configurations remain unchanged...
+  },
+
+  // 频道所有者配置 (可选) / Channel owner configuration (optional)
+  channel_owners: {
+    // 将QQ频道分配给特定agent
+    // Assign QQ channel to a specific agent
+    "qq": "default", // 或其他agent名称 / or other agent name
+  },
+}
+
+// 使用说明 / Usage Instructions:
+//
+// 1. Webhook配置 / Webhook Configuration:
+//    - 在QQ机器人开放平台的"开发" -> "事件设置"中配置回调URL
+//    - Configure callback URL in QQ Bot Console: "Development" -> "Event Settings"
+//    - URL格式: https://your-domain.com/webhook/qq
+//    - URL format: https://your-domain.com/webhook/qq
+//
+// 2. 消息类型支持 / Supported Message Types:
+//    - C2C_MESSAGE_CREATE: 私聊消息 / Direct messages
+//    - GROUP_AT_MESSAGE_CREATE: 群组@消息 / Group @mentions
+//
+// 3. Chat ID格式 / Chat ID Format:
+//    - 私聊: user:<user_openid>
+//    - 群聊: group:<group_openid>
+//
+// 4. 环境说明 / Environment Notes:
+//    - production: 生产环境 / Production environment
+//    - sandbox: 沙箱环境 / Sandbox environment (for testing)
+//
+// 5. 限制 / Limitations:
+//    - 消息发送速率限制: 20 msg/s (默认配置)
+//    - Message rate limit: 20 msg/s (default configuration)
+//    - 文件大小限制遵循QQ官方API限制
+//    - File size limits follow QQ Official API limits

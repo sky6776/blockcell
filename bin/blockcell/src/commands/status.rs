@@ -1,5 +1,6 @@
 use blockcell_agent::intent::IntentToolResolver;
 use blockcell_channels::account::{channel_configured, listener_labels};
+use blockcell_core::config::ToolCallMode;
 use blockcell_core::{Config, Paths};
 use std::sync::Arc;
 
@@ -470,6 +471,7 @@ mod tests {
             priority: 1,
             input_price: None,
             output_price: None,
+            tool_call_mode: ToolCallMode::Native,
         }];
         config.agents.defaults.provider = Some("deepseek".to_string());
         config.agents.defaults.model = "deepseek-chat".to_string();
@@ -495,6 +497,7 @@ mod tests {
             priority: 1,
             input_price: None,
             output_price: None,
+            tool_call_mode: ToolCallMode::Native,
         }];
         config.agents.defaults.provider = Some("ollama".to_string());
         config.agents.defaults.model = "llama3".to_string();
