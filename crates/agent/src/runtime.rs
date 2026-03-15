@@ -2076,8 +2076,7 @@ impl AgentRuntime {
             .agents
             .defaults
             .max_tool_iterations
-            .min(4)
-            .max(1);
+            .clamp(1, 4);
         let mut current_messages = messages;
         let mut final_response = String::new();
         let mut trace_messages = Vec::new();
@@ -2786,8 +2785,8 @@ impl AgentRuntime {
                         // 将累积的工具调用转换为完整请求
                         if response_opt.is_none() && !tool_call_accumulators.is_empty() {
                             let final_tool_calls: Vec<ToolCallRequest> = tool_call_accumulators
-                                .into_iter()
-                                .map(|(_, acc)| acc.to_tool_call_request())
+                                .into_values()
+                                .map(|acc| acc.to_tool_call_request())
                                 .collect();
 
                             response_opt = Some(LLMResponse {
@@ -2939,12 +2938,13 @@ impl AgentRuntime {
 
                     // Detect thin web_search results (only titles/URLs, no actual content).
                     // When this happens, extract the top URLs so the next hint can suggest web_fetch.
-                    if tool_call.name == "web_search" && !result.starts_with("Tool error:") {
-                        if is_thin_search_result(&result) {
-                            let urls = extract_urls_from_search_result(&result);
-                            if !urls.is_empty() {
-                                web_search_thin_results.extend(urls);
-                            }
+                    if tool_call.name == "web_search"
+                        && !result.starts_with("Tool error:")
+                        && is_thin_search_result(&result)
+                    {
+                        let urls = extract_urls_from_search_result(&result);
+                        if !urls.is_empty() {
+                            web_search_thin_results.extend(urls);
                         }
                     }
 
@@ -2973,7 +2973,7 @@ impl AgentRuntime {
                                         .and_then(|f| f.get("parameters"))
                                         .and_then(|p| p.get("properties"))
                                         .map(|props| {
-                                            props.as_object().map_or(false, |o| !o.is_empty())
+                                            props.as_object().is_some_and(|o| !o.is_empty())
                                         })
                                         .unwrap_or(false)
                             });
@@ -5090,6 +5090,7 @@ fn build_script_skill_summary_prompt(
 
 /// Free async function that runs a user message in the background.
 /// Each message gets its own AgentRuntime so the main loop stays responsive.
+#[allow(clippy::too_many_arguments)]
 async fn run_message_task(
     config: Config,
     paths: Paths,
@@ -5165,6 +5166,7 @@ async fn run_message_task(
 /// Free async function that runs a subagent task in the background.
 /// This is separate from `AgentRuntime` methods to break the recursive async type
 /// chain that would otherwise prevent the future from being `Send`.
+#[allow(clippy::too_many_arguments)]
 async fn run_subagent_task(
     config: Config,
     paths: Paths,
