@@ -128,7 +128,7 @@ const EXAMPLE_CONFIG: &str = r#"{
     }
   },
   "gateway": {
-    "host": "0.0.0.0",
+    "host": "localhost",
     "port": 18790,
     "webuiHost": "localhost",
     "webuiPort": 18791,
