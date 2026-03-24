@@ -1123,7 +1123,7 @@ pub struct GatewayConfig {
 }
 
 fn default_gateway_host() -> String {
-    "0.0.0.0".to_string()
+    "localhost".to_string()
 }
 
 fn default_gateway_port() -> u16 {
