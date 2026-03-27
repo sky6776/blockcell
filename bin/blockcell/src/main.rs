@@ -755,6 +755,14 @@ enum MemoryCommands {
         #[arg(long, default_value = "30")]
         recycle_days: i64,
     },
+    /// Retry queued vector sync operations
+    RetryVectorSync {
+        /// Max pending operations to replay in one run
+        #[arg(long, default_value = "100")]
+        limit: usize,
+    },
+    /// Rebuild the vector index from active SQLite rows
+    Reindex,
     /// Clear memory (soft-delete)
     Clear {
         /// Only clear a specific scope (short_term / long_term)
@@ -1092,6 +1100,12 @@ async fn main() -> anyhow::Result<()> {
             MemoryCommands::Maintenance { recycle_days } => {
                 commands::memory::maintenance(recycle_days).await?;
             }
+            MemoryCommands::RetryVectorSync { limit } => {
+                commands::memory::retry_vector_sync(limit).await?;
+            }
+            MemoryCommands::Reindex => {
+                commands::memory::reindex().await?;
+            }
             MemoryCommands::Clear { scope } => {
                 commands::memory::clear(scope).await?;
             }
@@ -1351,6 +1365,43 @@ mod tests {
                 },
                 other => panic!(
                     "unexpected channels command: {:?}",
+                    std::mem::discriminant(&other)
+                ),
+            },
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn test_memory_retry_vector_sync_parses_limit() {
+        let cli =
+            Cli::try_parse_from(["blockcell", "memory", "retry-vector-sync", "--limit", "25"])
+                .expect("memory retry-vector-sync should parse");
+
+        match cli.command {
+            Commands::Memory { command } => match command {
+                MemoryCommands::RetryVectorSync { limit } => {
+                    assert_eq!(limit, 25);
+                }
+                other => panic!(
+                    "unexpected memory command: {:?}",
+                    std::mem::discriminant(&other)
+                ),
+            },
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn test_memory_reindex_parses() {
+        let cli =
+            Cli::try_parse_from(["blockcell", "memory", "reindex"]).expect("reindex should parse");
+
+        match cli.command {
+            Commands::Memory { command } => match command {
+                MemoryCommands::Reindex => {}
+                other => panic!(
+                    "unexpected memory command: {:?}",
                     std::mem::discriminant(&other)
                 ),
             },

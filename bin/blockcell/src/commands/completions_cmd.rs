@@ -121,6 +121,11 @@ fn build_cli() -> clap::Command {
                 .subcommand(clap::Command::new("stats").about("Show statistics"))
                 .subcommand(clap::Command::new("search").about("Search memory"))
                 .subcommand(clap::Command::new("maintenance").about("Run maintenance"))
+                .subcommand(
+                    clap::Command::new("retry-vector-sync")
+                        .about("Retry queued vector sync operations"),
+                )
+                .subcommand(clap::Command::new("reindex").about("Rebuild the vector index"))
                 .subcommand(clap::Command::new("clear").about("Clear memory")),
         )
         .subcommand(

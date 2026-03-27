@@ -2,10 +2,11 @@ use blockcell_agent::AgentRuntime;
 use blockcell_core::{Config, InboundMessage, Paths};
 use blockcell_skills::evolution::EvolutionRecord;
 use blockcell_skills::is_builtin_tool;
-use blockcell_storage::MemoryStore;
 use blockcell_tools::build_tool_registry_for_agent_config;
 use blockcell_tools::mcp::manager::McpManager;
 use std::sync::Arc;
+
+use super::memory_store::open_memory_store;
 
 /// List all skill evolution records.
 pub async fn list(all: bool, enabled_only: bool) -> anyhow::Result<()> {
@@ -387,17 +388,21 @@ pub async fn learn(description: &str) -> anyhow::Result<()> {
     // Create provider pool using shared multi-provider dispatch
     let provider_pool = blockcell_providers::ProviderPool::from_config(&config)?;
 
+    // Optionally wire up memory store
+    let memory_store_handle = if let Ok(store) = open_memory_store(&paths, &config) {
+        use blockcell_agent::MemoryStoreAdapter;
+        use std::sync::Arc;
+        Some(Arc::new(MemoryStoreAdapter::new(store)) as blockcell_tools::MemoryStoreHandle)
+    } else {
+        None
+    };
+
     // Create runtime
     let mcp_manager = Arc::new(McpManager::load(&paths).await?);
     let tool_registry = build_tool_registry_for_agent_config(&config, Some(&mcp_manager)).await?;
     let mut runtime = AgentRuntime::new(config, paths.clone(), provider_pool, tool_registry)?;
 
-    // Optionally wire up memory store
-    let memory_db_path = paths.memory_dir().join("memory.db");
-    if let Ok(store) = MemoryStore::open(&memory_db_path) {
-        use blockcell_agent::MemoryStoreAdapter;
-        use std::sync::Arc;
-        let handle: blockcell_tools::MemoryStoreHandle = Arc::new(MemoryStoreAdapter::new(store));
+    if let Some(handle) = memory_store_handle {
         runtime.set_memory_store(handle);
     }
 

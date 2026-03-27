@@ -21,7 +21,6 @@ use blockcell_core::{Config, InboundMessage, Paths};
 use blockcell_providers::{Provider, ProviderPool};
 use blockcell_scheduler::CronService;
 use blockcell_skills::{is_builtin_tool, new_registry_handle, CoreEvolution};
-use blockcell_storage::MemoryStore;
 use blockcell_tools::mcp::manager::McpManager;
 use blockcell_tools::{
     build_tool_registry_for_agent_config, CapabilityRegistryHandle, CoreEvolutionHandle,
@@ -37,6 +36,8 @@ use crossterm::{
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{info, warn};
+
+use super::memory_store::open_memory_store;
 
 /// Built-in tools grouped by category for /tools display.
 /// This must include ALL tools registered in ToolRegistry::with_defaults().
@@ -289,8 +290,7 @@ pub async fn run(
     let _ = super::embedded_skills::extract_to_workspace(&paths.skills_dir());
 
     // Initialize memory store (SQLite + FTS5)
-    let memory_db_path = paths.memory_dir().join("memory.db");
-    let memory_store_handle: Option<MemoryStoreHandle> = match MemoryStore::open(&memory_db_path) {
+    let memory_store_handle: Option<MemoryStoreHandle> = match open_memory_store(&paths, &config) {
         Ok(store) => {
             // Run migration from MEMORY.md/daily files on first startup
             if let Err(e) = store.migrate_from_files(&paths.memory_dir()) {
@@ -531,9 +531,10 @@ pub async fn run(
 
         #[cfg(feature = "weixin")]
         for listener in blockcell_channels::account::weixin_listener_configs(&config) {
-            let weixin = Arc::new(
-                blockcell_channels::weixin::WeixinChannel::new(listener.config, inbound_tx.clone()),
-            );
+            let weixin = Arc::new(blockcell_channels::weixin::WeixinChannel::new(
+                listener.config,
+                inbound_tx.clone(),
+            ));
             let shutdown_rx = shutdown_tx.subscribe();
             channel_handles.push(tokio::spawn(async move {
                 weixin.run_loop(shutdown_rx).await;
@@ -978,13 +979,19 @@ fn read_line_with_command_picker(
     if let Err(e) = terminal::enable_raw_mode() {
         // Raw mode failed - use fallback with std::io::stdin
         // This means we won't have command picker, but basic input will work
-        eprintln!("Warning: Failed to enable raw mode: {}. Using fallback input.", e);
+        eprintln!(
+            "Warning: Failed to enable raw mode: {}. Using fallback input.",
+            e
+        );
         let _ = terminal::disable_raw_mode(); // Ensure clean state
         use std::io::{self, BufRead};
         let stdin = io::stdin();
         let mut line = String::new();
         if stdin.lock().read_line(&mut line).is_ok() {
-            return line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+            return line
+                .trim_end_matches('\n')
+                .trim_end_matches('\r')
+                .to_string();
         }
         return String::new();
     }
@@ -1028,7 +1035,15 @@ fn read_line_with_command_picker(
                             selected_index = 0;
                             visible_limit = 16;
                             // Render suggestions with the query part
-                            visible_count = render_suggestions(&all_items, query, &input, selected_index, visible_limit, prev_visible_limit, stdout);
+                            visible_count = render_suggestions(
+                                &all_items,
+                                query,
+                                &input,
+                                selected_index,
+                                visible_limit,
+                                prev_visible_limit,
+                                stdout,
+                            );
                             prev_visible_limit = visible_limit;
                         } else if showing_picker {
                             clear_suggestions(prev_visible_limit, &input, stdout);
@@ -1109,7 +1124,15 @@ fn read_line_with_command_picker(
                         if showing_picker && visible_count > 0 && selected_index > 0 {
                             selected_index -= 1;
                             let query = extract_command_query(&input).map(|(_, q)| q).unwrap_or("");
-                            visible_count = render_suggestions(&all_items, query, &input, selected_index, visible_limit, prev_visible_limit, stdout);
+                            visible_count = render_suggestions(
+                                &all_items,
+                                query,
+                                &input,
+                                selected_index,
+                                visible_limit,
+                                prev_visible_limit,
+                                stdout,
+                            );
                             prev_visible_limit = visible_limit;
                         }
                     }
@@ -1123,16 +1146,34 @@ fn read_line_with_command_picker(
                             let query = extract_command_query(&input).map(|(_, q)| q).unwrap_or("");
 
                             // Check if we're at the last displayed item and there are more items to load
-                            if selected_index == last_displayed_idx && selected_index < last_total_idx {
+                            if selected_index == last_displayed_idx
+                                && selected_index < last_total_idx
+                            {
                                 // Load more items
                                 visible_limit += LOAD_MORE_COUNT;
                                 selected_index += 1;
-                                visible_count = render_suggestions(&all_items, query, &input, selected_index, visible_limit, prev_visible_limit, stdout);
+                                visible_count = render_suggestions(
+                                    &all_items,
+                                    query,
+                                    &input,
+                                    selected_index,
+                                    visible_limit,
+                                    prev_visible_limit,
+                                    stdout,
+                                );
                                 prev_visible_limit = visible_limit;
                             } else if selected_index < last_displayed_idx {
                                 // Normal navigation within displayed items
                                 selected_index += 1;
-                                visible_count = render_suggestions(&all_items, query, &input, selected_index, visible_limit, prev_visible_limit, stdout);
+                                visible_count = render_suggestions(
+                                    &all_items,
+                                    query,
+                                    &input,
+                                    selected_index,
+                                    visible_limit,
+                                    prev_visible_limit,
+                                    stdout,
+                                );
                                 prev_visible_limit = visible_limit;
                             }
                         }
@@ -1148,7 +1189,15 @@ fn read_line_with_command_picker(
                                 showing_picker = true;
                                 selected_index = 0;
                                 visible_limit = 16; // Reset on new search
-                                visible_count = render_suggestions(&all_items, query, &input, selected_index, visible_limit, prev_visible_limit, stdout);
+                                visible_count = render_suggestions(
+                                    &all_items,
+                                    query,
+                                    &input,
+                                    selected_index,
+                                    visible_limit,
+                                    prev_visible_limit,
+                                    stdout,
+                                );
                                 prev_visible_limit = visible_limit;
                             } else {
                                 // Clear suggestions if was showing
@@ -1186,7 +1235,15 @@ fn read_line_with_command_picker(
                 // Terminal resize - re-render if showing picker
                 if showing_picker {
                     let query = extract_command_query(&input).map(|(_, q)| q).unwrap_or("");
-                    visible_count = render_suggestions(&all_items, query, &input, selected_index, visible_limit, prev_visible_limit, stdout);
+                    visible_count = render_suggestions(
+                        &all_items,
+                        query,
+                        &input,
+                        selected_index,
+                        visible_limit,
+                        prev_visible_limit,
+                        stdout,
+                    );
                     prev_visible_limit = visible_limit;
                 } else {
                     render_input_line(&input, stdout);
@@ -1347,9 +1404,21 @@ fn render_suggestions(
 
         if is_selected {
             // Selected item with reverse video and bold
-            let _ = execute!(stdout, Print(format!("\x1b[7m\x1b[1m {} {}{} \x1b[0m\x1b[90m[{}]\x1b[0m \x1b[2m{}\x1b[0m", icon, item.name, padding, kind_label, desc)));
+            let _ = execute!(
+                stdout,
+                Print(format!(
+                    "\x1b[7m\x1b[1m {} {}{} \x1b[0m\x1b[90m[{}]\x1b[0m \x1b[2m{}\x1b[0m",
+                    icon, item.name, padding, kind_label, desc
+                ))
+            );
         } else {
-            let _ = execute!(stdout, Print(format!("   {} {}{}  \x1b[90m[{}]\x1b[0m \x1b[2m{}\x1b[0m", icon, item.name, padding, kind_label, desc)));
+            let _ = execute!(
+                stdout,
+                Print(format!(
+                    "   {} {}{}  \x1b[90m[{}]\x1b[0m \x1b[2m{}\x1b[0m",
+                    icon, item.name, padding, kind_label, desc
+                ))
+            );
         }
     }
 
@@ -1358,7 +1427,13 @@ fn render_suggestions(
     if has_more {
         let remaining = total_count - visible_limit;
         let _ = execute!(stdout, Print("\r\n"), Clear(ClearType::CurrentLine));
-        let _ = execute!(stdout, Print(format!("\x1b[90m   ↓ show more ({} remaining)\x1b[0m", remaining)));
+        let _ = execute!(
+            stdout,
+            Print(format!(
+                "\x1b[90m   ↓ show more ({} remaining)\x1b[0m",
+                remaining
+            ))
+        );
         extra_lines = 1;
     }
 

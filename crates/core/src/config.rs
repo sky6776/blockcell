@@ -1288,6 +1288,44 @@ pub struct SecurityConfig {
     pub path_access: PathAccessConfig,
 }
 
+fn default_memory_vector_table() -> String {
+    "memory_vectors".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryVectorConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[serde(default = "default_memory_vector_table")]
+    pub table: String,
+}
+
+impl Default for MemoryVectorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: String::new(),
+            model: String::new(),
+            uri: None,
+            table: default_memory_vector_table(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryConfig {
+    #[serde(default)]
+    pub vector: MemoryVectorConfig,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoUpgradeConfig {
@@ -1320,6 +1358,8 @@ fn default_manifest_url() -> String {
 pub struct Config {
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
+    #[serde(default)]
+    pub memory: MemoryConfig,
     #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
@@ -1469,6 +1509,7 @@ impl Default for Config {
 
         Self {
             providers,
+            memory: MemoryConfig::default(),
             network: NetworkConfig::default(),
             community_hub: CommunityHubConfig::default(),
             agents: AgentsConfig::default(),
@@ -1927,13 +1968,25 @@ mod tests {
         let path = temp_config_path("config.json5");
         let mut cfg = Config::default();
         cfg.agents.defaults.model = "deepseek-chat".to_string();
+        cfg.memory.vector.enabled = true;
+        cfg.memory.vector.provider = "openai".to_string();
+        cfg.memory.vector.model = "text-embedding-3-small".to_string();
+        cfg.memory.vector.uri = Some("./memory/vectors.lancedb".to_string());
 
         cfg.save(&path).expect("save config json5");
         let content = fs::read_to_string(&path).expect("read saved config");
         assert!(content.contains("deepseek-chat"));
+        assert!(content.contains("text-embedding-3-small"));
 
         let loaded = Config::load(&path).expect("reload saved config");
         assert_eq!(loaded.agents.defaults.model, "deepseek-chat");
+        assert!(loaded.memory.vector.enabled);
+        assert_eq!(loaded.memory.vector.provider, "openai");
+        assert_eq!(loaded.memory.vector.model, "text-embedding-3-small");
+        assert_eq!(
+            loaded.memory.vector.uri.as_deref(),
+            Some("./memory/vectors.lancedb")
+        );
     }
 
     #[test]
@@ -1972,6 +2025,33 @@ mod tests {
             std::env::remove_var("BLOCKCELL_TEST_OPENAI_KEY");
             std::env::remove_var("BLOCKCELL_TEST_MODEL");
         }
+    }
+
+    #[test]
+    fn test_config_loads_memory_vector_config() {
+        let raw = r#"{
+  providers: {
+    openai: {
+      apiKey: "sk-test"
+    }
+  },
+  memory: {
+    vector: {
+      enabled: true,
+      provider: "openai",
+      model: "text-embedding-3-small",
+      uri: "./memory/lancedb",
+      table: "memory_vectors"
+    }
+  }
+}"#;
+
+        let cfg: Config = json5::from_str(raw).expect("parse config");
+        assert!(cfg.memory.vector.enabled);
+        assert_eq!(cfg.memory.vector.provider, "openai");
+        assert_eq!(cfg.memory.vector.model, "text-embedding-3-small");
+        assert_eq!(cfg.memory.vector.uri.as_deref(), Some("./memory/lancedb"));
+        assert_eq!(cfg.memory.vector.table, "memory_vectors");
     }
 
     #[test]

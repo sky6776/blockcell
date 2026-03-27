@@ -1,3 +1,4 @@
+use reqwest::blocking::Client as BlockingClient;
 use reqwest::{Client, Proxy};
 use std::time::Duration;
 use tracing::{info, warn};
@@ -141,6 +142,38 @@ pub fn build_http_client(
     builder.build().unwrap_or_else(|e| {
         warn!(error = %e, "Failed to build HTTP client with proxy, using default");
         Client::new()
+    })
+}
+
+pub fn build_blocking_http_client(
+    provider_proxy: Option<&str>,
+    global_proxy: Option<&str>,
+    no_proxy: &[String],
+    api_base: &str,
+    timeout: Duration,
+) -> BlockingClient {
+    let mut builder = BlockingClient::builder().timeout(timeout);
+
+    match resolve_proxy(provider_proxy, global_proxy, no_proxy, api_base) {
+        ProxyResolution::UseProxy(proxy_url) => match Proxy::all(&proxy_url) {
+            Ok(proxy) => {
+                info!(proxy = %proxy_url, api_base = %api_base, "Blocking HTTP client using proxy");
+                builder = builder.proxy(proxy);
+            }
+            Err(error) => {
+                warn!(error = %error, proxy = %proxy_url, "Invalid proxy URL, falling back to direct connect");
+            }
+        },
+        ProxyResolution::ForceDirectConnect => {
+            info!(api_base = %api_base, "Blocking HTTP client forced to direct connect");
+            builder = builder.no_proxy();
+        }
+        ProxyResolution::None => {}
+    }
+
+    builder.build().unwrap_or_else(|error| {
+        warn!(error = %error, "Failed to build blocking HTTP client with proxy, using default");
+        BlockingClient::new()
     })
 }
 

@@ -25,7 +25,6 @@ use blockcell_scheduler::{
 };
 use blockcell_skills::{new_registry_handle, CoreEvolution};
 use blockcell_skills::{EvolutionService, EvolutionServiceConfig};
-use blockcell_storage::MemoryStore;
 use blockcell_tools::mcp::manager::McpManager;
 use blockcell_tools::{
     build_tool_registry_for_agent_config, build_tool_registry_with_all_mcp,
@@ -53,6 +52,8 @@ use axum::{
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
+
+use super::memory_store::open_memory_store;
 
 mod alerts;
 mod banner;
@@ -600,9 +601,8 @@ fn with_route_agent_id(mut msg: InboundMessage, agent_id: &str) -> InboundMessag
     msg
 }
 
-fn open_agent_memory_store(paths: &Paths) -> Option<MemoryStoreHandle> {
-    let memory_db_path = paths.memory_dir().join("memory.db");
-    match MemoryStore::open(&memory_db_path) {
+fn open_agent_memory_store(paths: &Paths, config: &Config) -> Option<MemoryStoreHandle> {
+    match open_memory_store(paths, config) {
         Ok(store) => {
             if let Err(e) = store.migrate_from_files(&paths.memory_dir()) {
                 warn!(agent_base = %paths.base.display(), error = %e, "Memory migration failed");
@@ -645,7 +645,7 @@ async fn spawn_agent_runtime(
     agent_paths.ensure_dirs()?;
 
     let provider_pool = blockcell_providers::ProviderPool::from_config(&agent_config)?;
-    let memory_store_handle = open_agent_memory_store(&agent_paths);
+    let memory_store_handle = open_agent_memory_store(&agent_paths, &agent_config);
 
     let cap_registry_dir = agent_paths.evolved_tools_dir();
     let cap_registry_raw = new_registry_handle(cap_registry_dir);
@@ -1380,7 +1380,10 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     for listener in blockcell_channels::account::qq_listener_configs(&config) {
         let listener_name = listener.label.clone();
         info!(listener = %listener_name, "Starting QQ listener");
-        let qq = Arc::new(blockcell_channels::qq::QQChannel::new(listener.config, inbound_tx.clone()));
+        let qq = Arc::new(blockcell_channels::qq::QQChannel::new(
+            listener.config,
+            inbound_tx.clone(),
+        ));
         let shutdown_rx = shutdown_tx.subscribe();
         channel_handles.push((
             listener_name,
@@ -1394,9 +1397,10 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     for listener in blockcell_channels::account::weixin_listener_configs(&config) {
         let listener_name = listener.label.clone();
         info!(listener = %listener_name, "Starting Weixin listener");
-        let weixin = Arc::new(
-            blockcell_channels::weixin::WeixinChannel::new(listener.config, inbound_tx.clone()),
-        );
+        let weixin = Arc::new(blockcell_channels::weixin::WeixinChannel::new(
+            listener.config,
+            inbound_tx.clone(),
+        ));
         let shutdown_rx = shutdown_tx.subscribe();
         channel_handles.push((
             listener_name,
@@ -1541,14 +1545,8 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
             "/v1/evolution/:id",
             get(handle_evolution_detail).delete(handle_evolution_delete),
         )
-        .route(
-            "/v1/evolution/:id/stop",
-            post(handle_evolution_stop),
-        )
-        .route(
-            "/v1/evolution/:id/resume",
-            post(handle_evolution_resume),
-        )
+        .route("/v1/evolution/:id/stop", post(handle_evolution_stop))
+        .route("/v1/evolution/:id/resume", post(handle_evolution_resume))
         .route("/v1/channels/status", get(handle_channels_status))
         .route("/v1/channels", get(handle_channels_list))
         .route("/v1/channels/:id", put(handle_channel_update))

@@ -1,6 +1,13 @@
-use blockcell_core::Paths;
+use blockcell_core::{Config, Paths};
 use blockcell_storage::memory::QueryParams;
 use blockcell_storage::MemoryStore;
+
+use super::memory_store::open_memory_store;
+
+fn open_cli_memory_store(paths: &Paths) -> anyhow::Result<MemoryStore> {
+    let config = Config::load_or_default(paths)?;
+    open_memory_store(paths, &config)
+}
 
 /// List recent memory items.
 pub async fn list(item_type: Option<String>, limit: usize) -> anyhow::Result<()> {
@@ -12,8 +19,7 @@ pub async fn list(item_type: Option<String>, limit: usize) -> anyhow::Result<()>
         return Ok(());
     }
 
-    let store = MemoryStore::open(&db_path)
-        .map_err(|e| anyhow::anyhow!("Failed to open memory db: {}", e))?;
+    let store = open_cli_memory_store(&paths)?;
 
     let params = QueryParams {
         query: None,
@@ -77,8 +83,7 @@ pub async fn show(id: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let store = MemoryStore::open(&db_path)
-        .map_err(|e| anyhow::anyhow!("Failed to open memory db: {}", e))?;
+    let store = open_cli_memory_store(&paths)?;
 
     match store.get_by_id(id) {
         Ok(Some(item)) => {
@@ -120,8 +125,7 @@ pub async fn delete(id: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let store = MemoryStore::open(&db_path)
-        .map_err(|e| anyhow::anyhow!("Failed to open memory db: {}", e))?;
+    let store = open_cli_memory_store(&paths)?;
 
     match store.soft_delete(id) {
         Ok(true) => {
@@ -148,8 +152,7 @@ pub async fn stats() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let store = MemoryStore::open(&db_path)
-        .map_err(|e| anyhow::anyhow!("Failed to open memory db: {}", e))?;
+    let store = open_cli_memory_store(&paths)?;
 
     let stats = store
         .stats()
@@ -161,6 +164,29 @@ pub async fn stats() -> anyhow::Result<()> {
     println!("  Long-term:     {}", stats["long_term"]);
     println!("  Short-term:    {}", stats["short_term"]);
     println!("  Recycle bin:   {}", stats["deleted_in_recycle_bin"]);
+    if let Some(vector) = stats.get("vector") {
+        println!();
+        println!("  Vector enabled:   {}", vector["enabled"]);
+        match vector.get("healthy").and_then(|value| value.as_bool()) {
+            Some(healthy) => println!("  Vector healthy:   {}", healthy),
+            None => println!("  Vector healthy:   n/a"),
+        }
+        println!("  Pending vector ops: {}", vector["pending_operations"]);
+        println!("  Pending upserts:    {}", vector["pending_upserts"]);
+        println!("  Pending deletes:    {}", vector["pending_deletes"]);
+
+        if let Some(backend) = vector.get("backend") {
+            if let Some(rows) = backend.get("rows").and_then(|value| value.as_u64()) {
+                println!("  Vector rows:        {}", rows);
+            }
+            if let Some(indices) = backend.get("indices").and_then(|value| value.as_u64()) {
+                println!("  Vector indices:     {}", indices);
+            }
+            if let Some(error) = backend.get("error").and_then(|value| value.as_str()) {
+                println!("  Vector backend err: {}", error);
+            }
+        }
+    }
     println!();
     Ok(())
 }
@@ -180,8 +206,7 @@ pub async fn search(
         return Ok(());
     }
 
-    let store = MemoryStore::open(&db_path)
-        .map_err(|e| anyhow::anyhow!("Failed to open memory db: {}", e))?;
+    let store = open_cli_memory_store(&paths)?;
 
     let params = QueryParams {
         query: if query.is_empty() {
@@ -260,8 +285,7 @@ pub async fn maintenance(recycle_days: i64) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let store = MemoryStore::open(&db_path)
-        .map_err(|e| anyhow::anyhow!("Failed to open memory db: {}", e))?;
+    let store = open_cli_memory_store(&paths)?;
 
     let (expired, purged) = store
         .maintenance(recycle_days)
@@ -270,6 +294,50 @@ pub async fn maintenance(recycle_days: i64) -> anyhow::Result<()> {
     println!(
         "✅ Maintenance complete: {} expired records cleaned, {} recycle bin records purged",
         expired, purged
+    );
+    Ok(())
+}
+
+/// Retry queued vector sync operations.
+pub async fn retry_vector_sync(limit: usize) -> anyhow::Result<()> {
+    let paths = Paths::default();
+    let db_path = paths.workspace().join("memory").join("memory.db");
+
+    if !db_path.exists() {
+        println!("(Memory database not created yet)");
+        return Ok(());
+    }
+
+    let store = open_cli_memory_store(&paths)?;
+    let result = store
+        .retry_vector_sync(limit)
+        .map_err(|e| anyhow::anyhow!("Failed to retry vector sync: {}", e))?;
+
+    println!(
+        "✅ Vector retry complete: attempted {}, succeeded {}, failed {}",
+        result.attempted, result.succeeded, result.failed
+    );
+    Ok(())
+}
+
+/// Rebuild the vector index from active SQLite rows.
+pub async fn reindex() -> anyhow::Result<()> {
+    let paths = Paths::default();
+    let db_path = paths.workspace().join("memory").join("memory.db");
+
+    if !db_path.exists() {
+        println!("(Memory database not created yet)");
+        return Ok(());
+    }
+
+    let store = open_cli_memory_store(&paths)?;
+    let result = store
+        .reindex_vectors()
+        .map_err(|e| anyhow::anyhow!("Failed to reindex vectors: {}", e))?;
+
+    println!(
+        "✅ Vector reindex complete: indexed {}, failed {}",
+        result.indexed, result.failed
     );
     Ok(())
 }
@@ -284,8 +352,7 @@ pub async fn clear(scope: Option<String>) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let store = MemoryStore::open(&db_path)
-        .map_err(|e| anyhow::anyhow!("Failed to open memory db: {}", e))?;
+    let store = open_cli_memory_store(&paths)?;
 
     let count = store
         .batch_soft_delete(scope.as_deref(), None, None, None)

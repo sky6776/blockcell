@@ -12,6 +12,7 @@ pub mod knowledge_cmd;
 pub mod logs_cmd;
 pub mod mcp;
 pub mod memory;
+pub mod memory_store;
 pub mod onboard;
 pub mod provider;
 pub mod run_cmd;

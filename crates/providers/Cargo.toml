@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 blockcell-core = { path = "../core" }
+blockcell-storage = { path = "../storage" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

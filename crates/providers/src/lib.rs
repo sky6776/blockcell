@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod client;
+pub mod embeddings;
 pub mod factory;
 pub mod gemini;
 pub mod ollama;
@@ -56,6 +57,7 @@ pub trait Provider: Send + Sync {
 }
 
 pub use anthropic::AnthropicProvider;
+pub use embeddings::{create_embedder, OpenAICompatibleEmbedder};
 pub use factory::{
     create_evolution_provider, create_main_provider, create_provider, infer_provider_from_model,
 };

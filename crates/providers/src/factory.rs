@@ -7,7 +7,7 @@ use crate::{
 };
 
 /// 默认的 OpenAI 兼容 provider 的 api_base
-fn default_api_base(provider_name: &str) -> &'static str {
+pub(crate) fn default_api_base(provider_name: &str) -> &'static str {
     match provider_name {
         "openrouter" => "https://openrouter.ai/api/v1",
         "openai" => "https://api.openai.com/v1",

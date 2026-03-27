@@ -31,7 +31,7 @@ serde_yaml = "0.9"
 json5 = "0.4"
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart", "stream"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart", "stream", "blocking"], default-features = false }
 
 # CLI
 clap = { version = "4.4", features = ["derive"] }
@@ -111,6 +111,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Lazy statics
 once_cell = "1.19"
+lancedb = "0.27.1"
+arrow-array = "57.3.0"
+arrow-schema = "57.3.0"
 
 # URL encoding
 urlencoding = "2.1"
