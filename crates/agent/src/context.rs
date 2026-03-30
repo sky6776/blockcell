@@ -317,9 +317,11 @@ impl ContextBuilder {
         }
 
         let now = chrono::Utc::now();
+        let local_time = chrono::Local::now();
         prompt.push_str(&format!(
-            "Current time: {}\n",
-            now.format("%Y-%m-%d %H:%M:%S UTC")
+            "Current time: {} ({} UTC)\n",
+            local_time.format("%Y-%m-%d %H:%M:%S"),
+            now.format("%Y-%m-%d %H:%M:%S")
         ));
         prompt.push_str(&format!(
             "Workspace: {}\n\n",
