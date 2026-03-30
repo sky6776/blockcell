@@ -60,6 +60,8 @@ rhai = { version = "1.17", features = ["sync"] }
 # Cron
 cron = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+iana-time-zone = "0.1"
 
 # Crypto
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }

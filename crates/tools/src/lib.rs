@@ -242,6 +242,8 @@ pub struct PromptContext<'a> {
     /// Intent category names (e.g. "Finance", "Blockchain", "Chat") resolved by the caller.
     /// Tools can use this to conditionally emit detailed domain-specific guidelines.
     pub intents: &'a [String],
+    /// Default timezone from config, if set.
+    pub default_timezone: Option<&'a str>,
 }
 
 impl<'a> PromptContext<'a> {

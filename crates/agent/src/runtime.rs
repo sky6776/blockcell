@@ -3053,6 +3053,7 @@ impl AgentRuntime {
         let prompt_ctx = blockcell_tools::PromptContext {
             channel: &msg.channel,
             intents: &mode_names,
+            default_timezone: self.config.default_timezone.as_deref(),
         };
         let tool_name_refs: Vec<&str> = tool_names.iter().map(|s| s.as_str()).collect();
         let mut tool_prompt_rules = self
@@ -4231,6 +4232,7 @@ impl AgentRuntime {
         let prompt_ctx = blockcell_tools::PromptContext {
             channel: &msg.channel,
             intents: &mode_names,
+            default_timezone: self.config.default_timezone.as_deref(),
         };
         let tool_name_refs = tool_names
             .iter()

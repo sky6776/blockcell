@@ -400,6 +400,7 @@ mod tests {
             .prompt_rule(&PromptContext {
                 channel: "webui",
                 intents: &[],
+                default_timezone: None,
             })
             .expect("list_dir should expose a prompt rule");
         assert!(rule.contains("`path`"));
@@ -414,6 +415,7 @@ mod tests {
             .prompt_rule(&PromptContext {
                 channel: "webui",
                 intents: &[],
+                default_timezone: None,
             })
             .expect("write_file should expose a prompt rule");
         assert!(rule.contains("`path`"));

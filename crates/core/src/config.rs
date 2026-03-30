@@ -1705,7 +1705,25 @@ pub struct Config {
     pub auto_upgrade: AutoUpgradeConfig,
     #[serde(default)]
     pub security: SecurityConfig,
+    /// Default timezone for cron jobs and time-related operations.
+    /// IANA timezone name, e.g., "Asia/Shanghai", "America/New_York", "Europe/London".
+    /// If not set, system timezone is detected, falling back to UTC.
+    #[serde(default)]
+    pub default_timezone: Option<String>,
+    /// Cron service tick interval in seconds. Default: 1 second. Min: 1. Max: 3600.
+    /// Higher values reduce CPU/disk I/O but lower time precision.
+    #[serde(default = "default_cron_tick_interval")]
+    pub cron_tick_interval_secs: u64,
 }
+
+fn default_cron_tick_interval() -> u64 {
+    1
+}
+
+/// Minimum allowed cron tick interval in seconds.
+const MIN_CRON_TICK_INTERVAL_SECS: u64 = 1;
+/// Maximum allowed cron tick interval in seconds.
+const MAX_CRON_TICK_INTERVAL_SECS: u64 = 3600;
 
 impl Default for Config {
     fn default() -> Self {
@@ -1838,6 +1856,8 @@ impl Default for Config {
             intent_router: Some(IntentRouterConfig::default()),
             auto_upgrade: AutoUpgradeConfig::default(),
             security: SecurityConfig::default(),
+            default_timezone: None,
+            cron_tick_interval_secs: default_cron_tick_interval(),
         }
     }
 }
@@ -1959,20 +1979,125 @@ pub fn write_raw_validated_config_json5(path: &Path, content: &str) -> Result<Co
     Ok(config)
 }
 
+/// Detect system timezone using iana-time-zone crate.
+/// Returns None if detection fails (will fall back to UTC in calling code).
+fn detect_system_timezone() -> Option<String> {
+    match iana_time_zone::get_timezone() {
+        Ok(tz) if !tz.is_empty() => {
+            // Validate the detected timezone is a valid IANA timezone
+            if tz.parse::<chrono_tz::Tz>().is_ok() {
+                tracing::info!(timezone = %tz, "Detected system timezone");
+                Some(tz)
+            } else {
+                tracing::warn!(timezone = %tz, "Detected timezone is not a valid IANA timezone, falling back to UTC");
+                None
+            }
+        }
+        Ok(_) => {
+            tracing::debug!("System timezone detection returned empty string, using UTC");
+            None
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "Failed to detect system timezone, using UTC");
+            None
+        }
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let config: Config = validate_config_json5_file(path, &content)?;
+        config.validate()
+    }
+
+    /// Load config from file, or create default if not exists.
+    /// Also ensures default_timezone and cron_tick_interval_secs are set,
+    /// updating the config file if necessary.
+    pub fn load_or_default(paths: &Paths) -> Result<Self> {
+        let config_path = paths.config_file();
+
+        let config = if config_path.exists() {
+            Self::load(&config_path)?
+        } else {
+            // New config: detect system timezone once
+            let detected_tz = detect_system_timezone();
+            if let Some(ref tz) = detected_tz {
+                tracing::info!(timezone = %tz, "Detected system timezone for new config");
+            }
+            Self {
+                default_timezone: detected_tz,
+                ..Default::default()
+            }
+        };
+
+        // Check if we need to update the config file with missing fields
+        let needs_save = config.default_timezone.is_none() && config_path.exists();
+
+        // Detect timezone if not set (only for existing configs with missing field)
+        let config = if config.default_timezone.is_none() {
+            // Only reached for existing configs with missing default_timezone
+            let detected_tz = detect_system_timezone();
+            if let Some(ref tz) = detected_tz {
+                tracing::info!(timezone = %tz, "Setting detected timezone in config");
+            }
+            Config {
+                default_timezone: detected_tz,
+                ..config
+            }
+        } else {
+            config
+        };
+
+        // Save if we added missing fields
+        if needs_save || !config_path.exists() {
+            if let Err(e) = config.save(&config_path) {
+                tracing::warn!(error = %e, "Failed to save updated config file");
+            } else {
+                tracing::info!(path = %config_path.display(), "Config file updated with missing fields");
+            }
+        }
+
         Ok(config)
     }
 
-    pub fn load_or_default(paths: &Paths) -> Result<Self> {
-        let config_path = paths.config_file();
-        if config_path.exists() {
-            Self::load(&config_path)
-        } else {
-            Ok(Self::default())
+    /// Validate config values and return self if valid.
+    fn validate(self) -> Result<Self> {
+        // Validate cron_tick_interval_secs
+        if self.cron_tick_interval_secs < MIN_CRON_TICK_INTERVAL_SECS {
+            tracing::warn!(
+                value = self.cron_tick_interval_secs,
+                min = MIN_CRON_TICK_INTERVAL_SECS,
+                "cron_tick_interval_secs too small, using minimum value"
+            );
+            return Err(crate::Error::Config(format!(
+                "cron_tick_interval_secs must be at least {} seconds, got {}",
+                MIN_CRON_TICK_INTERVAL_SECS, self.cron_tick_interval_secs
+            )));
         }
+        if self.cron_tick_interval_secs > MAX_CRON_TICK_INTERVAL_SECS {
+            tracing::warn!(
+                value = self.cron_tick_interval_secs,
+                max = MAX_CRON_TICK_INTERVAL_SECS,
+                "cron_tick_interval_secs too large, using maximum value"
+            );
+            return Err(crate::Error::Config(format!(
+                "cron_tick_interval_secs must be at most {} seconds, got {}",
+                MAX_CRON_TICK_INTERVAL_SECS, self.cron_tick_interval_secs
+            )));
+        }
+
+        // Validate default_timezone if set
+        if let Some(ref tz) = self.default_timezone {
+            if tz.parse::<chrono_tz::Tz>().is_err() {
+                return Err(crate::Error::Config(format!(
+                    "Invalid default_timezone '{}'. Use IANA timezone like 'Asia/Shanghai', 'America/New_York'",
+                    tz
+                )));
+            }
+        }
+
+        Ok(self)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {

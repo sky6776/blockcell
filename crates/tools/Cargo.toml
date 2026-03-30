@@ -22,6 +22,8 @@ scraper = { workspace = true }
 htmd = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
+cron = { workspace = true }
 dirs = { workspace = true }
 calamine = { workspace = true }
 zip = { workspace = true }

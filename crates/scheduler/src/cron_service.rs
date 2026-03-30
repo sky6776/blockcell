@@ -2,9 +2,10 @@ use crate::job::{CronJob, ScheduleKind};
 use blockcell_core::system_event::{DeliveryPolicy, EventPriority, SystemEvent};
 use blockcell_core::{InboundMessage, Paths, Result};
 use blockcell_tools::EventEmitterHandle;
-use chrono::Utc;
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::SystemTime;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info};
 
@@ -29,6 +30,15 @@ pub struct CronService {
     inbound_tx: mpsc::Sender<InboundMessage>,
     agent_id: Option<String>,
     event_emitter: Arc<StdMutex<Option<EventEmitterHandle>>>,
+    /// Last known modification time of cron_jobs.json file.
+    /// Used to skip unnecessary disk reads when file hasn't changed.
+    last_file_mtime: Arc<RwLock<Option<SystemTime>>>,
+    /// Flag to track if in-memory state has changes that need to be saved.
+    has_unsaved_changes: Arc<RwLock<bool>>,
+    /// Tick interval in seconds for checking due jobs.
+    tick_interval_secs: u64,
+    /// Default timezone for jobs without a specified timezone or with invalid timezone.
+    default_timezone: Option<Tz>,
 }
 
 fn apply_route_agent_id(metadata: &mut serde_json::Value, agent_id: Option<&str>) {
@@ -42,16 +52,59 @@ fn apply_route_agent_id(metadata: &mut serde_json::Value, agent_id: Option<&str>
     }
 }
 
+/// Parse a timezone string (e.g., "Asia/Shanghai") into a Tz.
+/// Returns None and logs a warning if the timezone string is invalid.
+fn parse_timezone(tz_str: &str) -> Option<Tz> {
+    match tz_str.parse::<Tz>() {
+        Ok(tz) => Some(tz),
+        Err(e) => {
+            tracing::warn!(tz = %tz_str, error = %e, "Invalid timezone string");
+            None
+        }
+    }
+}
+
 impl CronService {
+    /// Create a new CronService with default tick interval (1 second).
     pub fn new(paths: Paths, inbound_tx: mpsc::Sender<InboundMessage>) -> Self {
-        Self::new_with_agent(paths, inbound_tx, None)
+        Self::new_with_options(paths, inbound_tx, None, None, None)
     }
 
+    /// Create a new CronService with optional agent_id (uses default tick interval).
     pub fn new_with_agent(
         paths: Paths,
         inbound_tx: mpsc::Sender<InboundMessage>,
         agent_id: Option<String>,
     ) -> Self {
+        Self::new_with_options(paths, inbound_tx, agent_id, None, None)
+    }
+
+    /// Create a new CronService with all options.
+    pub fn new_with_options(
+        paths: Paths,
+        inbound_tx: mpsc::Sender<InboundMessage>,
+        agent_id: Option<String>,
+        tick_interval_secs: Option<u64>,
+        default_timezone: Option<&str>,
+    ) -> Self {
+        // Parse default timezone string to Tz
+        let default_tz = default_timezone.and_then(|tz_str| {
+            match tz_str.parse::<Tz>() {
+                Ok(tz) => {
+                    tracing::info!(default_timezone = %tz_str, "CronService using default timezone");
+                    Some(tz)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        default_timezone = %tz_str,
+                        error = %e,
+                        "Invalid default timezone string, falling back to UTC"
+                    );
+                    None
+                }
+            }
+        });
+
         Self {
             paths,
             jobs: Arc::new(RwLock::new(Vec::new())),
@@ -60,6 +113,10 @@ impl CronService {
                 .map(|id| id.trim().to_string())
                 .filter(|id| !id.is_empty()),
             event_emitter: Arc::new(StdMutex::new(None)),
+            last_file_mtime: Arc::new(RwLock::new(None)),
+            has_unsaved_changes: Arc::new(RwLock::new(false)),
+            tick_interval_secs: tick_interval_secs.unwrap_or(1),
+            default_timezone: default_tz,
         }
     }
 
@@ -69,39 +126,6 @@ impl CronService {
             .lock()
             .expect("cron service event emitter lock poisoned");
         *slot = Some(emitter);
-    }
-
-    fn emit_system_event(&self, event: SystemEvent) {
-        let emitter = self
-            .event_emitter
-            .lock()
-            .expect("cron service event emitter lock poisoned")
-            .clone();
-        if let Some(emitter) = emitter {
-            emitter.emit(event);
-        }
-    }
-
-    fn emit_cron_event(
-        &self,
-        job: &CronJob,
-        kind: &str,
-        priority: EventPriority,
-        title: &str,
-        summary: String,
-        delivery: DeliveryPolicy,
-    ) {
-        let mut event = SystemEvent::new_main_session(kind, "cron", priority, title, summary);
-        event.delivery = delivery;
-        event.details = serde_json::json!({
-            "job_id": job.id.clone(),
-            "job_name": job.name.clone(),
-            "payload_kind": job.payload.kind.clone(),
-            "deliver": job.payload.deliver,
-            "deliver_channel": job.payload.channel.clone(),
-            "deliver_to": job.payload.to.clone(),
-        });
-        self.emit_system_event(event);
     }
 
     pub async fn load(&self) -> Result<()> {
@@ -124,6 +148,12 @@ impl CronService {
     }
 
     pub async fn save(&self) -> Result<()> {
+        // Check if there are unsaved changes
+        if !*self.has_unsaved_changes.read().await {
+            debug!("No unsaved changes, skipping cron save");
+            return Ok(());
+        }
+
         let path = self.paths.cron_jobs_file();
 
         if let Some(parent) = path.parent() {
@@ -139,13 +169,30 @@ impl CronService {
         let content = serde_json::to_string_pretty(&store)?;
         tokio::fs::write(&path, content).await?;
 
+        // Update the recorded modification time (our own write)
+        let mtime = tokio::fs::metadata(&path)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok());
+        *self.last_file_mtime.write().await = mtime;
+
+        // Clear the unsaved changes flag
+        *self.has_unsaved_changes.write().await = false;
+
+        debug!("Cron jobs saved to disk");
         Ok(())
     }
 
     pub async fn add_job(&self, job: CronJob) -> Result<()> {
         let mut jobs = self.jobs.write().await;
+        // Check for duplicate ID
+        if jobs.iter().any(|j| j.id == job.id) {
+            tracing::warn!(job_id = %job.id, "Duplicate job ID, replacing existing job");
+            jobs.retain(|j| j.id != job.id);
+        }
         jobs.push(job);
         drop(jobs);
+        *self.has_unsaved_changes.write().await = true;
         self.save().await
     }
 
@@ -157,6 +204,7 @@ impl CronService {
         drop(jobs);
 
         if removed {
+            *self.has_unsaved_changes.write().await = true;
             self.save().await?;
         }
         Ok(removed)
@@ -188,6 +236,7 @@ impl CronService {
                 job.updated_at_ms = chrono::Utc::now().timestamp_millis();
                 let name = job.name.clone();
                 drop(jobs);
+                *self.has_unsaved_changes.write().await = true;
                 self.save().await?;
                 Ok(Some(name))
             }
@@ -216,11 +265,31 @@ impl CronService {
     /// last_run_at_ms) for jobs that have already been initialized this session.
     /// This avoids the old `load()` bug where a full replace would clobber in-memory
     /// scheduling state and could cause jobs to re-fire or never fire.
-    async fn merge_load(&self) -> Result<()> {
+    ///
+    /// Returns `true` if the file was actually read (had changes), `false` if skipped.
+    async fn merge_load(&self) -> Result<bool> {
         let path = self.paths.cron_jobs_file();
         if !path.exists() {
-            return Ok(());
+            return Ok(false);
         }
+
+        // Check file modification time to skip unnecessary reads
+        let current_mtime = tokio::fs::metadata(&path)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok());
+
+        let last_mtime = *self.last_file_mtime.read().await;
+
+        // If file hasn't changed, skip the read
+        if let (Some(current), Some(last)) = (current_mtime, last_mtime) {
+            if current == last {
+                debug!("Cron jobs file unchanged, skipping reload");
+                return Ok(false);
+            }
+        }
+
+        // File has changed (or no previous mtime), read it
         let content = tokio::fs::read_to_string(&path).await?;
         let store: JobStore = serde_json::from_str(&content)?;
 
@@ -250,52 +319,103 @@ impl CronService {
             }
         }
         *mem_jobs = new_jobs;
+
+        // Update the recorded modification time
+        *self.last_file_mtime.write().await = current_mtime;
+
         debug!(
             count = mem_jobs.len(),
             "Loaded cron jobs (merged with in-memory state)"
         );
-        Ok(())
+        Ok(true)
     }
 
     /// Pick up any new jobs written to disk (e.g. by CronTool) since the last load.
-    /// Only adds jobs whose IDs are not already in memory; never modifies existing ones.
+    /// Also updates existing jobs if they were modified on disk (detected by updated_at_ms).
     /// Called just before save() to close the race window.
     async fn sync_new_from_disk(
         &self,
         known_ids: &std::collections::HashSet<String>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let path = self.paths.cron_jobs_file();
         if !path.exists() {
-            return Ok(());
+            return Ok(false);
         }
         let content = tokio::fs::read_to_string(&path).await?;
         let store: JobStore = serde_json::from_str(&content)?;
 
         let mut mem_jobs = self.jobs.write().await;
+        let mut changed = false;
+
         for disk_job in store.jobs {
+            // Check if this is a new job
             if !known_ids.contains(&disk_job.id)
                 && !mem_jobs.iter().any(|job| job.id == disk_job.id)
             {
                 debug!(job_id = %disk_job.id, "Picked up new cron job from disk");
                 mem_jobs.push(disk_job);
+                changed = true;
+            } else {
+                // Check if existing job was modified on disk (by updated_at_ms)
+                if let Some(mem_job) = mem_jobs.iter_mut().find(|j| j.id == disk_job.id) {
+                    // If disk job is newer, update the in-memory copy
+                    // but preserve execution state (next_run_at_ms, last_run_at_ms)
+                    // unless the schedule itself changed
+                    if disk_job.updated_at_ms > mem_job.updated_at_ms {
+                        let schedule_changed = mem_job.schedule.kind != disk_job.schedule.kind
+                            || mem_job.schedule.at_ms != disk_job.schedule.at_ms
+                            || mem_job.schedule.every_ms != disk_job.schedule.every_ms
+                            || mem_job.schedule.expr != disk_job.schedule.expr
+                            || mem_job.schedule.tz != disk_job.schedule.tz;
+
+                        debug!(
+                            job_id = %disk_job.id,
+                            schedule_changed = schedule_changed,
+                            "Detected modified job on disk, updating in-memory state"
+                        );
+
+                        // Preserve execution state unless schedule changed
+                        let preserved_next_run = if schedule_changed {
+                            // Schedule changed: reset next_run to force recalculation
+                            None
+                        } else {
+                            mem_job.state.next_run_at_ms
+                        };
+                        let preserved_last_run = mem_job.state.last_run_at_ms;
+
+                        // Update from disk
+                        *mem_job = disk_job;
+
+                        // Restore preserved state
+                        mem_job.state.next_run_at_ms = preserved_next_run;
+                        mem_job.state.last_run_at_ms = preserved_last_run;
+
+                        changed = true;
+                    }
+                }
             }
         }
-        Ok(())
+        Ok(changed)
     }
 
     pub async fn run_tick(&self) -> Result<()> {
         // Reload from disk, merging in-memory execution state for already-initialized jobs.
         // New jobs added by CronTool (disk-only) are picked up; existing job scheduling
         // state (next_run_at_ms / last_run_at_ms) is preserved to avoid double-firing.
-        if let Err(e) = self.merge_load().await {
-            error!(error = %e.to_string(), "Failed to reload cron jobs from disk");
-        }
+        let _file_changed = match self.merge_load().await {
+            Ok(changed) => changed,
+            Err(e) => {
+                error!(error = %e.to_string(), "Failed to reload cron jobs from disk");
+                false
+            }
+        };
 
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let mut jobs = self.jobs.write().await;
         let known_ids: std::collections::HashSet<String> =
             jobs.iter().map(|job| job.id.clone()).collect();
         let mut jobs_to_run = Vec::new();
+        let mut state_changed = false;
 
         for job in jobs.iter_mut() {
             if !job.enabled {
@@ -305,12 +425,27 @@ impl CronService {
             // Guard: skip one-time (At) jobs that have already fired
             if job.schedule.kind == ScheduleKind::At && job.state.last_run_at_ms.is_some() {
                 job.enabled = false;
+                state_changed = true;
                 continue;
             }
 
+            // Parse timezone for this job
+            let tz: Option<Tz> = job.schedule.tz.as_ref().and_then(|tz_str| {
+                let parsed = parse_timezone(tz_str);
+                if parsed.is_none() {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        tz = %tz_str,
+                        default_tz = ?self.default_timezone,
+                        "Invalid timezone string, falling back to default timezone or UTC"
+                    );
+                }
+                parsed
+            }).or(self.default_timezone);
+
             let should_run = match &job.state.next_run_at_ms {
                 Some(next) => *next <= now_ms,
-                None => self.calculate_next_run(job, now_ms),
+                None => self.calculate_next_run(job, now_ms, tz.as_ref()),
             };
 
             if should_run {
@@ -318,8 +453,9 @@ impl CronService {
 
                 // Update state
                 job.state.last_run_at_ms = Some(now_ms);
+                state_changed = true;
 
-                // Calculate next run
+                // Calculate next run with timezone support
                 match job.schedule.kind {
                     ScheduleKind::At => {
                         // One-time job: disable immediately
@@ -332,12 +468,10 @@ impl CronService {
                         }
                     }
                     ScheduleKind::Cron => {
-                        // Calculate next cron time
+                        // Calculate next cron time with timezone support
                         if let Some(expr) = &job.schedule.expr {
-                            if let Ok(schedule) = expr.parse::<cron::Schedule>() {
-                                if let Some(next) = schedule.upcoming(Utc).next() {
-                                    job.state.next_run_at_ms = Some(next.timestamp_millis());
-                                }
+                            if let Some(next_ms) = self.calculate_next_cron_run_ms(expr, tz.as_ref()) {
+                                job.state.next_run_at_ms = Some(next_ms);
                             }
                         }
                     }
@@ -345,9 +479,7 @@ impl CronService {
             }
         }
 
-        // 修复：delete_after_run 不依赖 enabled 状态。
-        // 原逻辑 `!j.enabled` 导致 Every 类型（执行后 enabled 仍为 true）的一次性任务永远不被删除。
-        // 修正为：只要执行过（last_run_at_ms.is_some()）且标记了 delete_after_run 就删除。
+        // Handle delete_after_run
         let delete_ids: Vec<String> = jobs
             .iter()
             .filter(|j| j.delete_after_run && j.state.last_run_at_ms.is_some())
@@ -355,77 +487,84 @@ impl CronService {
             .collect();
         if !delete_ids.is_empty() {
             jobs.retain(|j| !delete_ids.contains(&j.id));
+            state_changed = true;
             info!(count = delete_ids.len(), "Deleted completed one-time jobs");
         }
 
         drop(jobs);
 
-        // Pick up any new jobs written by CronTool between the merge_load above and now.
-        // This closes the race window: without this, save() would overwrite those new jobs.
-        if let Err(e) = self.sync_new_from_disk(&known_ids).await {
-            error!(error = %e.to_string(), "Failed to sync new cron jobs from disk");
+        // Mark state as changed if any modifications occurred
+        if state_changed {
+            *self.has_unsaved_changes.write().await = true;
+        }
+
+        // Always sync new jobs from disk to close the mtime race window.
+        // CronTool may have written new jobs between merge_load and now; without this,
+        // save() would overwrite those new jobs. This also catches cases where mtime
+        // granularity (1-2s on most filesystems) caused merge_load to skip a changed file.
+        match self.sync_new_from_disk(&known_ids).await {
+            Ok(added) => {
+                if added {
+                    *self.has_unsaved_changes.write().await = true;
+                }
+            }
+            Err(e) => {
+                error!(error = %e.to_string(), "Failed to sync new cron jobs from disk");
+            }
         }
 
         // Save state changes to disk BEFORE executing jobs
         // This ensures the next tick won't re-fire disabled/deleted jobs
-        self.save().await?;
+        if state_changed || *self.has_unsaved_changes.read().await {
+            self.save().await?;
+        }
 
-        // Execute jobs
+        // Execute jobs - spawn for parallel execution to avoid blocking
+        let inbound_tx = self.inbound_tx.clone();
+        let event_emitter = self.event_emitter.clone();
+        let agent_id = self.agent_id.clone();
+
         for job in jobs_to_run {
-            self.execute_job(&job).await;
+            let inbound_tx = inbound_tx.clone();
+            let event_emitter = event_emitter.clone();
+            let agent_id = agent_id.clone();
+
+            tokio::spawn(async move {
+                Self::execute_job_internal(&job, inbound_tx, event_emitter, agent_id).await;
+            });
         }
         Ok(())
     }
 
-    fn calculate_next_run(&self, job: &mut CronJob, now_ms: i64) -> bool {
-        match job.schedule.kind {
-            ScheduleKind::At => {
-                if let Some(at_ms) = job.schedule.at_ms {
-                    job.state.next_run_at_ms = Some(at_ms);
-                    at_ms <= now_ms
-                } else {
-                    false
-                }
-            }
-            ScheduleKind::Every => {
-                if let Some(every_ms) = job.schedule.every_ms {
-                    // 修复：首次不立即执行，而是等待第一个完整周期后再触发。
-                    // 原逻辑返回 true 导致服务启动后所有 Every 任务立即执行一次，
-                    // 且若 save() 在崩溃前未完成，重启后会再次立即执行（重复触发）。
-                    job.state.next_run_at_ms = Some(now_ms + every_ms);
-                    false
-                } else {
-                    false
-                }
-            }
-            ScheduleKind::Cron => {
-                if let Some(expr) = &job.schedule.expr {
-                    if let Ok(schedule) = expr.parse::<cron::Schedule>() {
-                        if let Some(next) = schedule.upcoming(Utc).next() {
-                            job.state.next_run_at_ms = Some(next.timestamp_millis());
-                            debug!(
-                                job_id = %job.id,
-                                next_run_ms = next.timestamp_millis(),
-                                "Cron job initialized, waiting for first scheduled time"
-                            );
-                        }
-                    }
-                }
-                false
-            }
-        }
-    }
-
-    async fn execute_job(&self, job: &CronJob) {
+    /// Internal execute function that can be called from spawned tasks
+    async fn execute_job_internal(
+        job: &CronJob,
+        inbound_tx: mpsc::Sender<InboundMessage>,
+        event_emitter: Arc<StdMutex<Option<EventEmitterHandle>>>,
+        agent_id: Option<String>,
+    ) {
         debug!(job_id = %job.id, job_name = %job.name, kind = %job.payload.kind, "Executing cron job");
-        self.emit_cron_event(
-            job,
-            "cron.job_started",
-            EventPriority::Normal,
-            "定时任务开始执行",
-            format!("定时任务 {} 已开始执行", job.name),
-            DeliveryPolicy::default(),
-        );
+
+        // Emit start event
+        if let Some(emitter) = event_emitter.lock().ok().and_then(|e| e.clone()) {
+            let mut event = SystemEvent::new_main_session(
+                "cron.job_started",
+                "cron",
+                EventPriority::Normal,
+                "定时任务开始执行",
+                format!("定时任务 {} 已开始执行", job.name),
+            );
+            event.delivery = DeliveryPolicy::default();
+            event.details = serde_json::json!({
+                "job_id": job.id.clone(),
+                "job_name": job.name.clone(),
+                "payload_kind": job.payload.kind.clone(),
+                "deliver": job.payload.deliver,
+                "deliver_channel": job.payload.channel.clone(),
+                "deliver_to": job.payload.to.clone(),
+            });
+            emitter.emit(event);
+        }
 
         let (content, metadata) = match job.payload.kind.as_str() {
             "reminder" => {
@@ -477,7 +616,7 @@ impl CronService {
         let (msg_channel, msg_chat_id) = ("cron".to_string(), job.id.clone());
 
         let mut metadata = metadata;
-        apply_route_agent_id(&mut metadata, self.agent_id.as_deref());
+        apply_route_agent_id(&mut metadata, agent_id.as_deref());
 
         let msg = InboundMessage {
             channel: msg_channel,
@@ -487,35 +626,129 @@ impl CronService {
             content,
             media: vec![],
             metadata,
-            timestamp_ms: Utc::now().timestamp_millis(),
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
         };
 
-        if let Err(e) = self.inbound_tx.send(msg).await {
+        if let Err(e) = inbound_tx.send(msg).await {
             error!(error = %e, "Failed to send cron job message");
-            self.emit_cron_event(
-                job,
-                "cron.job_failed",
-                EventPriority::Critical,
-                "定时任务派发失败",
-                format!("定时任务 {} 派发失败：{}", job.name, e),
-                DeliveryPolicy::critical(),
-            );
+
+            // Emit failure event
+            if let Some(emitter) = event_emitter.lock().ok().and_then(|e| e.clone()) {
+                let mut event = SystemEvent::new_main_session(
+                    "cron.job_failed",
+                    "cron",
+                    EventPriority::Critical,
+                    "定时任务派发失败",
+                    format!("定时任务 {} 派发失败：{}", job.name, e),
+                );
+                event.delivery = DeliveryPolicy::critical();
+                event.details = serde_json::json!({
+                    "job_id": job.id.clone(),
+                    "job_name": job.name.clone(),
+                    "error": e.to_string(),
+                });
+                emitter.emit(event);
+            }
         } else {
-            self.emit_cron_event(
-                job,
-                "cron.job_completed",
-                EventPriority::Normal,
-                "定时任务已派发",
-                format!("定时任务 {} 已成功派发", job.name),
-                DeliveryPolicy::default(),
-            );
+            // Emit completion event
+            if let Some(emitter) = event_emitter.lock().ok().and_then(|e| e.clone()) {
+                let mut event = SystemEvent::new_main_session(
+                    "cron.job_completed",
+                    "cron",
+                    EventPriority::Normal,
+                    "定时任务已派发",
+                    format!("定时任务 {} 已成功派发", job.name),
+                );
+                event.delivery = DeliveryPolicy::default();
+                event.details = serde_json::json!({
+                    "job_id": job.id.clone(),
+                    "job_name": job.name.clone(),
+                });
+                emitter.emit(event);
+            }
+        }
+    }
+
+    /// Execute a cron job (wrapper for testing and internal use)
+    #[allow(dead_code)]
+    async fn execute_job(&self, job: &CronJob) {
+        Self::execute_job_internal(
+            job,
+            self.inbound_tx.clone(),
+            self.event_emitter.clone(),
+            self.agent_id.clone(),
+        ).await;
+    }
+
+    /// Calculate the next cron run time with timezone support.
+    /// Returns the next run time as milliseconds since epoch.
+    fn calculate_next_cron_run_ms(&self, expr: &str, tz: Option<&Tz>) -> Option<i64> {
+        match expr.parse::<cron::Schedule>() {
+            Ok(schedule) => match tz {
+                Some(tz_ref) => schedule.upcoming(*tz_ref).next().map(|dt| dt.timestamp_millis()),
+                None => schedule.upcoming(chrono::Utc).next().map(|dt| dt.timestamp_millis()),
+            },
+            Err(e) => {
+                tracing::error!(expr = %expr, error = %e, "Invalid cron expression");
+                None
+            }
+        }
+    }
+
+    fn calculate_next_run(&self, job: &mut CronJob, now_ms: i64, tz: Option<&Tz>) -> bool {
+        match job.schedule.kind {
+            ScheduleKind::At => {
+                if let Some(at_ms) = job.schedule.at_ms {
+                    job.state.next_run_at_ms = Some(at_ms);
+                    at_ms <= now_ms
+                } else {
+                    false
+                }
+            }
+            ScheduleKind::Every => {
+                if let Some(every_ms) = job.schedule.every_ms {
+                    // Set next_run_at_ms for the NEXT scheduled run (after potential immediate execution).
+                    // This is stored now so that after immediate execution, the next run time is already set.
+                    // run_immediately controls whether THIS tick should trigger execution:
+                    // - true: return true to trigger immediate execution, next_run_at_ms is already set for next cycle
+                    // - false: return false, job will wait until next_run_at_ms
+                    job.state.next_run_at_ms = Some(now_ms + every_ms);
+                    job.schedule.run_immediately
+                } else {
+                    false
+                }
+            }
+            ScheduleKind::Cron => {
+                if let Some(expr) = &job.schedule.expr {
+                    if let Some(next_ms) = self.calculate_next_cron_run_ms(expr, tz) {
+                        job.state.next_run_at_ms = Some(next_ms);
+                        debug!(
+                            job_id = %job.id,
+                            next_run_ms = next_ms,
+                            tz = job.schedule.tz.as_deref().unwrap_or("UTC"),
+                            "Cron job initialized, waiting for first scheduled time"
+                        );
+                    }
+                }
+                false
+            }
         }
     }
 
     pub async fn run_loop(self: Arc<Self>, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
-        info!("CronService started");
+        info!(
+            tick_interval_secs = self.tick_interval_secs,
+            "CronService started"
+        );
 
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+        // Use configurable tick interval
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(self.tick_interval_secs));
+
+        // Skip accumulated ticks when the service was paused/blocked
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Skip the first immediate tick (tokio interval returns immediately on first tick)
+        interval.tick().await;
 
         loop {
             tokio::select! {
@@ -526,6 +759,13 @@ impl CronService {
                 }
                 _ = shutdown.recv() => {
                     info!("CronService shutting down");
+
+                    // Save any unsaved state before shutting down
+                    if *self.has_unsaved_changes.read().await {
+                        if let Err(e) = self.save().await {
+                            error!(error = %e.to_string(), "Failed to save cron state on shutdown");
+                        }
+                    }
                     break;
                 }
             }
@@ -536,6 +776,7 @@ impl CronService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     #[derive(Clone, Default)]
     struct RecordingEmitter {
@@ -587,6 +828,7 @@ mod tests {
                 every_ms: Some(60_000),
                 expr: None,
                 tz: None,
+                run_immediately: false,
             },
             payload: crate::job::JobPayload {
                 kind: "reminder".to_string(),
@@ -616,6 +858,7 @@ mod tests {
                 every_ms: Some(60_000),
                 expr: None,
                 tz: None,
+                run_immediately: false,
             },
             payload: crate::job::JobPayload {
                 kind: "agent".to_string(),
@@ -645,6 +888,7 @@ mod tests {
                 every_ms: None,
                 expr: None,
                 tz: None,
+                run_immediately: false,
             },
             payload: crate::job::JobPayload {
                 kind: "reminder".to_string(),

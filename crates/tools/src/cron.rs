@@ -35,13 +35,16 @@ fn execute_cron_action_with_paths(
     params: &Value,
     origin_channel: &str,
     origin_chat_id: &str,
+    default_timezone: Option<&str>,
 ) -> Result<Value> {
     match action {
         "add" => {
             let mut store = load_store(paths)?;
             let now_ms = Utc::now().timestamp_millis();
-            let name = params["name"].as_str().unwrap();
-            let message = params["message"].as_str().unwrap();
+            let name = params.get("name").and_then(|v| v.as_str())
+                .ok_or_else(|| Error::Validation("Missing or invalid 'name' parameter".to_string()))?;
+            let message = params.get("message").and_then(|v| v.as_str())
+                .ok_or_else(|| Error::Validation("Missing or invalid 'message' parameter".to_string()))?;
             let delete_after_run = params
                 .get("delete_after_run")
                 .and_then(|v| v.as_bool())
@@ -58,6 +61,15 @@ fn execute_cron_action_with_paths(
                         }),
                     )
                 } else if let Some(at_ms) = params.get("at_ms").and_then(|v| v.as_i64()) {
+                    // Validate at_ms: detect if it's likely a seconds timestamp (wrong unit)
+                    // A milliseconds timestamp for year 2020-2030 should be in range 1577836800000 - 1893456000000
+                    // If the value is less than 1e12 (1000000000000), it's likely in seconds, not milliseconds
+                    if at_ms > 0 && at_ms < 1_000_000_000_000 {
+                        return Err(Error::Validation(format!(
+                            "at_ms value {} appears to be in seconds, not milliseconds. Multiply by 1000 or use delay_seconds instead.",
+                            at_ms
+                        )));
+                    }
                     (
                         "at",
                         json!({
@@ -66,21 +78,48 @@ fn execute_cron_action_with_paths(
                         }),
                     )
                 } else if let Some(every) = params.get("every_seconds").and_then(|v| v.as_i64()) {
+                    if every <= 0 {
+                        return Err(Error::Validation(
+                            "every_seconds must be a positive integer".to_string()
+                        ));
+                    }
+                    let run_immediately = params.get("run_immediately").and_then(|v| v.as_bool()).unwrap_or(false);
                     (
                         "every",
                         json!({
                             "kind": "every",
-                            "everyMs": every * 1000
+                            "everyMs": every * 1000,
+                            "runImmediately": run_immediately
                         }),
                     )
                 } else if let Some(expr) = params.get("cron_expr").and_then(|v| v.as_str()) {
-                    (
-                        "cron",
-                        json!({
-                            "kind": "cron",
-                            "expr": expr
-                        }),
-                    )
+                    // Validate cron expression
+                    if expr.parse::<cron::Schedule>().is_err() {
+                        return Err(Error::Validation(format!(
+                            "Invalid cron expression '{}'. Use 6-field format: 'sec min hour day month weekday'",
+                            expr
+                        )));
+                    }
+                    // Use user-specified tz if provided, otherwise fall back to default_timezone
+                    let tz = params.get("tz").and_then(|v| v.as_str())
+                        .or(default_timezone);
+                    // Validate timezone if provided
+                    if let Some(tz_str) = tz {
+                        if tz_str.parse::<chrono_tz::Tz>().is_err() {
+                            return Err(Error::Validation(format!(
+                                "Invalid timezone '{}'. Use IANA timezone like 'Asia/Shanghai', 'America/New_York'",
+                                tz_str
+                            )));
+                        }
+                    }
+                    let mut schedule_json = json!({
+                        "kind": "cron",
+                        "expr": expr
+                    });
+                    if let Some(tz) = tz {
+                        schedule_json["tz"] = json!(tz);
+                    }
+                    ("cron", schedule_json)
                 } else {
                     return Err(Error::Validation("No schedule specified".to_string()));
                 };
@@ -193,7 +232,8 @@ fn execute_cron_action_with_paths(
         }
         "remove" => {
             let mut store = load_store(paths)?;
-            let job_id = params["job_id"].as_str().unwrap();
+            let job_id = params.get("job_id").and_then(|v| v.as_str())
+                .ok_or_else(|| Error::Validation("Missing or invalid 'job_id' parameter".to_string()))?;
 
             let before = store.jobs.len();
             store.jobs.retain(|j| {
@@ -236,7 +276,24 @@ fn load_store(paths: &Paths) -> Result<JobStore> {
         return Ok(JobStore::default());
     }
     let content = std::fs::read_to_string(&path)?;
-    let store: JobStore = serde_json::from_str(&content).unwrap_or_default();
+    let store: JobStore = serde_json::from_str(&content).unwrap_or_else(|e| {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "Failed to parse cron_jobs.json, starting with empty store. Existing file may be corrupted."
+        );
+        // Optionally backup the corrupted file
+        let corrupted_path = path.with_extension("json.corrupted");
+        if let Err(backup_err) = std::fs::rename(&path, &corrupted_path) {
+            tracing::warn!(
+                original = %path.display(),
+                backup = %corrupted_path.display(),
+                error = %backup_err,
+                "Failed to backup corrupted cron_jobs.json"
+            );
+        }
+        JobStore::default()
+    });
     Ok(store)
 }
 
@@ -274,7 +331,7 @@ impl Tool for CronTool {
                     },
                     "at_ms": {
                         "type": "integer",
-                        "description": "(add) Unix timestamp in milliseconds for a one-time job. Use this for reminders at a specific time."
+                        "description": "(add) Unix timestamp in **milliseconds** for a one-time job. MUST be milliseconds (e.g., 1743329100000), NOT seconds. For relative times, prefer delay_seconds which is easier to use."
                     },
                     "delay_seconds": {
                         "type": "integer",
@@ -286,7 +343,15 @@ impl Tool for CronTool {
                     },
                     "cron_expr": {
                         "type": "string",
-                        "description": "(add) Cron expression for complex schedules, e.g. '0 30 9 * * Mon-Fri' for weekdays at 9:30"
+                        "description": "(add) Cron expression for complex schedules, e.g. '0 30 9 * * Mon-Fri' for weekdays at 9:30. Use 6-field format: 'sec min hour day month weekday'. Time uses the user's configured timezone by default."
+                    },
+                    "tz": {
+                        "type": "string",
+                        "description": "(add) Optional. Override timezone for this job, e.g. 'America/New_York'. If not specified, uses the user's configured default timezone. Only use when user explicitly mentions a specific timezone."
+                    },
+                    "run_immediately": {
+                        "type": "boolean",
+                        "description": "(add) For every_seconds jobs. If true, execute immediately when created instead of waiting for the first interval. Default false."
                     },
                     "delete_after_run": {
                         "type": "boolean",
@@ -311,8 +376,16 @@ impl Tool for CronTool {
         }
     }
 
-    fn prompt_rule(&self, _ctx: &crate::PromptContext) -> Option<String> {
-        Some("- **定时任务 (cron)**: 用户要求定时执行某项任务时，先判断执行模式。**纯提醒**（如起床提醒、喝水提醒）用 `mode='reminder'`，`message` 直接写最终发给用户的话，不要写成待分析任务；触发时会直接发送，不经过 LLM。若任务需要真正执行某个技能脚本，先调用 `list_skills` 查找技能，再用 `mode='script'` 并设置 `skill_name='...'`。若任务本身就是一段需要模型理解、调用工具、再整理结果的指令（如定时搜索新闻、抓取网页、汇总情报），用 `mode='agent'`，这样触发时会进入正常 agent LLM/tool loop。`mode` 省略时：有 `skill_name` 默认 `script`，否则默认 `reminder`。 [TIMEZONE] `cron_expr` 使用 UTC 时间，中国用户（UTC+8）说每天 9 点应填 `cron_expr='0 0 1 * * *'`（UTC 1:00 = 北京时间 9:00）。一次性任务设 `delete_after_run=true`；周期任务用 `cron_expr` 或 `every_seconds`。".to_string())
+    fn prompt_rule(&self, ctx: &crate::PromptContext) -> Option<String> {
+        let tz_hint = match ctx.default_timezone {
+            Some(tz) => format!("默认时区: `{}`", tz),
+            None => "默认时区: UTC".to_string(),
+        };
+
+        Some(format!(
+            "- **定时任务 (cron)**: 用户要求定时执行某项任务时，先判断执行模式。**纯提醒**（如起床提醒、喝水提醒）用 `mode='reminder'`，`message` 直接写最终发给用户的话，不要写成待分析任务；触发时会直接发送，不经过 LLM。若任务需要真正执行某个技能脚本，先调用 `list_skills` 查找技能，再用 `mode='script'` 并设置 `skill_name='...'`。若任务本身就是一段需要模型理解、调用工具、再整理结果的指令（如定时搜索新闻、抓取网页、汇总情报），用 `mode='agent'`，这样触发时会进入正常 agent LLM/tool loop。`mode` 省略时：有 `skill_name` 默认 `script`，否则默认 `reminder`。**一次性任务优先用 `delay_seconds`**（如5分钟后用 `delay_seconds=300`），避免 `at_ms` 单位错误。{}。只有用户**明确**指定特定时区时才需设置 `tz` 参数（如'纽约时间9点'、'东京时间'），自动转换为 IANA 名称（如 `America/New_York`、`Asia/Tokyo`）。一次性任务设 `delete_after_run=true`；周期任务用 `cron_expr` 或 `every_seconds`。`every_seconds` 任务默认等待一个周期后首次执行，若需立即执行设 `run_immediately=true`。",
+            tz_hint
+        ))
     }
 
     fn validate(&self, params: &Value) -> Result<()> {
@@ -378,9 +451,12 @@ impl Tool for CronTool {
     }
 
     async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
-        let action = params["action"].as_str().unwrap().to_string();
+        let action = params.get("action").and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Validation("Missing required parameter: action".to_string()))?
+            .to_string();
         let origin_channel = ctx.channel.clone();
         let origin_chat_id = ctx.chat_id.clone();
+        let default_timezone = ctx.config.default_timezone.clone();
         // Derive agent-specific paths from the workspace directory.
         // ctx.workspace = <base>/workspace, so parent() = <base> (e.g. ~/.blockcell/agents/<id>).
         let paths = if let Some(base) = ctx.workspace.parent() {
@@ -395,6 +471,7 @@ impl Tool for CronTool {
                 &params,
                 &origin_channel,
                 &origin_chat_id,
+                default_timezone.as_deref(),
             )
         })
         .await
@@ -449,6 +526,7 @@ mod tests {
             }),
             "telegram",
             "12345",
+            None,
         );
         assert!(r.is_ok(), "unexpected error: {:?}", r.err());
         let _ = std::fs::remove_dir_all(paths.base);
@@ -488,6 +566,7 @@ mod tests {
             }),
             "telegram",
             "12345",
+            None,
         );
         assert!(r.is_ok(), "unexpected error: {:?}", r.err());
 
@@ -540,5 +619,172 @@ mod tests {
     fn test_cron_validate_unknown_action() {
         let tool = CronTool;
         assert!(tool.validate(&json!({"action": "invalid"})).is_err());
+    }
+
+    #[test]
+    fn test_cron_validate_invalid_timezone() {
+        let paths = temp_paths("tz_invalid");
+        let r = execute_cron_action_with_paths(
+            &paths,
+            "add",
+            &json!({
+                "name": "test",
+                "message": "hi",
+                "cron_expr": "0 0 9 * * *"
+            }),
+            "telegram",
+            "12345",
+            Some("Invalid/Timezone"),
+        );
+        assert!(r.is_err(), "Should reject invalid timezone");
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("Invalid timezone"), "Error message should mention invalid timezone");
+        let _ = std::fs::remove_dir_all(paths.base);
+    }
+
+    #[test]
+    fn test_cron_user_specified_timezone_overrides_default() {
+        let paths = temp_paths("tz_override");
+        let r = execute_cron_action_with_paths(
+            &paths,
+            "add",
+            &json!({
+                "name": "test",
+                "message": "hi",
+                "cron_expr": "0 0 9 * * *",
+                "tz": "America/New_York"
+            }),
+            "telegram",
+            "12345",
+            Some("Asia/Shanghai"),  // default_timezone
+        );
+        assert!(r.is_ok(), "Should accept user-specified timezone: {:?}", r.err());
+
+        // Verify the job was saved with user-specified timezone, not default
+        let store = load_store(&paths).expect("load cron store");
+        let saved_tz = store.jobs[0]
+            .get("schedule")
+            .and_then(|s| s.get("tz"))
+            .and_then(|v| v.as_str());
+        assert_eq!(saved_tz, Some("America/New_York"), "Should use user-specified timezone");
+        let _ = std::fs::remove_dir_all(paths.base);
+    }
+
+    #[test]
+    fn test_cron_validate_invalid_cron_expr() {
+        let paths = temp_paths("cron_invalid");
+        let r = execute_cron_action_with_paths(
+            &paths,
+            "add",
+            &json!({
+                "name": "test",
+                "message": "hi",
+                "cron_expr": "not a valid cron"
+            }),
+            "telegram",
+            "12345",
+            None,
+        );
+        assert!(r.is_err(), "Should reject invalid cron expression");
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("Invalid cron expression"), "Error message should mention invalid cron expression");
+        let _ = std::fs::remove_dir_all(paths.base);
+    }
+
+    #[test]
+    fn test_cron_validate_negative_every_seconds() {
+        let paths = temp_paths("every_negative");
+        let r = execute_cron_action_with_paths(
+            &paths,
+            "add",
+            &json!({
+                "name": "test",
+                "message": "hi",
+                "every_seconds": -10
+            }),
+            "telegram",
+            "12345",
+            None,
+        );
+        assert!(r.is_err(), "Should reject negative every_seconds");
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("every_seconds must be a positive integer"), "Error message should mention positive integer requirement");
+        let _ = std::fs::remove_dir_all(paths.base);
+    }
+
+    #[test]
+    fn test_cron_validate_zero_every_seconds() {
+        let paths = temp_paths("every_zero");
+        let r = execute_cron_action_with_paths(
+            &paths,
+            "add",
+            &json!({
+                "name": "test",
+                "message": "hi",
+                "every_seconds": 0
+            }),
+            "telegram",
+            "12345",
+            None,
+        );
+        assert!(r.is_err(), "Should reject zero every_seconds");
+        let _ = std::fs::remove_dir_all(paths.base);
+    }
+
+    #[test]
+    fn test_cron_add_with_default_timezone() {
+        let paths = temp_paths("tz_default");
+        let r = execute_cron_action_with_paths(
+            &paths,
+            "add",
+            &json!({
+                "name": "morning reminder",
+                "message": "Good morning!",
+                "cron_expr": "0 0 9 * * *"
+            }),
+            "telegram",
+            "12345",
+            Some("Asia/Shanghai"),
+        );
+        assert!(r.is_ok(), "Should accept default_timezone: {:?}", r.err());
+        let result = r.unwrap();
+        assert_eq!(result.get("status").and_then(|v| v.as_str()), Some("created"));
+
+        // Verify the job was saved with correct timezone from default_timezone
+        let store = load_store(&paths).expect("load cron store");
+        let saved_tz = store.jobs[0]
+            .get("schedule")
+            .and_then(|s| s.get("tz"))
+            .and_then(|v| v.as_str());
+        assert_eq!(saved_tz, Some("Asia/Shanghai"));
+        let _ = std::fs::remove_dir_all(paths.base);
+    }
+
+    #[test]
+    fn test_cron_add_with_run_immediately() {
+        let paths = temp_paths("run_immediately");
+        let r = execute_cron_action_with_paths(
+            &paths,
+            "add",
+            &json!({
+                "name": "test",
+                "message": "hi",
+                "every_seconds": 3600,
+                "run_immediately": true
+            }),
+            "telegram",
+            "12345",
+            None,
+        );
+        assert!(r.is_ok(), "Should accept run_immediately: {:?}", r.err());
+
+        // Verify the job was saved with run_immediately
+        let store = load_store(&paths).expect("load cron store");
+        let run_immediately = store.jobs[0]
+            .get("schedule")
+            .and_then(|s| s.get("runImmediately"))
+            .and_then(|v| v.as_bool());
+        assert_eq!(run_immediately, Some(true));
+        let _ = std::fs::remove_dir_all(paths.base);
     }
 }

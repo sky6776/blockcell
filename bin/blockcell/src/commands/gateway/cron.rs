@@ -46,6 +46,9 @@ pub(super) struct CronCreateRequest {
     deliver_channel: Option<String>,
     #[serde(default)]
     deliver_to: Option<String>,
+    /// For every_seconds jobs: execute immediately on first tick instead of waiting one cycle.
+    #[serde(default)]
+    run_immediately: bool,
 }
 
 fn resolve_cron_skill_payload_kind(paths: &Paths, skill_name: Option<&str>) -> &'static str {
@@ -160,6 +163,7 @@ pub(super) async fn handle_cron_create(
             every_ms: None,
             expr: None,
             tz: None,
+            run_immediately: false, // Not applicable for At jobs
         }
     } else if let Some(every) = req.every_seconds {
         JobSchedule {
@@ -168,6 +172,7 @@ pub(super) async fn handle_cron_create(
             every_ms: Some(every * 1000),
             expr: None,
             tz: None,
+            run_immediately: req.run_immediately,
         }
     } else if let Some(expr) = req.cron_expr {
         JobSchedule {
@@ -176,6 +181,7 @@ pub(super) async fn handle_cron_create(
             every_ms: None,
             expr: Some(expr),
             tz: None,
+            run_immediately: false, // Not applicable for Cron jobs
         }
     } else {
         return Json(
@@ -287,6 +293,7 @@ mod tests {
                 every_ms: None,
                 expr: None,
                 tz: None,
+                run_immediately: false,
             },
             payload: JobPayload {
                 kind: kind.to_string(),

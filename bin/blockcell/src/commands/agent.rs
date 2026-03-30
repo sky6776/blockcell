@@ -642,7 +642,15 @@ pub async fn run(
         let event_emitter = runtime.event_emitter_handle();
 
         // Create and start CronService
-        let cron_service = Arc::new(CronService::new(paths.clone(), inbound_tx.clone()));
+        let tick_interval_secs = config.cron_tick_interval_secs;
+        let default_timezone = config.default_timezone.as_deref();
+        let cron_service = Arc::new(CronService::new_with_options(
+            paths.clone(),
+            inbound_tx.clone(),
+            Some(agent_id.clone()),
+            Some(tick_interval_secs),
+            default_timezone,
+        ));
         cron_service.set_event_emitter(event_emitter);
         cron_service.load().await?;
 

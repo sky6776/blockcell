@@ -33,6 +33,10 @@ pub struct JobSchedule {
     pub expr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tz: Option<String>,
+    /// For Every jobs: if true, execute immediately on first tick instead of waiting one cycle.
+    /// Default: false (wait for first complete cycle).
+    #[serde(default)]
+    pub run_immediately: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

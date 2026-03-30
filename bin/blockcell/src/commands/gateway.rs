@@ -1133,9 +1133,11 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     // ── Create scheduler services ──
     let mut cron_services_map: HashMap<String, Arc<CronService>> = HashMap::new();
     let mut cron_handles: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
+    let tick_interval_secs = config.cron_tick_interval_secs;
+    let default_timezone = config.default_timezone.as_deref();
     for agent in &resolved_agents {
         let agent_id = agent.id.clone();
-        let cron_service = Arc::new(CronService::new_with_agent(
+        let cron_service = Arc::new(CronService::new_with_options(
             paths.for_agent(&agent_id),
             inbound_tx.clone(),
             if agent_id == "default" {
@@ -1143,6 +1145,8 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
             } else {
                 Some(agent_id.clone())
             },
+            Some(tick_interval_secs),
+            default_timezone,
         ));
         if let Some(emitter) = agent_event_emitters.get(&agent_id) {
             cron_service.set_event_emitter(emitter.clone());
