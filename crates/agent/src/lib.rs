@@ -18,6 +18,7 @@ pub mod summary_queue;
 pub mod system_event_orchestrator;
 pub mod system_event_store;
 pub mod task_manager;
+pub(crate) mod token;
 
 pub use bus::MessageBus;
 pub use capability_adapter::{CapabilityRegistryAdapter, CoreEvolutionAdapter, ProviderLLMBridge};

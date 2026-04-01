@@ -21,13 +21,14 @@ use tracing::{debug, error, info, warn};
 use crate::context::{ActiveSkillContext, ContextBuilder, InteractionMode};
 use crate::error::{
     classify_tool_failure, dangerous_exec_denied, dangerous_file_ops_denied,
-    disabled_skill_result, disabled_tool_result, estimate_messages_tokens, llm_exhausted_error,
+    disabled_skill_result, disabled_tool_result, llm_exhausted_error,
     scoped_tool_denied_result, ToolFailureKind,
 };
 use crate::history_projector::HistoryProjector;
 use crate::intent::{IntentCategory, IntentToolResolver};
 use crate::metrics::{ProcessingMetrics, ScopedTimer};
 use crate::skill_executor::{determine_manual_load_mode, SkillExecutionResult};
+use crate::token::estimate_messages_tokens;
 use crate::skill_kernel::SkillRunMode;
 use crate::summary_queue::MainSessionSummaryQueue;
 use crate::system_event_orchestrator::{

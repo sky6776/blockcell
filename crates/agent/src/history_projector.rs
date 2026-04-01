@@ -2,6 +2,8 @@ use blockcell_core::types::ChatMessage;
 use serde_json::Value;
 use std::collections::HashSet;
 
+use crate::token::estimate_messages_tokens;
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HistoryProjectionProfile {
@@ -314,6 +316,12 @@ fn trim_message_for_conversation(msg: &ChatMessage) -> ChatMessage {
         _ => 1400,
     };
     trim_message_content(&mut out, max_chars);
+
+    // Preserve reasoning by truncating instead of discarding
+    // Conversation mode uses smaller budget for tighter context limits
+    let max_thinking_chars = 2000;
+    out.reasoning_content = truncate_reasoning_content(&msg.reasoning_content, max_thinking_chars);
+
     out
 }
 
@@ -327,8 +335,18 @@ fn trim_message_for_script_planning(msg: &ChatMessage, compact: bool) -> ChatMes
         _ => 3000,
     };
     trim_message_content(&mut out, max_chars);
-    out.reasoning_content = None;
+
+    // Preserve reasoning by truncating instead of discarding
+    // Max thinking chars per message (approximately 1000 tokens = ~4000 chars)
+    let max_thinking_chars = 4000;
+    out.reasoning_content = truncate_reasoning_content(&msg.reasoning_content, max_thinking_chars);
+
     out
+}
+
+/// Truncate reasoning_content to a maximum character budget.
+fn truncate_reasoning_content(content: &Option<String>, max_chars: usize) -> Option<String> {
+    content.as_ref().map(|text| trim_text_head_tail(text, max_chars))
 }
 
 fn trim_message_content(msg: &mut ChatMessage, max_chars: usize) {
@@ -359,64 +377,7 @@ fn trim_message_content(msg: &mut ChatMessage, max_chars: usize) {
 }
 
 fn estimate_history_tokens(messages: &[ChatMessage]) -> usize {
-    messages.iter().map(estimate_message_tokens).sum()
-}
-
-fn estimate_message_tokens(msg: &ChatMessage) -> usize {
-    let content_tokens = match &msg.content {
-        Value::String(text) => estimate_tokens(text),
-        Value::Array(parts) => parts
-            .iter()
-            .map(|part| {
-                if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
-                    estimate_tokens(text)
-                } else if part.get("image_url").is_some() {
-                    200
-                } else {
-                    10
-                }
-            })
-            .sum(),
-        _ => 0,
-    };
-    let tool_call_tokens = msg.tool_calls.as_ref().map_or(0, |calls| {
-        calls.iter()
-            .map(|call| estimate_tokens(&call.name) + estimate_tokens(&call.arguments.to_string()) + 10)
-            .sum::<usize>()
-    });
-    content_tokens + tool_call_tokens + 4
-}
-
-fn estimate_tokens(text: &str) -> usize {
-    if text.is_empty() {
-        return 0;
-    }
-
-    let mut tokens = 0usize;
-    let mut ascii_word_chars = 0usize;
-    for ch in text.chars() {
-        if ch.is_ascii() {
-            if ch.is_ascii_whitespace() || ch.is_ascii_punctuation() {
-                if ascii_word_chars > 0 {
-                    tokens += 1 + ascii_word_chars / 4;
-                    ascii_word_chars = 0;
-                }
-                tokens += 1;
-            } else {
-                ascii_word_chars += 1;
-            }
-        } else {
-            if ascii_word_chars > 0 {
-                tokens += 1 + ascii_word_chars / 4;
-                ascii_word_chars = 0;
-            }
-            tokens += 1;
-        }
-    }
-    if ascii_word_chars > 0 {
-        tokens += 1 + ascii_word_chars / 4;
-    }
-    tokens + 4
+    estimate_messages_tokens(messages)
 }
 
 fn trim_text_head_tail(text: &str, max_chars: usize) -> String {

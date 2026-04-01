@@ -153,54 +153,6 @@ pub(crate) fn classify_tool_failure(result: &str) -> ToolFailureKind {
     ToolFailureKind::Permanent
 }
 
-// ── Token estimation ──
-
-/// Rough token count estimation for a string.
-/// Uses the heuristic: ~4 characters per token for English, ~2 characters per CJK token.
-pub(crate) fn estimate_tokens(text: &str) -> usize {
-    let mut count = 0usize;
-    for ch in text.chars() {
-        if ch.is_ascii() {
-            // ASCII: ~4 chars per token (roughly 1 token per word)
-            count += 1;
-        } else {
-            // CJK / Unicode: ~1-2 chars per token
-            count += 3;
-        }
-    }
-    // Divide by 4 to get approximate token count (ASCII is overcounted above)
-    count.div_ceil(4)
-}
-
-/// Estimate the total token count for a slice of chat messages.
-pub(crate) fn estimate_messages_tokens(messages: &[blockcell_core::types::ChatMessage]) -> usize {
-    messages
-        .iter()
-        .map(|msg| {
-            let content_len = match &msg.content {
-                serde_json::Value::String(s) => estimate_tokens(s),
-                serde_json::Value::Array(arr) => arr
-                    .iter()
-                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                    .map(estimate_tokens)
-                    .sum(),
-                _ => 0,
-            };
-            let tool_calls_len = msg
-                .tool_calls
-                .as_ref()
-                .map(|tcs| {
-                    tcs.iter()
-                        .map(|tc| estimate_tokens(&tc.name) + estimate_tokens(&tc.arguments.to_string()))
-                        .sum::<usize>()
-                })
-                .unwrap_or(0);
-            // ~4 tokens overhead per message (role, separators)
-            content_len + tool_calls_len + 4
-        })
-        .sum()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,20 +199,6 @@ mod tests {
             classify_tool_failure("HTTP 404 Not Found"),
             ToolFailureKind::ResourceMissing
         );
-    }
-
-    #[test]
-    fn test_estimate_tokens_ascii() {
-        // "hello world" = 11 chars => ~3 tokens
-        let tokens = estimate_tokens("hello world");
-        assert!(tokens > 0 && tokens < 10);
-    }
-
-    #[test]
-    fn test_estimate_tokens_cjk() {
-        // "你好世界" = 4 CJK chars => ~4 tokens (each CJK char ≈ 1 token)
-        let tokens = estimate_tokens("你好世界");
-        assert!((2..=6).contains(&tokens));
     }
 
     #[test]
