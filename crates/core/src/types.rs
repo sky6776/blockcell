@@ -152,6 +152,7 @@ impl PermissionSet {
 pub struct ChatMessage {
     pub role: String,
     pub content: serde_json::Value,
+    /// 推理内容 (思考过程，如 DeepSeek reasoning)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
