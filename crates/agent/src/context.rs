@@ -2,12 +2,10 @@ use blockcell_core::types::ChatMessage;
 use blockcell_core::{Config, Paths};
 use blockcell_skills::{EvolutionService, EvolutionServiceConfig, LLMProvider, SkillManager};
 use blockcell_tools::MemoryStoreHandle;
+use crate::auto_memory::MemoryInjector;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
-
-use crate::history_projector::{HistoryProjectionProfile, HistoryProjector};
-use crate::token::{estimate_message_tokens, estimate_tokens};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InteractionMode {
@@ -27,15 +25,16 @@ pub struct ActiveSkillContext {
 
 pub struct ContextBuilder {
     paths: Paths,
-    config: Config,
     skill_manager: Option<SkillManager>,
     memory_store: Option<MemoryStoreHandle>,
+    /// Layer 5 记忆注入器 (7 层记忆系统)
+    memory_injector: Option<MemoryInjector>,
     /// Cached capability brief for prompt injection (updated from tick).
     capability_brief: Option<String>,
 }
 
 impl ContextBuilder {
-    pub fn new(paths: Paths, config: Config) -> Self {
+    pub fn new(paths: Paths, _config: Config) -> Self {
         let skills_dir = paths.skills_dir();
         let mut skill_manager = SkillManager::new()
             .with_versioning(skills_dir.clone())
@@ -44,9 +43,9 @@ impl ContextBuilder {
 
         Self {
             paths,
-            config,
             skill_manager: Some(skill_manager),
             memory_store: None,
+            memory_injector: None,
             capability_brief: None,
         }
     }
@@ -57,6 +56,21 @@ impl ContextBuilder {
 
     pub fn set_memory_store(&mut self, store: MemoryStoreHandle) {
         self.memory_store = Some(store);
+    }
+
+    /// Set the Layer 5 memory injector (7-layer memory system).
+    pub fn set_memory_injector(&mut self, injector: MemoryInjector) {
+        self.memory_injector = Some(injector);
+    }
+
+    /// Get the memory injector (for checking if initialized).
+    pub fn memory_injector(&self) -> Option<&MemoryInjector> {
+        self.memory_injector.as_ref()
+    }
+
+    /// Get the memory injector (for async loading).
+    pub fn memory_injector_mut(&mut self) -> Option<&mut MemoryInjector> {
+        self.memory_injector.as_mut()
     }
 
     /// Set the cached capability brief (called from tick or initialization).
@@ -267,7 +281,8 @@ impl ContextBuilder {
                 };
                 match brief_result {
                     Ok(brief) if !brief.is_empty() => {
-                        prompt.push_str("## Memory Brief\n");
+                        prompt.push_str("## Memory Brief (SQLite FTS5 Search)\n");
+                        prompt.push_str("> 以下是通过语义搜索检索的相关记忆：\n\n");
                         prompt.push_str(&brief);
                         prompt.push_str("\n\n");
                     }
@@ -275,16 +290,25 @@ impl ContextBuilder {
                 }
             } else {
                 if let Some(content) = self.load_file_if_exists(self.paths.memory_md()) {
-                    prompt.push_str("## Long-term Memory\n");
+                    prompt.push_str("## Long-term Memory (Legacy File)\n");
                     prompt.push_str(&content);
                     prompt.push_str("\n\n");
                 }
                 let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
                 if let Some(content) = self.load_file_if_exists(self.paths.daily_memory(&today)) {
-                    prompt.push_str("## Today's Notes\n");
+                    prompt.push_str("## Today's Notes (Legacy File)\n");
                     prompt.push_str(&content);
                     prompt.push_str("\n\n");
                 }
+            }
+        }
+
+        // Layer 5: 注入持久化记忆 (7 层记忆系统)
+        // 在 SQLite 记忆之后注入，提供更深层的上下文
+        if let Some(ref injector) = self.memory_injector {
+            let injection = injector.build_injection_content();
+            if !injection.is_empty() {
+                prompt.push_str(&injection);
             }
         }
 
@@ -368,19 +392,6 @@ impl ContextBuilder {
         tool_prompt_rules: &[String],
     ) -> Vec<ChatMessage> {
         let mut messages = Vec::new();
-        let is_im_channel = matches!(
-            channel,
-            "wecom"
-                | "feishu"
-                | "lark"
-                | "telegram"
-                | "slack"
-                | "discord"
-                | "dingtalk"
-                | "whatsapp"
-                | "napcat"
-                | "qq"
-        );
 
         let system_prompt = self.build_system_prompt_for_mode_with_channel(
             mode,
@@ -392,7 +403,6 @@ impl ContextBuilder {
             available_tool_names,
             tool_prompt_rules,
         );
-        let system_tokens = estimate_tokens(&system_prompt);
         messages.push(ChatMessage::system(&system_prompt));
 
         let user_msg = if media.is_empty() {
@@ -424,29 +434,13 @@ impl ContextBuilder {
                 self.build_multimodal_message(&text_with_paths, media)
             }
         };
-        let user_msg_tokens = estimate_message_tokens(&user_msg);
 
-        let max_context = self.config.agents.defaults.max_context_tokens as usize;
-        let reserved_output = self.config.agents.defaults.max_tokens as usize;
-        let safety_margin = 500;
-        let history_budget = max_context
-            .saturating_sub(system_tokens)
-            .saturating_sub(user_msg_tokens)
-            .saturating_sub(reserved_output)
-            .saturating_sub(safety_margin);
-
-        let projected_history = Self::compress_history_for_user(history, user_content, history_budget);
-        let safe_start = Self::find_safe_history_start(&projected_history);
-        for msg in &projected_history[safe_start..] {
+        // 直接使用完整 history，不再截断
+        // 由 Layer 4 (Full Compact) 负责 LLM 语义压缩
+        // 由 find_safe_history_start 确保不出现孤立的 tool 消息
+        let safe_start = Self::find_safe_history_start(history);
+        for msg in &history[safe_start..] {
             messages.push(msg.clone());
-        }
-
-        if is_im_channel && messages.len() > 24 {
-            let keep = 24;
-            let start = messages.len().saturating_sub(keep);
-            let mut trimmed = vec![messages[0].clone()];
-            trimmed.extend(messages[start..].iter().cloned());
-            messages = trimmed;
         }
 
         messages.push(user_msg);
@@ -477,6 +471,7 @@ impl ContextBuilder {
         }
 
         ChatMessage {
+            id: None,
             role: "user".to_string(),
             content: serde_json::Value::Array(content_parts),
             reasoning_content: None,
@@ -517,32 +512,6 @@ impl ContextBuilder {
         let bytes = std::fs::read(path).ok()?;
         let base64_str = base64::engine::general_purpose::STANDARD.encode(&bytes);
         Some(format!("data:{};base64,{}", mime_type, base64_str))
-    }
-
-    /// Compress history by whole rounds so tool chains are never split.
-    /// - Prefer keeping the latest 6 complete rounds intact
-    /// - Older rounds are summarized to `user + final assistant`
-    #[cfg(test)]
-    fn compress_history(history: &[ChatMessage], token_budget: usize) -> Vec<ChatMessage> {
-        Self::compress_history_for_user(history, "", token_budget)
-    }
-
-    fn compress_history_for_user(
-        history: &[ChatMessage],
-        user_input: &str,
-        token_budget: usize,
-    ) -> Vec<ChatMessage> {
-        if history.is_empty() || token_budget == 0 {
-            return Vec::new();
-        }
-
-        HistoryProjector::new(history)
-            .project(
-                user_input,
-                HistoryProjectionProfile::Conversation,
-                token_budget,
-            )
-            .messages
     }
 
     /// Find a safe starting index in truncated history to avoid orphaned tool messages.
@@ -639,28 +608,6 @@ impl ContextBuilder {
 mod tests {
     use super::*;
     use std::fs;
-
-    fn build_tool_round(round: usize) -> Vec<ChatMessage> {
-        let call_id = format!("call-{}", round);
-        vec![
-            ChatMessage::user(&format!("user round {}", round)),
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: serde_json::Value::String(format!("planning round {}", round)),
-                reasoning_content: None,
-                tool_calls: Some(vec![blockcell_core::types::ToolCallRequest {
-                    id: call_id.clone(),
-                    name: format!("tool_{}", round),
-                    arguments: serde_json::json!({ "round": round }),
-                    thought_signature: None,
-                }]),
-                tool_call_id: None,
-                name: None,
-            },
-            ChatMessage::tool_result(&call_id, &format!(r#"{{"round":{},"ok":true}}"#, round)),
-            ChatMessage::assistant(&format!("final round {}", round)),
-        ]
-    }
 
     #[test]
     fn test_resolve_active_skill_by_name_keeps_manual_injection_for_script_skill() {
@@ -832,60 +779,5 @@ description: deploy demo
         assert!(content.contains("查看 .env 的内容"));
         assert!(!content.contains("[Follow-up Reference]"));
         assert!(!content.contains("/Users/apple/.blockcell/.env"));
-    }
-
-    #[test]
-    fn test_compress_history_keeps_latest_six_complete_rounds() {
-        let mut history = Vec::new();
-        for round in 1..=8 {
-            history.extend(build_tool_round(round));
-        }
-
-        let compressed = ContextBuilder::compress_history(&history, 50_000);
-
-        assert_eq!(compressed.len(), 28);
-        assert_eq!(compressed[0].content.as_str(), Some("user round 1"));
-        assert_eq!(compressed[1].content.as_str(), Some("final round 1"));
-        assert_eq!(compressed[2].content.as_str(), Some("user round 2"));
-        assert_eq!(compressed[3].content.as_str(), Some("final round 2"));
-
-        let round_three_index = compressed
-            .iter()
-            .position(|msg| msg.content.as_str() == Some("user round 3"))
-            .expect("round 3 should exist");
-        assert_eq!(compressed[round_three_index + 1].role, "assistant");
-        assert!(compressed[round_three_index + 1]
-            .tool_calls
-            .as_ref()
-            .is_some_and(|calls| calls.len() == 1));
-        assert_eq!(compressed[round_three_index + 2].role, "tool");
-        assert_eq!(compressed[round_three_index + 3].content.as_str(), Some("final round 3"));
-    }
-
-    #[test]
-    fn test_compress_history_never_starts_mid_round() {
-        let mut history = Vec::new();
-        for round in 1..=3 {
-            let mut round_msgs = build_tool_round(round);
-            if let Some(ChatMessage {
-                content: serde_json::Value::String(text),
-                ..
-            }) = round_msgs.get_mut(0)
-            {
-                *text = format!("user round {} {}", round, "x".repeat(120));
-            }
-            if let Some(ChatMessage {
-                content: serde_json::Value::String(text),
-                ..
-            }) = round_msgs.get_mut(3)
-            {
-                *text = format!("final round {} {}", round, "y".repeat(160));
-            }
-            history.extend(round_msgs);
-        }
-
-        let compressed = ContextBuilder::compress_history(&history, 140);
-        let first = compressed.first().expect("compressed history should not be empty");
-        assert_eq!(first.role, "user");
     }
 }

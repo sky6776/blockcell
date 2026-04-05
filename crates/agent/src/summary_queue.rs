@@ -5,6 +5,20 @@ use blockcell_core::system_event::{
 };
 use uuid::Uuid;
 
+/// 安全获取锁，处理锁中毒情况
+///
+/// 如果锁中毒（持有锁的线程 panic），会恢复并返回内部状态。
+/// 这是安全的，因为 SummaryQueue 的数据可以重建。
+fn get_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!("[summary_queue] Lock poisoned, recovering");
+            poisoned.into_inner()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SummaryQueueSnapshot {
     pub pending_count: usize,
@@ -28,7 +42,7 @@ impl MainSessionSummaryQueue {
     }
 
     pub fn enqueue(&self, item: SummaryItem) {
-        let mut items = self.items.lock().expect("summary queue lock poisoned");
+        let mut items = get_lock(&self.items);
         if let Some(merge_key) = item.merge_key.as_deref() {
             if let Some(existing) = items
                 .iter_mut()
@@ -67,7 +81,7 @@ impl MainSessionSummaryQueue {
     }
 
     pub fn flush_due_items(&self, now_ms: i64) -> Vec<SummaryItem> {
-        let mut items = self.items.lock().expect("summary queue lock poisoned");
+        let mut items = get_lock(&self.items);
         if items.is_empty() {
             return Vec::new();
         }
@@ -91,7 +105,7 @@ impl MainSessionSummaryQueue {
     }
 
     pub fn snapshot(&self) -> SummaryQueueSnapshot {
-        let items = self.items.lock().expect("summary queue lock poisoned");
+        let items = get_lock(&self.items);
         let mut cloned = items.clone();
         cloned.sort_by_key(|item| item.created_at_ms);
         SummaryQueueSnapshot {

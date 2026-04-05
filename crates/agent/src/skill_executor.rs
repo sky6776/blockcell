@@ -66,6 +66,7 @@ mod tests {
 
     fn skill_trace_message(skill_name: &str) -> ChatMessage {
         ChatMessage {
+            id: None,
             role: "assistant".to_string(),
             content: serde_json::Value::String(String::new()),
             reasoning_content: None,
