@@ -22,7 +22,7 @@ use blockcell_channels::napcat::NapCatChannel;
 use blockcell_channels::ChannelManager;
 use blockcell_core::{Config, InboundMessage, OutboundMessage, Paths};
 use blockcell_scheduler::{
-    CronJob, CronService, GhostService, GhostServiceConfig, HeartbeatService, JobPayload,
+    CronJob, CronService, DreamService, DreamServiceConfig, GhostService, GhostServiceConfig, HeartbeatService, JobPayload,
     JobSchedule, JobState, ScheduleKind,
 };
 use blockcell_skills::{new_registry_handle, CoreEvolution};
@@ -750,6 +750,12 @@ async fn spawn_agent_runtime(
     runtime.set_capability_registry(cap_registry_handle);
     runtime.set_core_evolution(core_evo_handle);
     runtime.set_event_tx(ws_broadcast_tx);
+
+    // Initialize Layer 5 memory injector (7-layer memory system)
+    if let Err(e) = runtime.init_memory_injector().await {
+        warn!(error = %e, "Failed to initialize memory injector");
+    }
+
     let event_emitter = runtime.event_emitter_handle();
 
     let (agent_inbound_tx, agent_inbound_rx) = mpsc::channel::<InboundMessage>(100);
@@ -1164,6 +1170,37 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     }
 
     let heartbeat_service = Arc::new(HeartbeatService::new(paths.clone(), inbound_tx.clone()));
+
+    // ── Layer 6: Dream Service (跨会话知识整合) ──
+    // 使用 default agent 的配置创建 provider_pool
+    let dream_provider_pool = if let Some(default_config) = config.config_for_agent("default") {
+        match blockcell_providers::ProviderPool::from_config(&default_config) {
+            Ok(pool) => Some(Arc::new(pool)),
+            Err(e) => {
+                warn!("Failed to create provider pool for Dream service: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(ref pool) = dream_provider_pool {
+        let dream_config = DreamServiceConfig {
+            enabled: true,
+            check_interval_secs: 10 * 60, // 10 分钟检查一次
+            provider_pool: Some(Arc::clone(pool)),
+        };
+        let dream_service = DreamService::new(dream_config, paths.clone());
+        let dream_shutdown_rx = shutdown_tx.subscribe();
+        let dream_handle = tokio::spawn(async move {
+            dream_service.run_loop(dream_shutdown_rx).await;
+        });
+        runtime_handles.push(("dream".to_string(), dream_handle));
+        info!("[dream] Dream service started for cross-session knowledge consolidation");
+    } else {
+        warn!("[dream] Dream service not started: no provider pool available");
+    }
 
     // Optional: register this gateway with the configured community hub.
     // This runs in the background and does not block gateway startup.

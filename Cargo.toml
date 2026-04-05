@@ -99,6 +99,9 @@ tar = "0.4"
 # PDF
 pdf-extract = "0.7"
 
+# Token counting (OpenAI tiktoken)
+tiktoken-rs = "0.6"
+
 # CSV
 csv = "1.3"
 

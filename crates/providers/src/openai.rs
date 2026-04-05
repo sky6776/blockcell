@@ -1746,6 +1746,7 @@ ls -la
         let messages = vec![
             ChatMessage::user("先写一个故事"),
             ChatMessage {
+                id: None,
                 role: "assistant".to_string(),
                 content: Value::String(String::new()),
                 reasoning_content: None,
@@ -1775,6 +1776,7 @@ ls -la
         let messages = vec![
             ChatMessage::user("列出当前目录"),
             ChatMessage {
+                id: None,
                 role: "assistant".to_string(),
                 content: Value::String(String::new()),
                 reasoning_content: None,

@@ -24,7 +24,7 @@ use crate::error::{
     disabled_skill_result, disabled_tool_result, llm_exhausted_error,
     scoped_tool_denied_result, ToolFailureKind,
 };
-use crate::history_projector::HistoryProjector;
+use crate::history_projector::{HistoryProjector, TimeBasedMCConfig};
 use crate::intent::{IntentCategory, IntentToolResolver};
 use crate::metrics::{ProcessingMetrics, ScopedTimer};
 use crate::skill_executor::{determine_manual_load_mode, SkillExecutionResult};
@@ -439,6 +439,7 @@ fn push_internal_skill_trace(
 ) {
     let tool_call = build_internal_skill_tool_call(tool_name, arguments);
     history.push(ChatMessage {
+        id: None,
         role: "assistant".to_string(),
         content: serde_json::Value::String(String::new()),
         reasoning_content: None,
@@ -503,7 +504,7 @@ fn persist_script_skill_history(
 }
 
 fn find_recent_skill_name_from_history(history: &[ChatMessage]) -> Option<String> {
-    HistoryProjector::new(history).analyze("").latest_skill_name
+    HistoryProjector::new(history).analyze().latest_skill_name
 }
 
 const SESSION_ACTIVE_SKILL_NAME_KEY: &str = "active_skill_name";
@@ -1087,12 +1088,10 @@ async fn pick_image_path(paths: &Paths, history: &[ChatMessage]) -> Option<Strin
         for cap in re_abs.captures_iter(&text) {
             let p = cap.get(1)?.as_str().to_string();
             if tokio::fs::metadata(&p).await.is_ok() {
-                let ok_under_media_dir = std::fs::canonicalize(&p)
-                    .ok()
-                    .and_then(|cp| std::fs::canonicalize(&media_dir).ok().map(|md| (cp, md)))
-                    .map(|(cp, md)| cp.starts_with(md))
-                    .unwrap_or(false);
-                if ok_under_media_dir {
+                // 使用异步 canonicalize 避免阻塞 tokio runtime
+                let cp = tokio::fs::canonicalize(&p).await.ok()?;
+                let md = tokio::fs::canonicalize(&media_dir).await.ok()?;
+                if cp.starts_with(md) {
                     return Some(p);
                 }
             }
@@ -1172,43 +1171,6 @@ fn is_tool_trace_content(text: &str) -> bool {
         || t.contains("[/TOOL_CALL]")
 }
 
-fn condense_web_search_result(raw: &str) -> Option<String> {
-    let val: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let results = val.get("results")?.as_array()?;
-
-    let mut out = String::new();
-    let mut idx = 1usize;
-    for r in results.iter().take(8) {
-        let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("");
-        let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
-        let snippet = r
-            .get("snippet")
-            .and_then(|v| v.as_str())
-            .or_else(|| r.get("description").and_then(|v| v.as_str()))
-            .unwrap_or("");
-
-        if title.is_empty() && url.is_empty() && snippet.is_empty() {
-            continue;
-        }
-
-        out.push_str(&format!("{}. {}\n{}\n{}\n\n", idx, title, url, {
-            let s: String = snippet.chars().take(240).collect();
-            if snippet.chars().count() > 240 {
-                format!("{}...", s)
-            } else {
-                s
-            }
-        }));
-        idx += 1;
-    }
-
-    if out.trim().is_empty() {
-        None
-    } else {
-        Some(out.trim().to_string())
-    }
-}
-
 /// Detect if a web_search result is "thin" — only contains titles/URLs with no actual content.
 /// This happens when the search engine returns page titles but the snippets are empty or near-empty.
 /// In this case the LLM should be directed to web_fetch specific URLs instead of giving up.
@@ -1256,40 +1218,6 @@ fn extract_urls_from_search_result(raw: &str) -> Vec<String> {
         .filter(|u| !u.is_empty())
         .take(3)
         .collect()
-}
-
-fn condense_web_fetch_result(raw: &str) -> Option<String> {
-    let val: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let content = val
-        .get("content")
-        .and_then(|v| v.as_str())
-        .or_else(|| val.get("text").and_then(|v| v.as_str()))
-        .unwrap_or("");
-
-    if content.trim().is_empty() {
-        return None;
-    }
-
-    let char_count = content.chars().count();
-    if char_count <= 1600 {
-        return Some(content.trim().to_string());
-    }
-
-    let head: String = content.chars().take(1100).collect();
-    let tail: String = content
-        .chars()
-        .rev()
-        .take(400)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    Some(format!(
-        "{}\n...<trimmed {} chars>...\n{}",
-        head.trim(),
-        char_count.saturating_sub(1500),
-        tail.trim()
-    ))
 }
 
 fn is_dangerous_exec_command(command: &str) -> bool {
@@ -1487,6 +1415,11 @@ pub struct AgentRuntime {
     path_policy: PathPolicy,
     /// Per-session cache for large list/table responses (prevents history token explosion).
     response_cache: crate::response_cache::ResponseCache,
+    /// 7-Layer Memory System integration.
+    memory_system: Option<crate::memory_system::MemorySystem>,
+    /// Flag to signal that memory injector cache needs refresh after Layer 5 extraction.
+    /// Uses Arc<AtomicBool> because background tasks need to set this flag.
+    memory_injector_needs_reload: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AgentRuntime {
@@ -1549,6 +1482,8 @@ impl AgentRuntime {
             channel_contacts,
             path_policy,
             response_cache: crate::response_cache::ResponseCache::new(),
+            memory_system: None,
+            memory_injector_needs_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -1673,6 +1608,44 @@ impl AgentRuntime {
 
     pub fn event_emitter_handle(&self) -> EventEmitterHandle {
         self.system_event_emitter.clone()
+    }
+
+    /// Initialize the 7-layer memory system for this session.
+    ///
+    /// This method creates the memory system and performs async initialization:
+    /// - Loads cursor state from disk
+    /// - Marks session as active (creates `.active` file)
+    pub async fn init_memory_system(&mut self, session_id: String) -> std::io::Result<()> {
+        use crate::memory_system::{MemorySystem, MemorySystemConfig};
+
+        let config = MemorySystemConfig::default();
+        // Use paths.base as both workspace and config directory
+        let base_dir = self.paths.base.clone();
+
+        let mut memory_system = MemorySystem::new(
+            config,
+            base_dir.clone(),
+            base_dir,
+            session_id,
+        );
+
+        // Perform async initialization: load cursor state + mark session active
+        memory_system.initialize().await?;
+
+        self.memory_system = Some(memory_system);
+
+        info!("[memory_system] initialized for session");
+        Ok(())
+    }
+
+    /// Get the memory system (if initialized).
+    pub fn memory_system(&self) -> Option<&crate::memory_system::MemorySystem> {
+        self.memory_system.as_ref()
+    }
+
+    /// Get mutable access to the memory system.
+    pub fn memory_system_mut(&mut self) -> Option<&mut crate::memory_system::MemorySystem> {
+        self.memory_system.as_mut()
     }
 
     fn sync_task_manager_event_emitter(&self) {
@@ -1819,6 +1792,89 @@ impl AgentRuntime {
     pub fn set_memory_store(&mut self, store: MemoryStoreHandle) {
         self.memory_store = Some(store.clone());
         self.context_builder.set_memory_store(store);
+    }
+
+    /// Initialize and load Layer 5 memory injector (7-layer memory system).
+    /// This loads the four memory files (user.md, project.md, feedback.md, reference.md)
+    /// from the memory directory and makes them available for system prompt injection.
+    pub async fn init_memory_injector(&mut self) -> std::io::Result<()> {
+        use crate::auto_memory::{MemoryInjector, get_memory_dir};
+
+        // Use the config base directory (e.g., ~/.blockcell/memory/)
+        let memory_dir = get_memory_dir(&self.paths.base);
+        let mut injector = MemoryInjector::default_injector();
+
+        // Try to load memory files; log warning if directory doesn't exist
+        match injector.load_memories(&memory_dir).await {
+            Ok(()) => {
+                let count = injector.cache_size();
+                if count > 0 {
+                    info!(
+                        memory_dir = %memory_dir.display(),
+                        files_loaded = count,
+                        "[Layer 5] Memory injector initialized with {} memory files",
+                        count
+                    );
+                } else {
+                    debug!(
+                        memory_dir = %memory_dir.display(),
+                        "[Layer 5] Memory injector initialized (no memory files found)"
+                    );
+                }
+                self.context_builder.set_memory_injector(injector);
+            }
+            Err(e) => {
+                // Non-fatal: memory injection is optional enhancement
+                warn!(
+                    memory_dir = %memory_dir.display(),
+                    error = %e,
+                    "[Layer 5] Failed to load memory files, continuing without persistent memory injection"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if memory injector cache needs refresh.
+    pub fn memory_injector_needs_reload(&self) -> bool {
+        self.memory_injector_needs_reload.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Signal that memory injector cache needs refresh (called by background tasks).
+    pub fn signal_memory_injector_reload(&self) {
+        self.memory_injector_needs_reload.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Reload memory injector cache if needed.
+    /// This should be called at the start of each conversation turn.
+    pub async fn reload_memory_injector_if_needed(&mut self) -> std::io::Result<()> {
+        if !self.memory_injector_needs_reload() {
+            return Ok(());
+        }
+
+        use crate::auto_memory::{MemoryInjector, get_memory_dir};
+
+        let memory_dir = get_memory_dir(&self.paths.base);
+        let mut injector = MemoryInjector::default_injector();
+        injector.load_memories(&memory_dir).await?;
+
+        let count = injector.cache_size();
+        info!(
+            memory_dir = %memory_dir.display(),
+            files_loaded = count,
+            "[Layer 5] Memory injector cache reloaded after extraction"
+        );
+
+        self.context_builder.set_memory_injector(injector);
+        self.memory_injector_needs_reload.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// Get a clone of the reload flag for use in background tasks.
+    pub fn memory_injector_reload_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.memory_injector_needs_reload)
     }
 
     /// Set the capability registry handle for tools.
@@ -1975,177 +2031,91 @@ impl AgentRuntime {
         summary
     }
 
-    /// Compress older tool interaction rounds in current_messages during the tool call loop.
-    /// Keeps: system message (index 0) + last 10 messages intact.
-    /// Middle messages: assistant tool_call messages are summarized, tool results are condensed.
-    fn compress_mid_loop(messages: &mut Vec<ChatMessage>) {
-        if messages.len() <= 12 {
-            return;
-        }
+    /// Execute Layer 4 Full Compact - LLM 语义压缩
+    ///
+    /// 当 token 超过预算阈值时，使用 LLM 生成 9-part structured summary，
+    /// 并收集恢复信息（文件、技能、Session Memory）。
+    ///
+    /// ## 返回
+    /// - `Some(CompactResult)` - 压缩成功
+    /// - `None` - 压缩失败（LLM 错误等）
+    async fn execute_layer4_compact(
+        &self,
+        messages: &[ChatMessage],
+        _session_key: &str,
+    ) -> Option<crate::compact::CompactResult> {
+        use crate::compact::{CompactResult, generate_compact_summary};
+        use crate::session_memory::get_session_memory_path;
 
-        let keep_tail = 10;
-        let mut split_point = messages.len().saturating_sub(keep_tail);
-        if split_point <= 1 {
-            return; // Only system message before the tail
-        }
+        info!(
+            pre_compact_tokens = estimate_messages_tokens(messages),
+            "[layer4] Starting full compact"
+        );
 
-        // Adjust split_point backward so the tail doesn't start with orphaned tool messages
-        // or an assistant-with-tool_calls whose tool responses are in the tail.
-        // Walk split_point back until the tail starts cleanly.
-        while split_point > 1 {
-            let tail_start_role = messages[split_point].role.as_str();
-            if tail_start_role == "tool" {
-                // Orphaned tool message — include its assistant message too
-                split_point -= 1;
-                continue;
+        // 1. 生成系统提示
+        let system_prompt = Arc::new(
+            "你是一个对话摘要助手。请根据对话历史生成结构化摘要，保留关键信息用于后续继续工作。".to_string()
+        );
+
+        // 2. 获取模型配置
+        let model = self.config.agents.defaults.model.clone();
+
+        // 3. 执行 LLM 语义压缩
+        let summary_result = generate_compact_summary(
+            Arc::clone(&self.provider_pool),
+            system_prompt,
+            &model,
+            messages.to_vec(),
+        ).await;
+
+        let summary_message = match summary_result {
+            Ok(summary) => summary.to_markdown(),
+            Err(e) => {
+                warn!(error = %e, "[layer4] Failed to generate compact summary");
+                return None;
             }
-            if tail_start_role == "assistant" {
-                if let Some(ref tcs) = messages[split_point].tool_calls {
-                    if !tcs.is_empty() {
-                        // Assistant with tool_calls at the boundary — include it in tail
-                        // (it's fine as-is; the tool responses follow in the tail)
-                        break;
-                    }
-                }
-            }
-            break;
-        }
+        };
 
-        // Keep system message (index 0) and tail messages
-        let system_msg = messages[0].clone();
-        let tail: Vec<ChatMessage> = messages[split_point..].to_vec();
+        // 4. 收集恢复信息
+        let recovery_message = if let Some(memory_system) = self.memory_system.as_ref() {
+            // 尝试读取 Session Memory 内容 (使用异步 I/O)
+            let session_memory_path = get_session_memory_path(
+                memory_system.workspace_dir(),
+                memory_system.session_id(),
+            );
+            let session_memory_content = if tokio::fs::try_exists(&session_memory_path).await.ok() == Some(true) {
+                tokio::fs::read_to_string(&session_memory_path).await.ok()
+            } else {
+                None
+            };
 
-        // Compress middle section (indices 1..split_point)
-        let mut compressed_middle: Vec<ChatMessage> = Vec::new();
-        let mut i = 1;
-        while i < split_point {
-            let msg = &messages[i];
-            if msg.role == "user" {
-                // Keep user messages intact - they contain task context that must not be lost
-                let text = match &msg.content {
-                    serde_json::Value::String(s) => s.clone(),
-                    _ => "(media)".to_string(),
-                };
-                compressed_middle.push(ChatMessage::user(&text));
-            } else if msg.role == "assistant" {
-                // For assistant messages with tool_calls, summarize to just the tool names
-                if let Some(ref tool_calls) = msg.tool_calls {
-                    let tool_names: Vec<&str> =
-                        tool_calls.iter().map(|tc| tc.name.as_str()).collect();
-                    let summary = format!("[Called: {}]", tool_names.join(", "));
-                    let mut compressed_assistant = ChatMessage::assistant(&summary);
-                    compressed_assistant.tool_calls = Some(tool_calls.clone());
-                    compressed_middle.push(compressed_assistant);
-                    // Skip subsequent tool result messages for these calls
-                    let expected_ids: std::collections::HashSet<&str> =
-                        tool_calls.iter().map(|tc| tc.id.as_str()).collect();
-                    let mut j = i + 1;
-                    while j < split_point {
-                        if messages[j].role == "tool" {
-                            if let Some(ref id) = messages[j].tool_call_id {
-                                if expected_ids.contains(id.as_str()) {
-                                    // Condense tool result aggressively (#3)
-                                    let tool_name = messages[j].name.as_deref().unwrap_or("tool");
-                                    let result_text = match &messages[j].content {
-                                        serde_json::Value::String(s) => {
-                                            if tool_result_indicates_error(s) {
-                                                // Keep error info slightly longer for context
-                                                let chars: String = s.chars().take(60).collect();
-                                                if s.chars().count() > 60 {
-                                                    format!("{}...", chars)
-                                                } else {
-                                                    chars
-                                                }
-                                            } else {
-                                                let chars: String = s.chars().take(40).collect();
-                                                if s.chars().count() > 40 {
-                                                    format!("{}...", chars)
-                                                } else {
-                                                    chars
-                                                }
-                                            }
-                                        }
-                                        _ => "ok".to_string(),
-                                    };
-                                    let mut tool_msg = ChatMessage::tool_result(
-                                        id,
-                                        &format!("[{}: {}]", tool_name, result_text),
-                                    );
-                                    tool_msg.name = Some(tool_name.to_string());
-                                    compressed_middle.push(tool_msg);
-                                    j += 1;
-                                    continue;
-                                }
-                            }
-                        }
-                        break;
-                    }
-                    i = j;
-                    continue;
-                } else {
-                    // Regular assistant text — trim it
-                    let text = match &msg.content {
-                        serde_json::Value::String(s) => {
-                            let chars: String = s.chars().take(200).collect();
-                            if s.chars().count() > 200 {
-                                format!("{}...", chars)
-                            } else {
-                                chars
-                            }
-                        }
-                        _ => String::new(),
-                    };
-                    compressed_middle.push(ChatMessage::assistant(&text));
-                }
-            } else if msg.role == "tool" {
-                // Orphaned tool message (not consumed by assistant handler above) — keep condensed
-                let tool_name = msg.name.as_deref().unwrap_or("tool");
-                let id = msg.tool_call_id.as_deref().unwrap_or("");
-                let result_text = match &msg.content {
-                    serde_json::Value::String(s) => {
-                        if tool_name == "web_search" {
-                            condense_web_search_result(s).unwrap_or_else(|| {
-                                let chars: String = s.chars().take(800).collect();
-                                if s.chars().count() > 800 {
-                                    format!("{}...", chars)
-                                } else {
-                                    chars
-                                }
-                            })
-                        } else if tool_name == "web_fetch" {
-                            condense_web_fetch_result(s).unwrap_or_else(|| {
-                                let chars: String = s.chars().take(1000).collect();
-                                if s.chars().count() > 1000 {
-                                    format!("{}...", chars)
-                                } else {
-                                    chars
-                                }
-                            })
-                        } else {
-                            let chars: String = s.chars().take(160).collect();
-                            if s.chars().count() > 160 {
-                                format!("{}...", chars)
-                            } else {
-                                chars
-                            }
-                        }
-                    }
-                    _ => "ok".to_string(),
-                };
-                let mut tool_msg =
-                    ChatMessage::tool_result(id, &format!("[{}: {}]", tool_name, result_text));
-                tool_msg.name = Some(tool_name.to_string());
-                compressed_middle.push(tool_msg);
-            }
-            // else: skip unknown roles
-            i += 1;
-        }
+            memory_system.generate_compact_recovery(session_memory_content.as_deref())
+        } else {
+            String::new()
+        };
 
-        // Rebuild messages: system + compressed middle + tail
-        *messages = Vec::with_capacity(1 + compressed_middle.len() + tail.len());
-        messages.push(system_msg);
-        messages.extend(compressed_middle);
-        messages.extend(tail);
+        // 5. 构建 CompactResult
+        let pre_compact_tokens = estimate_messages_tokens(messages);
+        let post_compact_tokens = estimate_messages_tokens(&[
+            ChatMessage::system(&summary_message),
+            ChatMessage::user(&recovery_message),
+        ]);
+
+        info!(
+            pre_compact_tokens,
+            post_compact_tokens,
+            compression_ratio = (pre_compact_tokens - post_compact_tokens) as f64 / pre_compact_tokens as f64,
+            "[layer4] Compact completed successfully"
+        );
+
+        Some(CompactResult {
+            summary_message,
+            recovery_message,
+            pre_compact_tokens,
+            post_compact_tokens,
+            success: true,
+            error: None,
+        })
     }
 
     async fn chat_with_provider(
@@ -2203,6 +2173,7 @@ impl AgentRuntime {
             }
 
             let assistant_tool_call = ChatMessage {
+                id: None,
                 role: "assistant".to_string(),
                 content: serde_json::Value::String(response.content.unwrap_or_default()),
                 reasoning_content: response.reasoning_content.clone(),
@@ -2366,6 +2337,13 @@ impl AgentRuntime {
         msg: &InboundMessage,
         persist_session_key: &str,
     ) -> Result<SkillExecutionResult> {
+        // Layer 4: Track skill activation for Post-Compact recovery
+        // 在技能执行入口处追踪，覆盖手动激活和意图路由自动加载
+        if let Some(memory_system) = self.memory_system.as_mut() {
+            memory_system.record_skill_load(&active_skill.name, &active_skill.prompt_md);
+            debug!(skill_name = %active_skill.name, "[layer4] Tracked skill activation for recovery (auto-routed or manual)");
+        }
+
         let history = self.session_store.load(persist_session_key)?;
         let (result, mut session_metadata, allowed_tools) = self
             .run_skill_for_turn(active_skill, msg, &history, persist_session_key)
@@ -2832,6 +2810,11 @@ impl AgentRuntime {
         info!(session_key = %session_key, "Processing message");
         self.update_main_session_target(&msg);
 
+        // ── Refresh memory injector cache if Layer 5 extraction completed ──
+        if let Err(e) = self.reload_memory_injector_if_needed().await {
+            warn!(error = %e, "[Layer 5] Failed to reload memory injector cache");
+        }
+
         // ── Record sender as a known channel contact (for cross-channel lookup) ──
         if msg.channel != "ws" && msg.channel != "cli" && msg.channel != "system" {
             let sender_name = msg
@@ -2942,6 +2925,31 @@ impl AgentRuntime {
         // Load session history
         let mut history = self.session_store.load(&session_key)?;
         let mut session_metadata = self.session_store.load_metadata(&persist_session_key)?;
+
+        // Layer 2: 时间触发的轻量压缩
+        // 检查会话最后更新时间，如果超过阈值则清理旧工具结果
+        let time_config = TimeBasedMCConfig::default();
+        if let Some(updated_at_str) = session_metadata.get("updated_at").and_then(|v| v.as_str()) {
+            if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(updated_at_str) {
+                let last_assistant_timestamp = Some(updated_at.with_timezone(&chrono::Utc));
+                let projector = HistoryProjector::new(&history);
+
+                // 应用时间触发的轻量压缩
+                if let Some(compacted) = projector.time_based_microcompact(
+                    last_assistant_timestamp,
+                    None, // 主线程来源
+                    &time_config,
+                ) {
+                    tracing::info!(
+                        original_count = history.len(),
+                        compacted_count = compacted.len(),
+                        gap_threshold_minutes = time_config.gap_threshold_minutes,
+                        "[layer2] time-based microcompact applied"
+                    );
+                    history = compacted;
+                }
+            }
+        }
 
         // Auto-set session display name from first user message
         if history.is_empty() {
@@ -3096,6 +3104,20 @@ impl AgentRuntime {
         // Now add user message to history for session persistence
         history.push(ChatMessage::user(&msg.content));
 
+        // Layer 4: Initialize memory system if needed
+        if self.memory_system.is_none() {
+            if let Err(e) = self.init_memory_system(session_key.clone()).await {
+                warn!(error = %e, "[layer4] Failed to initialize memory system");
+            }
+        }
+
+        // Layer 5: Initialize memory injector if needed (load persistent memory files)
+        if self.context_builder.memory_injector().is_none() {
+            if let Err(e) = self.init_memory_injector().await {
+                warn!(error = %e, "[layer5] Failed to initialize memory injector");
+            }
+        }
+
         // Get tool schemas from resolved tool names
         let mut tools = if tool_names.is_empty() {
             // Chat mode: no tools
@@ -3142,6 +3164,82 @@ impl AgentRuntime {
         let mut tool_call_counts: HashMap<String, u32> = HashMap::new();
         let mut over_iteration: bool = false;
         let mut current_messages = messages;
+
+        // Layer 1: 消息级别预算检查
+        // 如果工具结果总和超过预算，持久化最大的结果
+        if let Some(memory_system) = self.memory_system.as_ref() {
+            let candidates = crate::response_cache::collect_tool_result_candidates(&current_messages);
+            if !candidates.is_empty() {
+                let total_size: usize = candidates.iter().map(|c| c.size).sum();
+                let budget = crate::response_cache::MAX_TOOL_RESULTS_PER_MESSAGE_CHARS;
+
+                if total_size > budget {
+                    debug!(
+                        total_size = total_size,
+                        budget = budget,
+                        candidates_count = candidates.len(),
+                        "[layer1] Message budget exceeded, applying budget"
+                    );
+
+                    let state = memory_system.content_replacement_state().clone();
+                    let mut state_mut = state.clone();
+
+                    current_messages = crate::response_cache::apply_budget_async(
+                        &current_messages,
+                        &candidates,
+                        &mut state_mut,
+                        budget,
+                        &self.paths.base,
+                        &session_key,
+                    ).await;
+
+                    // 更新状态
+                    if let Some(ms) = self.memory_system.as_mut() {
+                        *ms.content_replacement_state_mut() = state_mut;
+                    }
+                }
+            }
+        }
+
+        // Layer 4: 第一次 LLM 调用前的 Compact 检查
+        // 如果从磁盘恢复的历史已经超过阈值，先压缩再进入主循环
+        {
+            let estimated_tokens = estimate_messages_tokens(&current_messages);
+            if let Some(memory_system) = self.memory_system.as_ref() {
+                if memory_system.should_compact(estimated_tokens) {
+                    info!(
+                        estimated_tokens,
+                        token_budget = memory_system.config().token_budget,
+                        threshold = memory_system.config().compact_threshold,
+                        "[layer4] Pre-loop compact check triggered"
+                    );
+
+                    if let Some(compact_result) = self.execute_layer4_compact(
+                        &current_messages,
+                        &session_key,
+                    ).await {
+                        current_messages.clear();
+                        current_messages.push(ChatMessage::system(
+                            &compact_result.to_compact_message()
+                        ));
+                        current_messages.push(ChatMessage::user("请继续当前任务。"));
+
+                        info!(
+                            post_compact_tokens = estimate_messages_tokens(&current_messages),
+                            "[layer4] Pre-loop compact completed"
+                        );
+                        metrics.record_compression();
+
+                        // Compact 成功后清空追踪器，防止下次 Compact 重复恢复
+                        if let Some(ms) = self.memory_system.as_mut() {
+                            ms.file_tracker_mut().clear();
+                            ms.skill_tracker_mut().clear();
+                        }
+                    }
+                }
+            }
+        }
+
         let mut final_response = String::new();
         let mut message_tool_sent_media = false;
         let mut tool_fail_counts: HashMap<String, u32> = HashMap::new();
@@ -3285,6 +3383,13 @@ impl AgentRuntime {
                                 skill_name
                             ))
                         })?;
+
+                    // Layer 4: Track skill activation for Post-Compact recovery
+                    if let Some(memory_system) = self.memory_system.as_mut() {
+                        memory_system.record_skill_load(&skill_ctx.name, &skill_ctx.prompt_md);
+                        debug!(skill_name = %skill_ctx.name, "[layer4] Tracked skill activation for recovery");
+                    }
+
                     let skill_history_seed = history[..history.len().saturating_sub(1)].to_vec();
                     let (skill_result, updated_metadata, allowed_tools) = self
                         .run_skill_for_turn(&skill_ctx, &msg, &skill_history_seed, &persist_session_key)
@@ -3565,18 +3670,47 @@ impl AgentRuntime {
                     current_messages.push(ChatMessage::user(&hint));
                 }
 
-                // Mid-loop compression: trigger based on estimated token count (#3).
-                // Use token estimation instead of raw message count for more accurate
-                // context window management. Threshold ~12k tokens triggers compression.
+                // Layer 4: Full Compact - 当 token 超过预算阈值时触发 LLM 语义压缩
+                // 预算阈值: token_budget * compact_threshold (默认 100_000 * 0.8 = 80_000)
                 let estimated_tokens = estimate_messages_tokens(&current_messages);
-                if estimated_tokens > 12_000 || current_messages.len() > 30 {
-                    Self::compress_mid_loop(&mut current_messages);
-                    metrics.record_compression();
-                    info!(
-                        estimated_tokens,
-                        msg_count = current_messages.len(),
-                        "Mid-loop compression triggered"
-                    );
+                if let Some(memory_system) = self.memory_system.as_ref() {
+                    if memory_system.should_compact(estimated_tokens) {
+                        info!(
+                            estimated_tokens,
+                            token_budget = memory_system.config().token_budget,
+                            threshold = memory_system.config().compact_threshold,
+                            "[layer4] Full compact threshold reached"
+                        );
+
+                        // 执行 Layer 4 Compact
+                        if let Some(compact_result) = self.execute_layer4_compact(
+                            &current_messages,
+                            &session_key,
+                        ).await {
+                            // 替换消息历史为压缩后的内容
+                            current_messages.clear();
+                            current_messages.push(ChatMessage::system(
+                                &compact_result.to_compact_message()
+                            ));
+                            // 添加当前用户消息作为继续点
+                            current_messages.push(ChatMessage::user("请继续当前任务。"));
+
+                            info!(
+                                post_compact_tokens = estimate_messages_tokens(&current_messages),
+                                "[layer4] Compact completed, messages replaced with summary"
+                            );
+                            metrics.record_compression();
+
+                            // Compact 成功后清空追踪器，防止下次 Compact 重复恢复
+                            if let Some(ms) = self.memory_system.as_mut() {
+                                ms.file_tracker_mut().clear();
+                                ms.skill_tracker_mut().clear();
+                            }
+
+                            // 跳过后续处理
+                            continue;
+                        }
+                    }
                 }
 
                 if !over_iteration && !short_circuit_after_tools {
@@ -3657,6 +3791,171 @@ impl AgentRuntime {
 
                 final_response.clear();
                 overwrite_last_assistant_message(&mut history, "");
+            }
+        }
+
+        // Post-Sampling Hooks: Layer 3 & Layer 5
+        // 在主循环结束后执行 Session Memory 和 Auto Memory 提取
+        // 使用 tokio::spawn 非阻塞执行，不延迟用户响应
+        if let Some(memory_system) = self.memory_system.as_ref() {
+            let current_tokens = estimate_messages_tokens(&history);
+            let action = crate::memory_system::evaluate_memory_hooks(
+                memory_system,
+                &history,
+                current_tokens,
+            );
+
+            match action {
+                crate::memory_system::PostSamplingAction::ExtractSessionMemory => {
+                    info!("[post-sampling] Spawning Session Memory extraction task");
+
+                    // 克隆必要的数据用于异步任务
+                    let provider_pool = Arc::clone(&self.provider_pool);
+                    let history_clone = history.clone();
+                    let memory_path = crate::session_memory::get_session_memory_path(
+                        memory_system.workspace_dir(),
+                        memory_system.session_id(),
+                    );
+                    let model = self.config.agents.defaults.model.clone();
+
+                    // 非阻塞执行
+                    let handle = tokio::spawn(async move {
+                        let system_prompt = Arc::new(
+                            "你是一个会话记忆提取助手。请从对话中提取关键信息并更新 Session Memory 文件。"
+                                .to_string(),
+                        );
+
+                        let current_memory = tokio::fs::read_to_string(&memory_path)
+                            .await
+                            .unwrap_or_else(|_| crate::session_memory::DEFAULT_SESSION_MEMORY_TEMPLATE.to_string());
+
+                        let result = crate::session_memory::extract_session_memory(
+                            provider_pool,
+                            &system_prompt,
+                            &model,
+                            history_clone,
+                            &memory_path,
+                            &current_memory,
+                            crate::session_memory::DEFAULT_SESSION_MEMORY_TEMPLATE,
+                        ).await;
+
+                        match result {
+                            Ok(_) => info!("[layer3] Session Memory extraction completed"),
+                            Err(e) => warn!(error = %e, "[layer3] Session Memory extraction failed"),
+                        }
+                    });
+
+                    // 保存任务句柄
+                    if let Some(ms) = self.memory_system.as_mut() {
+                        ms.add_background_task(handle);
+                    }
+                }
+                crate::memory_system::PostSamplingAction::ExtractAutoMemory(types) => {
+                    info!(
+                        memory_types = ?types,
+                        "[post-sampling] Spawning Auto Memory extraction tasks"
+                    );
+
+                    // 克隆必要的数据
+                    let provider_pool = Arc::clone(&self.provider_pool);
+                    let history_clone = history.clone();
+                    let config_dir = memory_system.config_dir().to_path_buf();
+                    let model = self.config.agents.defaults.model.clone();
+                    // 克隆 reload 标志，用于在后台任务完成时通知主 runtime
+                    let reload_flag = self.memory_injector_reload_flag();
+
+                    // 为每种记忆类型创建独立的异步任务
+                    for memory_type in types {
+                        let provider_pool_for_type = Arc::clone(&provider_pool);
+                        let history_for_type = history_clone.clone();
+                        let config_dir_for_type = config_dir.clone();
+                        let model_for_type = model.clone();
+                        let reload_flag_for_type = Arc::clone(&reload_flag);
+
+                        let handle = tokio::spawn(async move {
+                            let system_prompt = Arc::new(
+                                "你是一个记忆提取助手。请从对话中提取用户偏好、项目信息、反馈和外部资源引用。"
+                                    .to_string(),
+                            );
+
+                            let cursor = crate::auto_memory::ExtractionCursor::new(memory_type);
+                            let result = crate::auto_memory::extract_auto_memory(
+                                provider_pool_for_type,
+                                &config_dir_for_type,
+                                memory_type,
+                                system_prompt,
+                                &model_for_type,
+                                history_for_type,
+                                cursor,
+                            ).await;
+
+                            if result.success {
+                                info!(
+                                    memory_type = memory_type.name(),
+                                    input_tokens = result.input_tokens,
+                                    output_tokens = result.output_tokens,
+                                    "[layer5] Auto Memory extraction completed"
+                                );
+                                // 标记需要刷新缓存
+                                reload_flag_for_type.store(true, std::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                warn!(
+                                    memory_type = memory_type.name(),
+                                    error = ?result.error,
+                                    "[layer5] Auto Memory extraction failed"
+                                );
+                            }
+                        });
+
+                        // 保存任务句柄
+                        if let Some(ms) = self.memory_system.as_mut() {
+                            ms.add_background_task(handle);
+                        }
+                    }
+                }
+                crate::memory_system::PostSamplingAction::Compact => {
+                    // Post-Sampling 中的 Compact - 同步执行压缩
+                    // Compact 应在当前交互结束前同步执行
+                    // 这样下次交互时历史已经是压缩后的状态，用户无感知
+                    info!(
+                        current_tokens,
+                        token_budget = memory_system.config().token_budget,
+                        "[post-sampling] Executing synchronous compact before response delivery"
+                    );
+
+                    if let Some(compact_result) = self.execute_layer4_compact(
+                        &history,
+                        &session_key,
+                    ).await {
+                        // 压缩成功，替换历史
+                        history.clear();
+                        history.push(ChatMessage::system(
+                            &compact_result.to_compact_message()
+                        ));
+                        history.push(ChatMessage::user("请继续当前任务。"));
+
+                        info!(
+                            post_compact_tokens = estimate_messages_tokens(&history),
+                            "[post-sampling] Compact completed, history replaced"
+                        );
+                        metrics.record_compression();
+
+                        // 清空追踪器
+                        if let Some(ms) = self.memory_system.as_mut() {
+                            ms.file_tracker_mut().clear();
+                            ms.skill_tracker_mut().clear();
+                        }
+                    }
+                }
+                crate::memory_system::PostSamplingAction::None => {}
+            }
+
+            // 清理已完成的后台任务
+            if let Some(ms) = self.memory_system.as_mut() {
+                let cleaned = ms.cleanup_completed_tasks();
+                if cleaned > 0 {
+                    debug!(cleaned_count = cleaned, "Cleaned up completed background tasks");
+                }
             }
         }
 
@@ -4210,6 +4509,43 @@ impl AgentRuntime {
             None, // trace_id can be added later
             Some(duration_ms),
         );
+
+        // Layer 4: Track file reads for Post-Compact recovery
+        // 追踪多种文件访问工具的结果，用于 Compact 后恢复
+        if !is_error {
+            let file_content_to_track: Option<(std::path::PathBuf, &str)> = match tool_call.name.as_str() {
+                "read_file" => {
+                    // read_file: 直接追踪文件内容
+                    if let Some(path_str) = tool_call.arguments.get("path").and_then(|v| v.as_str()) {
+                        Some((self.resolve_path(path_str), &result_str))
+                    } else {
+                        None
+                    }
+                }
+                "grep" | "rg" => {
+                    // grep/rg: 追踪搜索路径和匹配结果
+                    let path = tool_call.arguments.get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(".");
+                    Some((self.resolve_path(path), &result_str))
+                }
+                "glob" => {
+                    // glob: 追踪匹配的文件列表
+                    let path = tool_call.arguments.get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(".");
+                    Some((self.resolve_path(path), &result_str))
+                }
+                _ => None,
+            };
+
+            if let Some((path, content)) = file_content_to_track {
+                if let Some(memory_system) = self.memory_system.as_mut() {
+                    memory_system.record_file_read(path.clone(), content);
+                    debug!(path = %path.display(), tool = %tool_call.name, "[layer4] Tracked file access for recovery");
+                }
+            }
+        }
 
         // 在工具结果中追加学习提示，让 LLM 自然地回复用户
         match learning_hint {
@@ -6113,6 +6449,7 @@ description: prompt demo
         }));
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn test_prompt_skill_can_use_exec_skill_script_inside_skill_scope() {
         let mut runtime = test_runtime();
@@ -6180,6 +6517,7 @@ description: local demo
         }));
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn test_resolved_skill_tool_names_include_exec_skill_script_for_script_capable_skill() {
         let mut runtime = test_runtime();
@@ -6311,6 +6649,7 @@ description: legacy script demo
         }));
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn test_cli_style_skill_runs_via_exec_skill_script() {
         let mut runtime = test_runtime();
@@ -6451,6 +6790,7 @@ description: compat local demo
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn test_unified_entry_can_activate_skill_without_forced_skill_metadata() {
         let provider = Arc::new(UnifiedEntryProvider {
@@ -6604,6 +6944,7 @@ description: local demo
             "deep_analysis",
             &["web_search".to_string()],
             &[ChatMessage {
+                id: None,
                 role: "assistant".to_string(),
                 content: serde_json::Value::String("搜索 BTC 新闻".to_string()),
                 reasoning_content: None,

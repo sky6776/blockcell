@@ -19,7 +19,7 @@ use blockcell_channels::whatsapp::WhatsAppChannel;
 use blockcell_channels::ChannelManager;
 use blockcell_core::{Config, InboundMessage, Paths};
 use blockcell_providers::{Provider, ProviderPool};
-use blockcell_scheduler::CronService;
+use blockcell_scheduler::{CronService, DreamService, DreamServiceConfig};
 use blockcell_skills::{is_builtin_tool, new_registry_handle, CoreEvolution};
 use blockcell_tools::mcp::manager::McpManager;
 use blockcell_tools::{
@@ -439,6 +439,11 @@ pub async fn run(
         runtime.set_capability_registry(cap_registry_handle.clone());
         runtime.set_core_evolution(core_evo_handle.clone());
 
+        // Initialize Layer 5 memory injector (7-layer memory system)
+        if let Err(e) = runtime.init_memory_injector().await {
+            warn!(error = %e, "Failed to initialize memory injector");
+        }
+
         // Create event broadcast channel for streaming output
         let (event_tx, mut event_rx) = broadcast::channel::<String>(256);
         runtime.set_event_tx(event_tx.clone());
@@ -640,6 +645,12 @@ pub async fn run(
         }
         runtime.set_capability_registry(cap_registry_handle.clone());
         runtime.set_core_evolution(core_evo_handle.clone());
+
+        // Initialize Layer 5 memory injector (7-layer memory system)
+        if let Err(e) = runtime.init_memory_injector().await {
+            warn!(error = %e, "Failed to initialize memory injector");
+        }
+
         let event_emitter = runtime.event_emitter_handle();
 
         // Create and start CronService
@@ -662,6 +673,19 @@ pub async fn run(
                 cron.run_loop(shutdown_rx).await;
             })
         };
+
+        // Layer 6: 启动 Dream Service（跨会话知识整合）
+        let dream_config = DreamServiceConfig {
+            enabled: true,
+            check_interval_secs: 10 * 60, // 10 分钟检查一次
+            provider_pool: Some(Arc::clone(&provider_pool)),
+        };
+        let dream_service = DreamService::new(dream_config, paths.clone());
+        let dream_shutdown_rx = shutdown_tx.subscribe();
+        let _dream_handle = tokio::spawn(async move {
+            dream_service.run_loop(dream_shutdown_rx).await;
+        });
+        info!("[dream] Dream service started for cross-session knowledge consolidation");
 
         // Spawn event handler for streaming token output
         let event_handler_handle = tokio::spawn(async move {

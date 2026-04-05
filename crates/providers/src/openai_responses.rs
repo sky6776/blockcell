@@ -555,6 +555,7 @@ mod tests {
     #[test]
     fn test_build_input_preserves_multimodal_parts() {
         let messages = vec![ChatMessage {
+            id: None,
             role: "user".to_string(),
             content: json!([
                 { "type": "text", "text": "看看这张图" },
@@ -607,6 +608,7 @@ mod tests {
     #[test]
     fn test_assistant_tool_calls_are_top_level_items() {
         let messages = vec![ChatMessage {
+            id: None,
             role: "assistant".to_string(),
             content: Value::String("".to_string()),
             reasoning_content: None,

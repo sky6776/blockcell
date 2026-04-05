@@ -150,6 +150,9 @@ impl PermissionSet {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
+    /// 消息唯一标识符（可选，用于追踪消息位置）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub role: String,
     pub content: serde_json::Value,
     /// 推理内容 (思考过程，如 DeepSeek reasoning)
@@ -166,6 +169,7 @@ pub struct ChatMessage {
 impl ChatMessage {
     pub fn system(content: &str) -> Self {
         Self {
+            id: Some(uuid::Uuid::new_v4().to_string()),
             role: "system".to_string(),
             content: serde_json::Value::String(content.to_string()),
             reasoning_content: None,
@@ -177,6 +181,7 @@ impl ChatMessage {
 
     pub fn user(content: &str) -> Self {
         Self {
+            id: Some(uuid::Uuid::new_v4().to_string()),
             role: "user".to_string(),
             content: serde_json::Value::String(content.to_string()),
             reasoning_content: None,
@@ -188,6 +193,7 @@ impl ChatMessage {
 
     pub fn assistant(content: &str) -> Self {
         Self {
+            id: Some(uuid::Uuid::new_v4().to_string()),
             role: "assistant".to_string(),
             content: serde_json::Value::String(content.to_string()),
             reasoning_content: None,
@@ -199,6 +205,7 @@ impl ChatMessage {
 
     pub fn tool_result(tool_call_id: &str, content: &str) -> Self {
         Self {
+            id: Some(uuid::Uuid::new_v4().to_string()),
             role: "tool".to_string(),
             content: serde_json::Value::String(content.to_string()),
             reasoning_content: None,
@@ -206,6 +213,26 @@ impl ChatMessage {
             tool_call_id: Some(tool_call_id.to_string()),
             name: None,
         }
+    }
+
+    /// 为消息生成并设置唯一 ID
+    pub fn with_id(mut self) -> Self {
+        self.id = Some(uuid::Uuid::new_v4().to_string());
+        self
+    }
+
+    /// 设置指定的 ID
+    pub fn with_specific_id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    /// 获取消息 ID（如果没有则生成一个）
+    pub fn get_or_create_id(&mut self) -> &str {
+        if self.id.is_none() {
+            self.id = Some(uuid::Uuid::new_v4().to_string());
+        }
+        self.id.as_ref().unwrap()
     }
 }
 
