@@ -85,6 +85,37 @@ impl SkillLayout {
     }
 }
 
+enum LocalScriptSyntaxCheck {
+    Shell(&'static str),
+    Node,
+    Php,
+    Ruby,
+    Python,
+}
+
+impl LocalScriptSyntaxCheck {
+    fn run(self, skill_path: &Path) -> std::io::Result<std::process::Output> {
+        let path = skill_path.to_str().unwrap_or("");
+        match self {
+            LocalScriptSyntaxCheck::Shell(shell) => std::process::Command::new(shell)
+                .args(["-n", path])
+                .output(),
+            LocalScriptSyntaxCheck::Node => std::process::Command::new("node")
+                .args(["--check", path])
+                .output(),
+            LocalScriptSyntaxCheck::Php => std::process::Command::new("php")
+                .args(["-l", path])
+                .output(),
+            LocalScriptSyntaxCheck::Ruby => std::process::Command::new("ruby")
+                .args(["-c", path])
+                .output(),
+            LocalScriptSyntaxCheck::Python => std::process::Command::new("python3")
+                .args(["-m", "py_compile", path])
+                .output(),
+        }
+    }
+}
+
 /// 进化上下文
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvolutionContext {
@@ -2139,6 +2170,61 @@ or\n\
         prompt.push_str("- Use `exec_local` only for relative paths inside the active skill directory.\n\n");
     }
 
+    fn detect_local_script_syntax_check(skill_path: &Path) -> Option<LocalScriptSyntaxCheck> {
+        match skill_path.extension().and_then(|value| value.to_str()).unwrap_or("") {
+            "sh" => Some(LocalScriptSyntaxCheck::Shell("sh")),
+            "bash" => Some(LocalScriptSyntaxCheck::Shell("bash")),
+            "zsh" => Some(LocalScriptSyntaxCheck::Shell("zsh")),
+            "js" => Some(LocalScriptSyntaxCheck::Node),
+            "php" => Some(LocalScriptSyntaxCheck::Php),
+            "rb" => Some(LocalScriptSyntaxCheck::Ruby),
+            "py" => Some(LocalScriptSyntaxCheck::Python),
+            _ => Self::detect_shebang_syntax_check(skill_path),
+        }
+    }
+
+    fn detect_shebang_syntax_check(skill_path: &Path) -> Option<LocalScriptSyntaxCheck> {
+        let bytes = std::fs::read(skill_path).ok()?;
+        let text = std::str::from_utf8(&bytes).ok()?;
+        let first_line = text.lines().next()?.trim_start_matches('\u{feff}').trim();
+        let shebang = first_line.strip_prefix("#!")?.trim();
+        let interpreter = Self::extract_shebang_interpreter(shebang)?;
+
+        match interpreter.as_str() {
+            "sh" => Some(LocalScriptSyntaxCheck::Shell("sh")),
+            "bash" => Some(LocalScriptSyntaxCheck::Shell("bash")),
+            "zsh" => Some(LocalScriptSyntaxCheck::Shell("zsh")),
+            "node" => Some(LocalScriptSyntaxCheck::Node),
+            "php" => Some(LocalScriptSyntaxCheck::Php),
+            "rb" | "ruby" => Some(LocalScriptSyntaxCheck::Ruby),
+            "py" | "python" | "python3" => Some(LocalScriptSyntaxCheck::Python),
+            _ => None,
+        }
+    }
+
+    fn extract_shebang_interpreter(shebang: &str) -> Option<String> {
+        let mut parts = shebang.split_whitespace();
+        let first = parts.next()?;
+        let first_name = std::path::Path::new(first)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(first);
+
+        if first_name == "env" {
+            let mut next = parts.next()?;
+            while next.starts_with('-') {
+                next = parts.next()?;
+            }
+            let next_name = std::path::Path::new(next)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(next);
+            return Some(next_name.to_string());
+        }
+
+        Some(first_name.to_string())
+    }
+
     fn build_hybrid_audit_prompt(
         &self,
         context: &EvolutionContext,
@@ -2227,53 +2313,49 @@ or\n\
     }
 
     async fn compile_local_script(&self, skill_path: &Path) -> Result<(bool, Option<String>)> {
-        let ext = skill_path
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("");
+        let syntax_check = Self::detect_local_script_syntax_check(skill_path);
 
-        let output = match ext {
-            "sh" | "bash" | "zsh" => std::process::Command::new("sh")
-                .args(["-n", skill_path.to_str().unwrap_or("")])
-                .output(),
-            "js" => std::process::Command::new("node")
-                .args(["--check", skill_path.to_str().unwrap_or("")])
-                .output(),
-            "php" => std::process::Command::new("php")
-                .args(["-l", skill_path.to_str().unwrap_or("")])
-                .output(),
-            "rb" => std::process::Command::new("ruby")
-                .args(["-c", skill_path.to_str().unwrap_or("")])
-                .output(),
-            "py" => std::process::Command::new("python3")
-                .args(["-m", "py_compile", skill_path.to_str().unwrap_or("")])
-                .output(),
-            _ => {
-                let content = std::fs::read_to_string(skill_path)
-                    .map_err(|e| Error::Skill(format!("Failed to read local script: {}", e)))?;
-                if content.trim().is_empty() {
-                    return Ok((false, Some("Local script content is empty".to_string())));
+        if let Some(check) = syntax_check {
+            let output = check.run(skill_path);
+
+            match output {
+                Ok(out) if out.status.success() => return Ok((true, None)),
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                    let message = if !stderr.trim().is_empty() {
+                        stderr
+                    } else if !stdout.trim().is_empty() {
+                        stdout
+                    } else {
+                        format!("Local script syntax check failed for {:?}", skill_path.file_name())
+                    };
+                    return Ok((false, Some(message)));
                 }
-                return Ok((true, None));
+                Err(e) => {
+                    return Ok((
+                        true,
+                        Some(format!("Syntax checker unavailable or failed to run: {}", e)),
+                    ));
+                }
             }
-        };
-
-        match output {
-            Ok(out) if out.status.success() => Ok((true, None)),
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                let message = if !stderr.trim().is_empty() {
-                    stderr
-                } else if !stdout.trim().is_empty() {
-                    stdout
-                } else {
-                    format!("Local script syntax check failed for {:?}", skill_path.file_name())
-                };
-                Ok((false, Some(message)))
-            }
-            Err(e) => Ok((true, Some(format!("Syntax checker unavailable or failed to run: {}", e)))),
         }
+
+        let content = std::fs::read(skill_path)
+            .map_err(|e| Error::Skill(format!("Failed to read local script: {}", e)))?;
+
+        if content.is_empty() {
+            return Ok((false, Some("Local script content is empty".to_string())));
+        }
+
+        Ok((
+            true,
+            Some(if skill_path.extension().is_none() {
+                "No extension or recognized shebang detected; skipped syntax-specific validation".to_string()
+            } else {
+                "Skipped syntax-specific validation for unsupported script type".to_string()
+            }),
+        ))
     }
 
     fn extract_diff_from_response(&self, response: &str) -> Result<String> {
@@ -2741,5 +2823,35 @@ mod tests {
         assert!(prompt.contains("Current entrypoint: `SKILL.py`"));
         assert!(prompt.contains("exec_local"));
         assert!(prompt.contains("entrypoint mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_compile_local_script_detects_python_shebang_for_no_extension_script() {
+        let skills_dir = temp_skills_dir("no_ext_shebang");
+        let engine = SkillEvolution::new(skills_dir.clone(), 5);
+        let skill_path = skills_dir.join("run-me");
+        std::fs::write(
+            &skill_path,
+            "#!/usr/bin/env python3\nprint(\"unterminated\"\n",
+        )
+        .expect("write shebang script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&skill_path)
+                .expect("script metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&skill_path, perms).expect("set executable bit");
+        }
+
+        let (passed, error) = engine
+            .compile_local_script(&skill_path)
+            .await
+            .expect("compile should run");
+
+        assert!(!passed);
+        let error = error.expect("should return syntax error");
+        assert!(error.contains("SyntaxError") || error.contains("unterminated"));
     }
 }
