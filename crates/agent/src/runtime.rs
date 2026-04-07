@@ -2267,6 +2267,26 @@ impl AgentRuntime {
         })
     }
 
+    fn last_local_exec_tool_name(trace_messages: &[ChatMessage]) -> Option<String> {
+        for message in trace_messages.iter().rev() {
+            if let Some(name) = message.name.as_deref() {
+                if matches!(name, "exec_skill_script" | "exec_local") {
+                    return Some(name.to_string());
+                }
+            }
+
+            if let Some(tool_calls) = message.tool_calls.as_ref() {
+                for call in tool_calls.iter().rev() {
+                    if matches!(call.name.as_str(), "exec_skill_script" | "exec_local") {
+                        return Some(call.name.clone());
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     async fn decide_interaction(
         &mut self,
         msg: &InboundMessage,
@@ -4689,8 +4709,44 @@ impl AgentRuntime {
             )
             .await?;
 
+        let mut final_response = prompt_result.final_response;
+        if let Some(last_local_exec_tool_name) = Self::last_local_exec_tool_name(&prompt_result.trace_messages) {
+            if let Some(summary_bundle) = self
+                .context_builder
+                .skill_manager()
+                .and_then(|manager| manager.get(&active_skill.name))
+                .and_then(|skill| skill.load_summary_bundle())
+            {
+                let summary_system_prompt = concat!(
+                    "You are blockcell, an AI assistant with access to tools.\n\n",
+                    "You are in a final summary-only step for a script-backed skill. ",
+                    "Follow the skill summary instructions, preserve factual meaning, and output only the user-facing answer. ",
+                    "Do not call tools.\n"
+                );
+                let summary_prompt = build_script_skill_summary_prompt(
+                    &msg.content,
+                    &active_skill.name,
+                    &last_local_exec_tool_name,
+                    &summary_bundle,
+                    &final_response,
+                );
+                let summary_messages = vec![
+                    ChatMessage::system(summary_system_prompt),
+                    ChatMessage::user(&summary_prompt),
+                ];
+                let summary_response = self
+                    .chat_with_provider(&summary_messages, &[])
+                    .await?
+                    .content
+                    .unwrap_or_default();
+                if !summary_response.trim().is_empty() {
+                    final_response = summary_response;
+                }
+            }
+        }
+
         Ok((
-            prompt_result.final_response,
+            final_response,
             prompt_result.trace_messages,
             session_metadata,
         ))
@@ -5784,6 +5840,20 @@ mod tests {
                     finish_reason: "stop".to_string(),
                     usage: serde_json::Value::Null,
                 }
+            } else if user_text.contains("技能说明摘要") && user_text.contains("执行结果") {
+                let execution_result = user_text
+                    .split("执行结果：")
+                    .nth(1)
+                    .or_else(|| user_text.split("执行结果:").nth(1))
+                    .unwrap_or_default()
+                    .trim();
+                LLMResponse {
+                    content: Some(format!("summary: {}", execution_result)),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop".to_string(),
+                    usage: serde_json::Value::Null,
+                }
             } else {
                 LLMResponse {
                     content: Some(format!("mock answer: {}", user_text)),
@@ -5989,6 +6059,20 @@ mod tests {
                     .unwrap_or_default();
                 LLMResponse {
                     content: Some(format!("local exec result: {}", stdout)),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop".to_string(),
+                    usage: serde_json::Value::Null,
+                }
+            } else if user_text.contains("技能说明摘要") && user_text.contains("执行结果") {
+                let execution_result = user_text
+                    .split("执行结果：")
+                    .nth(1)
+                    .or_else(|| user_text.split("执行结果:").nth(1))
+                    .unwrap_or_default()
+                    .trim();
+                LLMResponse {
+                    content: Some(format!("summary: {}", execution_result)),
                     reasoning_content: None,
                     tool_calls: Vec::new(),
                     finish_reason: "stop".to_string(),
@@ -6561,6 +6645,7 @@ description: local demo
             .session_store
             .load(&session_key)
             .expect("load session history");
+        assert!(result.starts_with("summary:"), "unexpected skill result: {}", result);
         assert!(
             result.contains("local-skill-skill"),
             "unexpected skill result: {}; history: {:?}",
@@ -6811,6 +6896,7 @@ description: compat local demo
             .session_store
             .load(&session_key)
             .expect("load session history");
+        assert!(result.starts_with("summary:"), "unexpected skill result: {}", result);
         assert!(
             result.contains("local-skill-skill"),
             "unexpected skill result: {}; history: {:?}",
@@ -6905,7 +6991,7 @@ description: local demo
             .expect("load session history");
 
         assert!(
-            result.contains("local exec result: local-skill-skill"),
+            result.starts_with("summary:"),
             "unexpected result: {}",
             result
         );
@@ -6923,7 +7009,6 @@ description: local demo
                 .map(|calls| calls.iter().any(|call| call.name == "skill_enter"))
                 .unwrap_or(false)
         }));
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]

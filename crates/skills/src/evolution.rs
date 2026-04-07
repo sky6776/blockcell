@@ -1855,6 +1855,7 @@ impl SkillEvolution {
         prompt.push_str("## Output Format\n");
         prompt.push_str("Generate the COMPLETE local script content.\n");
         prompt.push_str("If the skill can directly produce final user-facing text, return `display_text`. Otherwise return `summary_data` as a lightweight structured summary for runtime/LLM polishing.\n");
+        prompt.push_str("If this skill also needs a post-execution result polishing step, you may optionally add `## Summary {#summary}` to the paired SKILL.md. Treat that section as a soft hint for runtime summary handling, not a hard requirement.\n");
         prompt.push_str("If you output `meta.yaml`, it must follow the minimal meta rules below.\n\n");
         prompt.push_str(Self::trigger_rules_prompt());
         prompt.push_str("The script must be runnable by exec_local and should not rely on unsafe external assumptions.\n");
@@ -1906,6 +1907,7 @@ impl SkillEvolution {
         prompt.push_str("## Instructions\n");
         prompt.push_str("Fix ALL the issues listed above and generate the COMPLETE corrected local script content.\n");
         prompt.push_str("If the skill can directly produce final user-facing text, return `display_text`. Otherwise return `summary_data` as a lightweight structured summary for runtime/LLM polishing.\n");
+        prompt.push_str("If this skill also needs a post-execution result polishing step, you may optionally add `## Summary {#summary}` to the paired SKILL.md. Treat that section as a soft hint for runtime summary handling, not a hard requirement.\n");
         prompt.push_str("If you output `meta.yaml`, it must follow the minimal meta rules below.\n\n");
         prompt.push_str(Self::trigger_rules_prompt());
         prompt.push_str("Do NOT leave any of the reported issues unfixed.\n");
@@ -2055,6 +2057,7 @@ or\n\
         prompt.push_str("## Output Format\n");
         prompt.push_str("Generate the COMPLETE SKILL.py content.\n");
         prompt.push_str("If the skill can directly produce final user-facing text, return `display_text`. Otherwise return `summary_data` as a lightweight structured summary for runtime/LLM polishing. Do NOT place complete webpages, long markdown, or large raw logs into `summary_data`.\n");
+        prompt.push_str("If this skill also needs a post-execution result polishing step, you may optionally add `## Summary {#summary}` to the paired SKILL.md. Treat that section as a soft hint for runtime summary handling, not a hard requirement.\n");
         prompt.push_str("Output the Python code in a ```python code block.\n");
         prompt.push_str("If you output `meta.yaml`, it must follow the minimal meta rules below.\n\n");
         prompt.push_str(Self::trigger_rules_prompt());
@@ -2127,6 +2130,7 @@ or\n\
     fn append_hybrid_contract_notes(&self, prompt: &mut String, context: &EvolutionContext) {
         prompt.push_str("## Hybrid Contract\n");
         prompt.push_str("- `SKILL.md` defines the user-facing behavior, the tool flow, and when local execution is appropriate.\n");
+        prompt.push_str("- `## Summary {#summary}` is optional and can be used to describe post-execution result polishing for script-backed skills; treat it as a hint, not a hard requirement.\n");
         prompt.push_str("- The file at `source_path` is the executable entrypoint for local behavior.\n");
         prompt.push_str("- Keep the manual and the entrypoint aligned; if you move behavior, update both sides together.\n");
         if let Some(source_path) = context.source_path.as_ref() {
@@ -2709,6 +2713,7 @@ mod tests {
 
         assert!(prompt.contains("## Hybrid Contract"));
         assert!(prompt.contains("SKILL.md` defines the user-facing behavior"));
+        assert!(prompt.contains("## Summary {#summary}"));
         assert!(prompt.contains("Current entrypoint: `SKILL.py`"));
         assert!(prompt.contains("exec_local"));
         assert!(prompt.contains("local execution is appropriate"));
@@ -2732,6 +2737,7 @@ mod tests {
 
         assert!(prompt.contains("## Hybrid Contract"));
         assert!(prompt.contains("Keep the manual and the entrypoint aligned"));
+        assert!(prompt.contains("## Summary {#summary}"));
         assert!(prompt.contains("Current entrypoint: `SKILL.py`"));
         assert!(prompt.contains("exec_local"));
         assert!(prompt.contains("entrypoint mismatch"));

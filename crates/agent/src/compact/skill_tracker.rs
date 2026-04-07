@@ -39,11 +39,7 @@ impl SkillTracker {
 
     /// 记录技能加载
     pub fn record_load(&mut self, name: &str, content: &str) {
-        let summary = if content.len() > self.max_summary_chars {
-            format!("{}...\n[content truncated]", &content[..self.max_summary_chars])
-        } else {
-            content.to_string()
-        };
+        let summary = truncate_to_chars(content, self.max_summary_chars);
 
         let estimated_tokens = estimate_tokens(content);
 
@@ -87,6 +83,16 @@ impl SkillTracker {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
+}
+
+/// 安全截断字符串到指定字符数，避免按字节切片破坏 UTF-8 边界。
+fn truncate_to_chars(content: &str, max_chars: usize) -> String {
+    if content.chars().count() <= max_chars {
+        return content.to_string();
+    }
+
+    let truncated: String = content.chars().take(max_chars).collect();
+    format!("{}...\n[content truncated]", truncated)
 }
 
 #[cfg(test)]
@@ -136,6 +142,20 @@ mod tests {
         // 摘要应该被截断
         assert!(record.summary.len() <= 2100); // 2000 + "...[content truncated]"
         assert!(record.summary.contains("[content truncated]"));
+    }
+
+    #[test]
+    fn test_skill_tracker_summary_truncation_utf8() {
+        let mut tracker = SkillTracker::new();
+
+        let long_content = "小".repeat(3000);
+        tracker.record_load("utf8_skill", &long_content);
+
+        let records = tracker.all_records();
+        let record = records.get("utf8_skill").unwrap();
+
+        assert!(record.summary.contains("[content truncated]"));
+        assert!(record.summary.starts_with(&"小".repeat(10)));
     }
 
     #[test]

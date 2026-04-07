@@ -1,9 +1,12 @@
 use blockcell_agent::AgentRuntime;
-use blockcell_core::{Config, InboundMessage, Paths};
+use blockcell_core::types::ChatMessage;
+use blockcell_core::{build_session_key, Config, InboundMessage, Paths};
 use blockcell_skills::evolution::EvolutionRecord;
 use blockcell_skills::is_builtin_tool;
+use blockcell_skills::SkillTestFixture;
 use blockcell_tools::build_tool_registry_for_agent_config;
 use blockcell_tools::mcp::manager::McpManager;
+use blockcell_storage::SessionStore;
 use std::sync::Arc;
 
 use super::memory_store::open_memory_store;
@@ -18,6 +21,278 @@ fn skill_test_primary_asset_step_label() -> &'static str {
 
 fn skill_test_rhai_compat_step_label() -> &'static str {
     "legacy Rhai compat"
+}
+
+fn prepare_skill_test_workspace(source_dir: &std::path::Path) -> anyhow::Result<Paths> {
+    let overlay_base = std::env::temp_dir().join(format!(
+        "blockcell-skill-test-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let overlay_paths = Paths::with_base(overlay_base);
+    let user_paths = Paths::new();
+
+    if let Some(parent) = overlay_paths.config_file().parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let user_config_path = user_paths.config_file();
+    if user_config_path.exists() {
+        std::fs::copy(&user_config_path, overlay_paths.config_file())?;
+    }
+
+    let user_env_path = user_paths.env_file();
+    if user_env_path.exists() {
+        std::fs::copy(&user_env_path, overlay_paths.env_file())?;
+    }
+
+    let overlay_skills_dir = overlay_paths.skills_dir();
+    std::fs::create_dir_all(&overlay_skills_dir)?;
+
+    for entry in std::fs::read_dir(source_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let target = overlay_skills_dir.join(entry.file_name());
+        copy_dir_recursive(&path, &target)?;
+    }
+
+    Ok(overlay_paths)
+}
+
+fn copy_dir_recursive(source: &std::path::Path, target: &std::path::Path) -> anyhow::Result<()> {
+    if target.exists() {
+        std::fs::remove_dir_all(target)?;
+    }
+    std::fs::create_dir_all(target)?;
+
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&source_path, &target_path)?;
+        } else if entry.file_type()?.is_file() {
+            if let Some(parent) = target_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&source_path, &target_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Default)]
+struct FixtureSummary {
+    total: usize,
+    passed: usize,
+    failed: usize,
+}
+
+fn record_failed_skill(failed_names: &mut Vec<String>, skill_name: &str) {
+    if !failed_names.iter().any(|name| name == skill_name) {
+        failed_names.push(skill_name.to_string());
+    }
+}
+
+fn load_skill_test_fixtures(skill_path: &std::path::Path) -> Vec<SkillTestFixture> {
+    let tests_dir = skill_path.join("tests");
+    if !tests_dir.exists() {
+        return vec![];
+    }
+
+    let mut fixtures = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&tests_dir) {
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by(|left, right| left.path().cmp(&right.path()));
+
+        for entry in entries {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(fixture) = serde_json::from_str::<SkillTestFixture>(&content) {
+                        fixtures.push(fixture);
+                    }
+                }
+            }
+        }
+    }
+
+    fixtures
+}
+
+fn merge_object_fields(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    value: &serde_json::Value,
+) {
+    if let Some(object) = value.as_object() {
+        for (key, field_value) in object {
+            target.insert(key.clone(), field_value.clone());
+        }
+    }
+}
+
+fn build_fixture_metadata(skill_name: &str, fixture: &SkillTestFixture) -> serde_json::Value {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("test_mode".to_string(), serde_json::json!("fixture"));
+    metadata.insert("fixture_name".to_string(), serde_json::json!(fixture.name));
+    metadata.insert("fixture_input".to_string(), serde_json::json!(fixture.input));
+    metadata.insert("context".to_string(), fixture.context.clone());
+    metadata.insert("params".to_string(), fixture.params.clone());
+    metadata.insert("constraints".to_string(), fixture.constraints.clone());
+
+    merge_object_fields(&mut metadata, &fixture.context);
+    merge_object_fields(&mut metadata, &fixture.params);
+    merge_object_fields(&mut metadata, &fixture.constraints);
+
+    metadata.insert(
+        "forced_skill_name".to_string(),
+        serde_json::json!(skill_name),
+    );
+
+    serde_json::Value::Object(metadata)
+}
+
+fn collect_fixture_tool_calls(messages: &[ChatMessage]) -> Vec<String> {
+    let mut tools = Vec::new();
+
+    for message in messages {
+        if message.role != "assistant" {
+            continue;
+        }
+
+        if let Some(tool_calls) = message.tool_calls.as_ref() {
+            for tool_call in tool_calls {
+                if tool_call.name == "skill_enter" {
+                    continue;
+                }
+                tools.push(tool_call.name.clone());
+            }
+        }
+    }
+
+    tools
+}
+
+fn response_matches_expected_output(actual: &str, expected: Option<&str>) -> bool {
+    let Some(expected) = expected.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+
+    actual
+        .to_lowercase()
+        .contains(&expected.to_lowercase())
+}
+
+async fn build_skill_test_runtime(paths: &Paths) -> anyhow::Result<AgentRuntime> {
+    let config = Config::load_or_default(&paths)?;
+
+    let provider_pool = blockcell_providers::ProviderPool::from_config(&config)?;
+
+    let memory_store_handle = if let Ok(store) = open_memory_store(&paths, &config) {
+        use blockcell_agent::MemoryStoreAdapter;
+        use std::sync::Arc;
+        Some(Arc::new(MemoryStoreAdapter::new(store)) as blockcell_tools::MemoryStoreHandle)
+    } else {
+        None
+    };
+
+    let mcp_manager = Arc::new(McpManager::load(&paths).await?);
+    let tool_registry = build_tool_registry_for_agent_config(&config, Some(&mcp_manager)).await?;
+    let mut runtime = AgentRuntime::new(config, paths.clone(), provider_pool, tool_registry)?;
+
+    if let Some(handle) = memory_store_handle {
+        runtime.set_memory_store(handle);
+    }
+
+    Ok(runtime)
+}
+
+async fn run_skill_fixtures(
+    skill_name: &str,
+    skill_path: &std::path::Path,
+    runtime_paths: &Paths,
+) -> anyhow::Result<FixtureSummary> {
+    let fixtures = load_skill_test_fixtures(skill_path);
+    if fixtures.is_empty() {
+        return Ok(FixtureSummary::default());
+    }
+
+    let mut runtime = build_skill_test_runtime(runtime_paths).await?;
+    let session_store = SessionStore::new(runtime_paths.clone());
+    let mut summary = FixtureSummary {
+        total: fixtures.len(),
+        ..Default::default()
+    };
+
+    println!("  🧪 Fixture regression ({} cases)", summary.total);
+
+    for (index, fixture) in fixtures.iter().enumerate() {
+        let chat_id = format!("fixture:{}:{}", skill_name, fixture.name);
+        let session_key = build_session_key("cli", &chat_id);
+        let metadata = build_fixture_metadata(skill_name, fixture);
+
+        let inbound = InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: chat_id.clone(),
+            content: fixture.input.clone(),
+            media: vec![],
+            metadata,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+
+        print!("    [{}/{}] {:<24}", index + 1, summary.total, fixture.name);
+        let run_result = runtime.process_message(inbound).await;
+
+        let outcome = match run_result {
+            Ok(response) => {
+                let history = session_store.load(&session_key)?;
+                let actual_tools = collect_fixture_tool_calls(&history);
+                let expected_tools_match = fixture.expected_tools.is_empty()
+                    || actual_tools == fixture.expected_tools;
+                let expected_output_match =
+                    response_matches_expected_output(&response, fixture.expected_output.as_deref());
+
+                if expected_tools_match && expected_output_match {
+                    summary.passed += 1;
+                    "✅"
+                } else {
+                    summary.failed += 1;
+                    println!();
+                    if !expected_tools_match {
+                        println!("      expected tools: {:?}", fixture.expected_tools);
+                        println!("      actual tools:   {:?}", actual_tools);
+                    }
+                    if !expected_output_match {
+                        let preview = response.chars().take(240).collect::<String>();
+                        if let Some(expected) = fixture.expected_output.as_deref() {
+                            println!("      expected output: {:?}", expected.trim());
+                        }
+                        println!("      actual output:   {:?}", preview);
+                    }
+                    "❌"
+                }
+            }
+            Err(error) => {
+                summary.failed += 1;
+                println!();
+                println!("      error: {}", error);
+                "❌"
+            }
+        };
+
+        println!(" {}", outcome);
+        let _ = std::fs::remove_file(runtime_paths.session_file(&session_key));
+    }
+
+    Ok(summary)
 }
 
 /// List all skill evolution records.
@@ -659,8 +934,8 @@ pub async fn test(path: &str, input: Option<String>, verbose: bool) -> anyhow::R
                 }
             }
         } else {
-            println!("❌ MISSING");
-            fail += 1;
+            println!("✅ OK (Prompt-only)");
+            pass += 1;
         }
         print_result(pass, fail);
         return Ok(());
@@ -1032,6 +1307,8 @@ pub async fn test_all(dir: &str, input: Option<String>, verbose: bool) -> anyhow
         anyhow::bail!("Directory not found: {}", dir);
     }
 
+    let runtime_paths = prepare_skill_test_workspace(base)?;
+
     let entries: Vec<_> = std::fs::read_dir(base)?
         .flatten()
         .filter(|e| {
@@ -1051,6 +1328,9 @@ pub async fn test_all(dir: &str, input: Option<String>, verbose: bool) -> anyhow
     let total = entries.len();
     let mut passed = 0usize;
     let mut failed_names: Vec<String> = Vec::new();
+    let mut fixture_total = 0usize;
+    let mut fixture_passed = 0usize;
+    let mut fixture_failed = 0usize;
 
     println!();
     println!("🧪 Batch testing {} skills in: {}", total, dir);
@@ -1067,6 +1347,7 @@ pub async fn test_all(dir: &str, input: Option<String>, verbose: bool) -> anyhow
         let result = test(skill_path.to_str().unwrap_or(""), input.clone(), verbose).await;
         match result {
             Ok(_) => {
+                let mut skill_passed = true;
                 // Re-check by primary compatibility asset (top-level Rhai compile or Python syntax).
                 let script_ok = {
                     let rhai_path = skill_path.join("SKILL.rhai");
@@ -1076,18 +1357,45 @@ pub async fn test_all(dir: &str, input: Option<String>, verbose: bool) -> anyhow
                         engine.compile(&script).is_ok()
                     } else {
                         let py_path = skill_path.join("SKILL.py");
-                        py_path.exists() && python_syntax_check(&py_path).is_ok()
+                        if py_path.exists() {
+                            python_syntax_check(&py_path).is_ok()
+                        } else {
+                            // Prompt-only skills have no top-level script asset to compile.
+                            true
+                        }
                     }
                 };
-                if script_ok {
+                if !script_ok {
+                    skill_passed = false;
+                    record_failed_skill(&mut failed_names, name);
+                }
+
+                match run_skill_fixtures(name, &skill_path, &runtime_paths).await {
+                    Ok(summary) => {
+                        fixture_total += summary.total;
+                        fixture_passed += summary.passed;
+                        fixture_failed += summary.failed;
+                        if summary.failed > 0 {
+                            skill_passed = false;
+                        }
+                        if summary.failed > 0 {
+                            record_failed_skill(&mut failed_names, name);
+                        }
+                    }
+                    Err(e) => {
+                        println!("  ⚠️  Error running fixtures for {}: {}", name, e);
+                        skill_passed = false;
+                        record_failed_skill(&mut failed_names, name);
+                    }
+                }
+
+                if skill_passed {
                     passed += 1;
-                } else {
-                    failed_names.push(name.to_string());
                 }
             }
             Err(e) => {
                 println!("  ⚠️  Error running test for {}: {}", name, e);
-                failed_names.push(name.to_string());
+                record_failed_skill(&mut failed_names, name);
             }
         }
     }
@@ -1096,7 +1404,12 @@ pub async fn test_all(dir: &str, input: Option<String>, verbose: bool) -> anyhow
     println!("📊 Batch Test Summary");
     println!("   Total:  {}", total);
     println!("   Passed: {}", passed);
-    println!("   Failed: {}", total - passed);
+    println!("   Failed: {}", failed_names.len());
+    if fixture_total > 0 {
+        println!("   Fixture cases: {}", fixture_total);
+        println!("   Fixture passed: {}", fixture_passed);
+        println!("   Fixture failed: {}", fixture_failed);
+    }
     if !failed_names.is_empty() {
         println!();
         println!("   ❌ Failed skills:");
@@ -1105,6 +1418,8 @@ pub async fn test_all(dir: &str, input: Option<String>, verbose: bool) -> anyhow
         }
     }
     println!();
+
+    let _ = std::fs::remove_dir_all(runtime_paths.base);
 
     Ok(())
 }

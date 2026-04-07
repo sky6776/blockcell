@@ -754,6 +754,12 @@ pub struct SkillTestFixture {
     /// Context variables to inject into Rhai scope.
     #[serde(default)]
     pub context: serde_json::Value,
+    /// Optional tool parameters used by some fixtures.
+    #[serde(default)]
+    pub params: serde_json::Value,
+    /// Optional constraint hints used by some fixtures.
+    #[serde(default)]
+    pub constraints: serde_json::Value,
 }
 
 pub struct SkillManager {
