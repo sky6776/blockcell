@@ -36,12 +36,12 @@ impl SlashCommand for ClearSkillsCommand {
         }
 
         let content = if count > 0 {
-            format!("\n✅ Cleared all skill evolution records ({} total)\n\n", count)
+            format!("✅ **Cleared all skill evolution records** ({} total)\n", count)
         } else {
-            "\n(No records to clear)\n\n".to_string()
+            "*(No records to clear)*\n".to_string()
         };
 
-        CommandResult::Handled(CommandResponse::text(content))
+        CommandResult::Handled(CommandResponse::markdown(content))
     }
 }
 
@@ -67,8 +67,8 @@ impl SlashCommand for ForgetSkillCommand {
         let skill_name = args.trim();
 
         if skill_name.is_empty() {
-            return CommandResult::Handled(CommandResponse::text(
-                "  Usage: /forget-skill <skill_name>\n\n".to_string(),
+            return CommandResult::Handled(CommandResponse::markdown(
+                "Usage: `/forget-skill <skill_name>`\n".to_string(),
             ));
         }
 
@@ -96,14 +96,14 @@ impl SlashCommand for ForgetSkillCommand {
 
         let content = if count > 0 {
             format!(
-                "\n✅ Deleted all records for skill `{}` ({} total)\n\n",
+                "✅ **Deleted all records for skill `{}`** ({} total)\n",
                 skill_name, count
             )
         } else {
-            format!("\n⚠️ No records found for skill `{}`\n\n", skill_name)
+            format!("⚠️ **No records found for skill `{}`**\n", skill_name)
         };
 
-        CommandResult::Handled(CommandResponse::text(content))
+        CommandResult::Handled(CommandResponse::markdown(content))
     }
 }
 

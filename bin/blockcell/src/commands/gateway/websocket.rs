@@ -159,6 +159,7 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                             "type": "message_done",
                                             "chat_id": chat_id,
                                             "content": response.content,
+                                            "is_markdown": response.is_markdown,
                                             "task_id": "",
                                         });
                                         let _ = ws_broadcast.send(event.to_string());

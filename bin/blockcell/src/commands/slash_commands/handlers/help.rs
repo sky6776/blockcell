@@ -22,7 +22,7 @@ impl SlashCommand for HelpCommand {
         let commands = handler.list_commands();
 
         let mut content = String::new();
-        content.push_str("\n📋 Available commands:\n\n");
+        content.push_str("📋 **Available commands:**\n\n");
 
         for cmd in commands {
             let name = cmd.name();
@@ -39,15 +39,14 @@ impl SlashCommand for HelpCommand {
                 String::new()
             };
 
-            content.push_str(&format!("  /{}{} — {}\n", name, channel_note, desc));
+            content.push_str(&format!("- `/{}{}` — {}\n", name, channel_note, desc));
         }
 
-        content.push_str("\n💡 提示:\n");
-        content.push_str("  - 大部分命令零 Token 消耗，本地直接执行\n");
-        content.push_str("  - /learn 命令会调用 LLM，消耗 Token\n");
-        content.push('\n');
+        content.push_str("\n💡 **提示:**\n");
+        content.push_str("- 大部分命令零 Token 消耗，本地直接执行\n");
+        content.push_str("- `/learn` 命令会调用 LLM，消耗 Token\n");
 
-        CommandResult::Handled(CommandResponse::text(content))
+        CommandResult::Handled(CommandResponse::markdown(content))
     }
 }
 

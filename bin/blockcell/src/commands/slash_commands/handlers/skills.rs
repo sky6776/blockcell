@@ -94,7 +94,7 @@ impl SlashCommand for SkillsCommand {
 
     async fn execute(&self, _args: &str, ctx: &CommandContext) -> CommandResult {
         let content = print_skills_status(&ctx.paths);
-        CommandResult::Handled(CommandResponse::text(content))
+        CommandResult::Handled(CommandResponse::markdown(content))
     }
 }
 
@@ -167,7 +167,7 @@ fn print_skills_status(paths: &blockcell_core::Paths) -> String {
     }
 
     let mut content = String::new();
-    content.push_str(&format!("\n🧠 Skills ({} total)\n", skill_map.len()));
+    content.push_str(&format!("🧠 **Skills** ({} total)\n\n", skill_map.len()));
 
     // 按分类分组
     let mut categorized = HashSet::new();
@@ -181,20 +181,21 @@ fn print_skills_status(paths: &blockcell_core::Paths) -> String {
             }
         }
         if !items.is_empty() {
-            content.push_str(&format!("\n  {} ({})\n", category, items.len()));
+            content.push_str(&format!("**{}** ({})\n", category, items.len()));
             for (name, desc) in &items {
                 if desc.is_empty() {
-                    content.push_str(&format!("    • {}\n", name));
+                    content.push_str(&format!("- {}\n", name));
                 } else {
                     let char_count = desc.chars().count();
                     if char_count > 40 {
                         let short: String = desc.chars().take(40).collect();
-                        content.push_str(&format!("    • {} — {}…\n", name, short));
+                        content.push_str(&format!("- {} — {}…\n", name, short));
                     } else {
-                        content.push_str(&format!("    • {} — {}\n", name, desc));
+                        content.push_str(&format!("- {} — {}\n", name, desc));
                     }
                 }
             }
+            content.push('\n');
         }
     }
 
@@ -204,20 +205,21 @@ fn print_skills_status(paths: &blockcell_core::Paths) -> String {
         .filter(|(name, _)| !categorized.contains(name.as_str()))
         .collect();
     if !uncategorized.is_empty() {
-        content.push_str(&format!("\n  📦 Other ({})\n", uncategorized.len()));
+        content.push_str(&format!("📦 **Other** ({})\n", uncategorized.len()));
         for (name, desc) in &uncategorized {
             if desc.is_empty() {
-                content.push_str(&format!("    • {}\n", name));
+                content.push_str(&format!("- {}\n", name));
             } else {
                 let char_count = desc.chars().count();
                 if char_count > 40 {
                     let short: String = desc.chars().take(40).collect();
-                    content.push_str(&format!("    • {} — {}…\n", name, short));
+                    content.push_str(&format!("- {} — {}…\n", name, short));
                 } else {
-                    content.push_str(&format!("    • {} — {}\n", name, desc));
+                    content.push_str(&format!("- {} — {}\n", name, desc));
                 }
             }
         }
+        content.push('\n');
     }
 
     // 演化记录
@@ -261,22 +263,23 @@ fn print_skills_status(paths: &blockcell_core::Paths) -> String {
     }
 
     if !learned.is_empty() || !learning.is_empty() || !failed.is_empty() {
-        content.push_str("\n  ── Evolution Status ──\n");
+        content.push_str("── **Evolution Status** ──\n\n");
     }
 
     if !learned.is_empty() {
-        content.push_str(&format!("  ✅ Learned ({}):\n", learned.len()));
+        content.push_str(&format!("✅ **Learned** ({}):\n", learned.len()));
         for r in &learned {
             content.push_str(&format!(
-                "    • {} ({})\n",
+                "- {} ({})\n",
                 r.skill_name,
                 format_timestamp(r.created_at)
             ));
         }
+        content.push('\n');
     }
 
     if !learning.is_empty() {
-        content.push_str(&format!("  🔄 Learning ({}):\n", learning.len()));
+        content.push_str(&format!("🔄 **Learning** ({}):\n", learning.len()));
         for r in &learning {
             let status_desc = match format!("{:?}", r.status).as_str() {
                 "Triggered" => "pending",
@@ -290,22 +293,21 @@ fn print_skills_status(paths: &blockcell_core::Paths) -> String {
                 _ => "in progress",
             };
             content.push_str(&format!(
-                "    • {} [{}] ({})\n",
+                "- {} [{}] ({})\n",
                 r.skill_name,
                 status_desc,
                 format_timestamp(r.created_at)
             ));
         }
+        content.push('\n');
     }
 
     if !failed.is_empty() {
-        content.push_str(&format!("  ❌ Failed ({}):\n", failed.len()));
+        content.push_str(&format!("❌ **Failed** ({}):\n", failed.len()));
         for r in &failed {
-            content.push_str(&format!("    • {}\n", r.skill_name));
+            content.push_str(&format!("- {}\n", r.skill_name));
         }
     }
-
-    content.push('\n');
     content
 }
 

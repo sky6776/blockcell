@@ -21,8 +21,8 @@ impl SlashCommand for TasksCommand {
         let task_manager = match &ctx.task_manager {
             Some(tm) => tm,
             None => {
-                return CommandResult::Handled(CommandResponse::text(
-                    "⚠️ Task manager not available\n".to_string(),
+                return CommandResult::Handled(CommandResponse::markdown(
+                    "⚠️ **Task manager not available**\n".to_string(),
                 ));
             }
         };
@@ -32,16 +32,16 @@ impl SlashCommand for TasksCommand {
         let task_list = task_manager.list_tasks(None).await;
 
         let mut content = String::new();
-        content.push_str("\n📋 Task overview:\n");
+        content.push_str("📋 **Task overview:**\n\n");
         content.push_str(&format!(
-            "  {} queued | {} running | {} completed | {} failed\n",
+            "- {} queued | {} running | {} completed | {} failed\n",
             queued, running, completed, failed
         ));
 
         if task_list.is_empty() {
-            content.push_str("  (No tasks)\n");
+            content.push_str("\n*(No tasks)*\n");
         } else {
-            content.push_str("\n  Tasks:\n");
+            content.push_str("\n**Tasks:**\n");
             for t in &task_list {
                 let status_icon = match t.status.to_string().as_str() {
                     "queued" => "⏳",
@@ -52,12 +52,12 @@ impl SlashCommand for TasksCommand {
                 };
                 let short_id: String = t.id.chars().take(12).collect();
                 content.push_str(&format!(
-                    "  {} [{}] {} - {}\n",
+                    "- {} `[{}]` {} - {}\n",
                     status_icon, short_id, t.status, t.label
                 ));
 
                 if let Some(ref progress) = t.progress {
-                    content.push_str(&format!("    Progress: {}\n", progress));
+                    content.push_str(&format!("  - Progress: {}\n", progress));
                 }
                 if let Some(ref result) = t.result {
                     let preview = if result.chars().count() > 100 {
@@ -66,17 +66,15 @@ impl SlashCommand for TasksCommand {
                     } else {
                         result.clone()
                     };
-                    content.push_str(&format!("    Result: {}\n", preview));
+                    content.push_str(&format!("  - Result: {}\n", preview));
                 }
                 if let Some(ref err) = t.error {
-                    content.push_str(&format!("    Error: {}\n", err));
+                    content.push_str(&format!("  - Error: {}\n", err));
                 }
             }
         }
 
-        content.push('\n');
-
-        CommandResult::Handled(CommandResponse::text(content))
+        CommandResult::Handled(CommandResponse::markdown(content))
     }
 }
 

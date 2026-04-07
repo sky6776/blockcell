@@ -93,6 +93,27 @@ blockcell setup  # 首次设置，创建 ~/.blockcell/config.json5
 }
 ```
 
+### 环境变量
+
+BlockCell 支持通过环境变量覆盖配置：
+
+| 变量 | 说明 | 默认值 |
+| ---- | ---- | ------ |
+| `BLOCKCELL_CONFIG_PATH` | 自定义配置文件路径 | `~/.blockcell/config.json5` |
+| `BLOCKCELL_API_TOKEN` | Gateway API 认证令牌 | (可选，用于 WebUI 认证) |
+| `BLOCKCELL_HUB_URL` | 技能中心 URL | `https://hub.blockcell.dev` |
+| `BLOCKCELL_HUB_API_KEY` | 技能中心 API 密钥 | (可选) |
+| `RUST_LOG` | 日志级别 (tracing) | `info` |
+| `EDITOR` / `VISUAL` | 配置编辑器 | 系统默认 |
+
+Gateway 模式额外支持 `.env` 文件 (`~/.blockcell/.env`)：
+
+```bash
+# Gateway .env 示例
+BLOCKCELL_API_TOKEN=your_secure_token_here
+RUST_LOG=debug,blockcell_agent=trace
+```
+
 ### 运行
 
 ```bash
@@ -100,6 +121,87 @@ blockcell status   # 检查状态
 blockcell agent    # 交互模式
 blockcell gateway  # 守护进程 + WebUI
 ```
+
+### 部署
+
+#### Docker 部署
+
+项目使用多阶段构建优化镜像大小：
+
+```bash
+# 构建镜像
+docker build -t blockcell:latest .
+
+# 运行容器
+docker run -d \
+  --name blockcell \
+  -p 3000:3000 \
+  -v ~/.blockcell:/home/blockcell/.blockcell \
+  blockcell:latest gateway
+
+# 使用环境变量
+docker run -d \
+  -e BLOCKCELL_API_TOKEN=your_token \
+  -e RUST_LOG=debug \
+  -p 3000:3000 \
+  blockcell:latest gateway
+```
+
+#### Docker Compose
+
+```yaml
+version: '3.8'
+services:
+  blockcell:
+    image: blockcell:latest
+    command: gateway
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/home/blockcell/.blockcell
+    environment:
+      - RUST_LOG=info
+      - BLOCKCELL_API_TOKEN=${API_TOKEN}
+    restart: unless-stopped
+```
+
+#### 系统服务 (systemd)
+
+```bash
+# 创建服务文件
+sudo tee /etc/systemd/system/blockcell.service <<EOF
+[Unit]
+Description=BlockCell Gateway Service
+After=network.target
+
+[Service]
+Type=simple
+User=blockcell
+ExecStart=/usr/local/bin/blockcell gateway
+Restart=on-failure
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 启用并启动
+sudo systemctl enable blockcell
+sudo systemctl start blockcell
+```
+
+## 主要用例
+
+BlockCell 支持多种 AI 智能体应用场景：
+
+| 用例 | 说明 | 示例 |
+| ---- | ---- | ---- |
+| **个人 AI 助手** | 通过 Telegram/Slack/Discord 进行智能对话 | 查询天气、翻译文档、代码问答 |
+| **数据处理** | 文件分析、图表生成、数据转换 | 解析 Excel、生成图表、格式转换 |
+| **自动化任务** | Cron 定时执行、后台作业 | 定时备份、数据同步、状态监控 |
+| **多 Agent 协作** | Intent 路由分发到不同 Agent | 客服机器人、任务分发、专业分工 |
+| **浏览器控制** | Web 自动化、数据抓取 | 表单填写、页面监控、数据采集 |
+| **技能进化** | 自我学习、版本管理、热更新 | Bug 修复、功能迭代、知识积累 |
 
 ## 架构说明
 
@@ -179,6 +281,70 @@ async fn process(&self) -> Result<(), MyError> { ... }
 // 日志: 使用 tracing
 tracing::info!(user_id = %id, "Processing request");
 ```
+
+### 斜杠命令开发
+
+斜杠命令位于 `bin/blockcell/src/commands/slash_commands/`，用于统一处理 CLI、Gateway、WebSocket、Channel 的命令。
+
+#### 命令处理器规范
+
+1. **输出格式**: 所有命令响应必须使用 **Markdown 格式**
+   - 使用 `CommandResponse::markdown(content)` 而非 `CommandResponse::text(content)`
+   - 原因：WebUI 使用 `MarkdownContent` 组件渲染，纯文本 `\n` 不会换行
+
+2. **Markdown 格式要求**:
+
+   ```rust
+   // ✅ 正确：使用 Markdown 列表语法
+   content.push_str("- item 1\n");
+   content.push_str("- item 2\n");
+   content.push_str("**Bold** for emphasis\n");
+
+   // ❌ 错误：纯文本换行在 WebUI 不生效
+   content.push_str("  item 1\n");
+   content.push_str("  item 2\n");
+   ```
+
+3. **WebSocket 发送**:
+
+   ```rust
+   // 必须包含 is_markdown 字段
+   let event = serde_json::json!({
+       "type": "message_done",
+       "chat_id": chat_id,
+       "content": response.content,
+       "is_markdown": response.is_markdown,
+       "task_id": "",
+   });
+   ```
+
+#### 文件结构
+
+```text
+slash_commands/
+├── mod.rs          # SlashCommand trait 定义
+├── context.rs      # CommandContext, CommandResult, CommandResponse
+├── registry.rs     # 全局 SLASH_COMMAND_HANDLER
+└── handlers/       # 各命令实现
+    ├── help.rs     # /help - 显示命令列表
+    ├── skills.rs   # /skills - 技能状态
+    ├── tools.rs    # /tools - 工具列表
+    ├── tasks.rs    # /tasks - 后台任务
+    ├── learn.rs    # /learn - 学习新技能 (ForwardToRuntime)
+    ├── clear.rs    # /clear - 清除会话
+    ├── quit.rs     # /quit, /exit - 退出 (ExitRequested)
+    └── skill_mgmt.rs  # /clear-skills, /forget-skill
+```
+
+#### 特殊返回类型
+
+| 类型 | 用途 | 示例命令 |
+| ---- | ---- | -------- |
+| `Handled(CommandResponse)` | 正常响应 | /help, /skills, /tools |
+| `ForwardToRuntime` | 需 LLM 处理 | /learn |
+| `ExitRequested` | 请求退出 | /quit, /exit |
+| `PermissionDenied` | 权限不足 | 渠道限制命令 |
+| `NotACommand` | 非命令输入 | 普通消息 |
 
 ## 测试要求
 
@@ -289,6 +455,7 @@ npm run type-check
 ### PR 流程
 
 1. **代码质量检查**
+
    ```bash
    cargo fmt --check           # 格式检查
    cargo clippy -- -D warnings # Lint 检查，必须零警告
@@ -333,6 +500,7 @@ npm run type-check
    - 在 `Cargo.toml` 添加 feature 依赖
 
 3. **错误处理**
+
    ```rust
    #[derive(Debug, thiserror::Error)]
    pub enum MyError {
@@ -344,6 +512,7 @@ npm run type-check
    ```
 
 4. **日志规范**
+
    ```rust
    // 结构化日志
    tracing::info!(

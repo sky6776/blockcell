@@ -81,7 +81,7 @@ impl SlashCommand for ToolsCommand {
 
     async fn execute(&self, _args: &str, ctx: &CommandContext) -> CommandResult {
         let content = print_tools_status(&ctx.paths);
-        CommandResult::Handled(CommandResponse::text(content))
+        CommandResult::Handled(CommandResponse::markdown(content))
     }
 }
 
@@ -91,16 +91,17 @@ fn print_tools_status(paths: &blockcell_core::Paths) -> String {
 
     let mut content = String::new();
     content.push_str(&format!(
-        "\n🔌 Built-in tools ({} total, {} categories)\n",
+        "🔌 **Built-in tools** ({} total, {} categories)\n\n",
         total_tools,
         BUILTIN_TOOLS.len()
     ));
 
     for (category, items) in BUILTIN_TOOLS {
-        content.push_str(&format!("\n  {} ({})\n", category, items.len()));
+        content.push_str(&format!("**{}** ({})\n", category, items.len()));
         for (name, desc) in *items {
-            content.push_str(&format!("    ✅ {} — {}\n", name, desc));
+            content.push_str(&format!("- ✅ {} — {}\n", name, desc));
         }
+        content.push('\n');
     }
 
     // 动态演化工具
@@ -114,7 +115,7 @@ fn print_tools_status(paths: &blockcell_core::Paths) -> String {
                 if !caps.is_empty() {
                     let active = caps.iter().filter(|c| c.is_available()).count();
                     content.push_str(&format!(
-                        "\n  🧬 Dynamic evolved tools ({}, {} available)\n",
+                        "🧬 **Dynamic evolved tools** ({}, {} available)\n",
                         caps.len(),
                         active
                     ));
@@ -126,10 +127,11 @@ fn print_tools_status(paths: &blockcell_core::Paths) -> String {
                             _ => "❌",
                         };
                         content.push_str(&format!(
-                            "    {} {} v{} — {}\n",
+                            "- {} {} v{} — {}\n",
                             icon, cap.id, cap.version, cap.description
                         ));
                     }
+                    content.push('\n');
                 }
             }
         }
@@ -154,13 +156,13 @@ fn print_tools_status(paths: &blockcell_core::Paths) -> String {
         }
         if evo_count > 0 {
             content.push_str(&format!(
-                "\n  🧬 Core evolution: {} records ({} active)\n",
+                "🧬 **Core evolution**: {} records ({} active)\n\n",
                 evo_count, active_count
             ));
         }
     }
 
-    content.push_str("\n  💡 /skills view skills | capability_evolve tool to learn new tools\n\n");
+    content.push_str("💡 `/skills` view skills | `capability_evolve` tool to learn new tools\n");
 
     content
 }
