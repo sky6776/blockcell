@@ -553,6 +553,19 @@ fn suppress_prompt_reinjection_for_continued_skill(
     active_skill
 }
 
+fn apply_skill_fallback_response(final_response: String, fallback_message: Option<&str>) -> String {
+    let trimmed_response = final_response.trim();
+    if !trimmed_response.is_empty() {
+        return trimmed_response.to_string();
+    }
+
+    fallback_message
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_string)
+        .unwrap_or_default()
+}
+
 struct PromptSkillLoopOutput {
     final_response: String,
     trace_messages: Vec<ChatMessage>,
@@ -4730,6 +4743,11 @@ impl AgentRuntime {
             }
         }
 
+        final_response = apply_skill_fallback_response(
+            final_response,
+            active_skill.fallback_message.as_deref(),
+        );
+
         Ok((
             final_response,
             prompt_result.trace_messages,
@@ -5724,6 +5742,28 @@ mod tests {
             }
         }
         cursor == expected.len()
+    }
+
+    #[test]
+    fn apply_skill_fallback_response_uses_fallback_for_empty_output() {
+        let fallback = "当前无法获取腾讯新闻数据，请先检查 CLI 安装、API Key 配置或网络环境。";
+
+        assert_eq!(
+            apply_skill_fallback_response(String::new(), Some(fallback)),
+            fallback
+        );
+        assert_eq!(
+            apply_skill_fallback_response("   \n\t".to_string(), Some(fallback)),
+            fallback
+        );
+    }
+
+    #[test]
+    fn apply_skill_fallback_response_keeps_non_empty_output() {
+        assert_eq!(
+            apply_skill_fallback_response("  ok  ".to_string(), Some("fallback")),
+            "ok"
+        );
     }
 
     #[async_trait::async_trait]

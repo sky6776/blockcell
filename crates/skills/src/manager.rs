@@ -506,7 +506,7 @@ fn concise_markdown_excerpt(text: &str, max_chars: usize) -> String {
     truncate_chars(excerpt.trim(), max_chars)
 }
 
-fn skill_supports_local_exec(skill: &Skill, manual: &str) -> bool {
+fn skill_supports_local_exec(skill: &Skill, _manual: &str) -> bool {
     if skill.path.join("SKILL.py").exists() || skill.path.join("SKILL.rhai").exists() {
         return true;
     }
@@ -515,23 +515,7 @@ fn skill_supports_local_exec(skill: &Skill, manual: &str) -> bool {
         return true;
     }
 
-    let manual_lower = manual.to_lowercase();
-    [
-        "exec_local",
-        "本地脚本",
-        "local script",
-        "scripts/",
-        ".py",
-        ".sh",
-        ".php",
-        ".js",
-        "python ",
-        "bash ",
-        "sh ",
-        "./",
-    ]
-        .iter()
-        .any(|needle| manual_lower.contains(needle))
+    false
 }
 
 fn skill_dir_contains_local_script(dir: &Path) -> bool {
@@ -1627,5 +1611,55 @@ description: 本地脚本 demo
             .local_exec_entrypoints
             .iter()
             .any(|entry| entry == "scripts/"));
+    }
+
+    #[test]
+    fn test_skill_card_does_not_treat_install_instructions_as_local_exec() {
+        let skill_dir = temp_skill_dir("blockcell-skill-card-cli-install");
+        fs::write(
+            skill_dir.join("meta.yaml"),
+            r#"
+name: tencent-news
+description: 获取腾讯新闻热点、早报、晚报和 AI 精选内容。
+"#,
+        )
+        .expect("write meta");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"# Tencent News
+
+## Shared {#shared}
+- 适合通过工具 `exec` 执行对应的 `tencent-news-cli` 命令来查询腾讯新闻热点、早报、晚报、AI 精选，以及提交使用反馈。
+- 这个 skill 依赖本地 CLI 和 API Key；如果 CLI 未安装或未配置，先引导用户完成安装与配置，再继续查询。
+
+## Prompt {#prompt}
+执行 tencent-news-cli hot
+
+## 安装与配置
+```bash
+curl -fsSL https://example.invalid/setup.sh | sh
+```
+"#,
+        )
+        .expect("write skill md");
+
+        let skill = Skill {
+            name: "tencent-news".to_string(),
+            path: skill_dir,
+            meta: SkillMeta {
+                name: "tencent-news".to_string(),
+                description: "获取腾讯新闻热点、早报、晚报和 AI 精选内容。".to_string(),
+                ..SkillMeta::default()
+            },
+            available: true,
+            unavailable_reason: None,
+            current_version: None,
+            cached_docs: None,
+        };
+
+        let card = SkillManager::build_skill_card(&skill);
+        assert_eq!(card.execution_layout, "PromptTool");
+        assert!(!card.supports_local_exec);
+        assert!(card.local_exec_entrypoints.is_empty());
     }
 }
