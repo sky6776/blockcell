@@ -26,7 +26,7 @@ use crate::error::{
 };
 use crate::history_projector::{HistoryProjector, TimeBasedMCConfig};
 use crate::intent::{IntentCategory, IntentToolResolver};
-use crate::metrics::{ProcessingMetrics, ScopedTimer};
+use crate::session_metrics::{ProcessingMetrics, ScopedTimer};
 use crate::skill_executor::{determine_manual_load_mode, SkillExecutionResult};
 use crate::token::estimate_messages_tokens;
 use crate::skill_kernel::SkillRunMode;
@@ -40,6 +40,18 @@ use crate::task_manager::TaskManager;
 const TOOL_ROUND_THROTTLE_MS: u64 = 600;
 const TOOL_ROUND_THROTTLE_AFTER_RATE_LIMIT_MS: u64 = 2_500;
 const ACTIVATE_SKILL_TOOL_NAME: &str = "activate_skill";
+
+/// Compact execution context - contains info needed for notifications.
+///
+/// Used to send user notifications before/after compression operations.
+pub struct CompactContext<'a> {
+    /// Channel to send notification to.
+    pub channel: &'a str,
+    /// Chat ID to send notification to.
+    pub chat_id: &'a str,
+    /// Account ID for multi-tenant scenarios.
+    pub account_id: Option<&'a str>,
+}
 
 /// Adapter that wraps a Provider to implement the skills::LLMProvider trait.
 /// This allows EvolutionService to call the LLM for code generation without
@@ -2051,6 +2063,11 @@ impl AgentRuntime {
     /// 当 token 超过预算阈值时，使用 LLM 生成 9-part structured summary，
     /// 并收集恢复信息（文件、技能、Session Memory）。
     ///
+    /// ## 参数
+    /// - `messages` - 要压缩的消息列表
+    /// - `_session_key` - 会话标识符
+    /// - `compact_ctx` - 可选的通知上下文，用于发送用户通知
+    ///
     /// ## 返回
     /// - `CompactResult` - 压缩结果（通过 `success` 字段判断是否成功）
     ///   - 成功：`success: true`，包含摘要和恢复消息
@@ -2059,24 +2076,57 @@ impl AgentRuntime {
         &self,
         messages: &[ChatMessage],
         _session_key: &str,
+        compact_ctx: Option<CompactContext<'_>>,
     ) -> crate::compact::CompactResult {
         use crate::compact::{CompactResult, generate_compact_summary};
         use crate::session_memory::get_session_memory_path;
+        use crate::session_metrics::get_compact_circuit_breaker;
+
+        let pre_compact_tokens = estimate_messages_tokens(messages);
+
+        // ========== 1. 熔断器检查 ==========
+        let circuit_breaker = get_compact_circuit_breaker();
+        if !circuit_breaker.allow() {
+            warn!(
+                target: "blockcell.session_metrics.layer4",
+                "[layer4] Compact skipped - circuit breaker OPEN"
+            );
+            return CompactResult::failed("Circuit breaker open - too many recent failures");
+        }
+
+        // ========== 2. 发送压缩开始通知 ==========
+        if let (Some(ref tx), Some(ref ctx)) = (&self.outbound_tx, &compact_ctx) {
+            let mut notification = OutboundMessage::new(
+                ctx.channel,
+                ctx.chat_id,
+                "🔄 对话历史较长，正在压缩以保持性能..."
+            );
+            if let Some(aid) = ctx.account_id {
+                notification.account_id = Some(aid.to_string());
+            }
+            let _ = tx.send(notification).await;
+        }
+
+        // ========== 3. 记录压缩开始事件 ==========
+        let threshold = self.memory_system.as_ref()
+            .map(|m| m.config().compact_threshold)
+            .unwrap_or(0.8);
+        crate::memory_event!(layer4, compact_started, pre_compact_tokens, threshold, true);
 
         info!(
-            pre_compact_tokens = estimate_messages_tokens(messages),
+            pre_compact_tokens,
             "[layer4] Starting full compact"
         );
 
-        // 1. 生成系统提示
+        // ========== 4. 生成系统提示 ==========
         let system_prompt = Arc::new(
             "你是一个对话摘要助手。请根据对话历史生成结构化摘要，保留关键信息用于后续继续工作。".to_string()
         );
 
-        // 2. 获取模型配置
+        // ========== 5. 获取模型配置 ==========
         let model = self.config.agents.defaults.model.clone();
 
-        // 3. 执行 LLM 语义压缩
+        // ========== 6. 执行 LLM 语义压缩 ==========
         let summary_result = generate_compact_summary(
             Arc::clone(&self.provider_pool),
             system_prompt,
@@ -2084,18 +2134,41 @@ impl AgentRuntime {
             messages.to_vec(),
         ).await;
 
-        let summary_message = match summary_result {
-            Ok(summary) => summary.to_markdown(),
+        let (summary_message, cache_read_tokens, cache_creation_tokens) = match summary_result {
+            Ok(result) => {
+                (
+                    result.summary.to_markdown(),
+                    result.cache_read_tokens,
+                    result.cache_creation_tokens,
+                )
+            }
             Err(e) => {
                 let error_msg = format!("LLM compact summary generation failed: {}", e);
                 warn!(error = %e, "[layer4] Failed to generate compact summary");
+
+                // 记录失败事件和熔断器状态
+                crate::memory_event!(layer4, compact_failed, &error_msg, pre_compact_tokens, 1);
+                circuit_breaker.record_failure();
+
+                // 发送失败通知
+                if let (Some(ref tx), Some(ref ctx)) = (&self.outbound_tx, &compact_ctx) {
+                    let mut notification = OutboundMessage::new(
+                        ctx.channel,
+                        ctx.chat_id,
+                        "⚠️ 压缩失败，继续使用当前历史。"
+                    );
+                    if let Some(aid) = ctx.account_id {
+                        notification.account_id = Some(aid.to_string());
+                    }
+                    let _ = tx.send(notification).await;
+                }
+
                 return CompactResult::failed(&error_msg);
             }
         };
 
-        // 4. 收集恢复信息
+        // ========== 7. 收集恢复信息 ==========
         let recovery_message = if let Some(memory_system) = self.memory_system.as_ref() {
-            // 尝试读取 Session Memory 内容 (使用异步 I/O)
             let session_memory_path = get_session_memory_path(
                 memory_system.workspace_dir(),
                 memory_system.session_id(),
@@ -2111,12 +2184,22 @@ impl AgentRuntime {
             String::new()
         };
 
-        // 5. 构建 CompactResult
-        let pre_compact_tokens = estimate_messages_tokens(messages);
+        // ========== 8. 构建 CompactResult ==========
         let post_compact_tokens = estimate_messages_tokens(&[
             ChatMessage::system(&summary_message),
             ChatMessage::user(&recovery_message),
         ]);
+
+        // ========== 9. 记录成功事件 ==========
+        // 使用来自 LLM API 响应的真实 cache usage 数据
+        crate::memory_event!(
+            layer4, compact_completed,
+            pre_compact_tokens,
+            post_compact_tokens,
+            cache_read_tokens,
+            cache_creation_tokens
+        );
+        circuit_breaker.record_success();
 
         info!(
             pre_compact_tokens,
@@ -2125,11 +2208,34 @@ impl AgentRuntime {
             "[layer4] Compact completed successfully"
         );
 
+        // ========== 10. 发送压缩成功通知 ==========
+        if let (Some(ref tx), Some(ref ctx)) = (&self.outbound_tx, &compact_ctx) {
+            let compression_ratio = (pre_compact_tokens - post_compact_tokens)
+                as f64 / pre_compact_tokens as f64 * 100.0;
+            let notification_content = format!(
+                "✅ 已压缩对话历史，保留关键信息。\n📊 Token: {} → {} (压缩 {:.0}%)",
+                pre_compact_tokens,
+                post_compact_tokens,
+                compression_ratio
+            );
+            let mut notification = OutboundMessage::new(
+                ctx.channel,
+                ctx.chat_id,
+                &notification_content
+            );
+            if let Some(aid) = ctx.account_id {
+                notification.account_id = Some(aid.to_string());
+            }
+            let _ = tx.send(notification).await;
+        }
+
         CompactResult {
             summary_message,
             recovery_message,
             pre_compact_tokens,
             post_compact_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
             success: true,
             error: None,
         }
@@ -3251,9 +3357,15 @@ impl AgentRuntime {
                         "[layer4] Pre-loop compact check triggered"
                     );
 
+                    let compact_ctx = CompactContext {
+                        channel: &msg.channel,
+                        chat_id: &msg.chat_id,
+                        account_id: msg.account_id.as_deref(),
+                    };
                     let compact_result = self.execute_layer4_compact(
                         &current_messages,
                         &session_key,
+                        Some(compact_ctx),
                     ).await;
                     if compact_result.success {
                         current_messages.clear();
@@ -3726,9 +3838,15 @@ impl AgentRuntime {
                         );
 
                         // 执行 Layer 4 Compact
+                        let compact_ctx = CompactContext {
+                            channel: &msg.channel,
+                            chat_id: &msg.chat_id,
+                            account_id: msg.account_id.as_deref(),
+                        };
                         let compact_result = self.execute_layer4_compact(
                             &current_messages,
                             &session_key,
+                            Some(compact_ctx),
                         ).await;
                         if compact_result.success {
                             // 替换消息历史为压缩后的内容
@@ -3996,9 +4114,15 @@ impl AgentRuntime {
                         "[post-sampling] Executing synchronous compact before response delivery"
                     );
 
+                    let compact_ctx = CompactContext {
+                        channel: &msg.channel,
+                        chat_id: &msg.chat_id,
+                        account_id: msg.account_id.as_deref(),
+                    };
                     let compact_result = self.execute_layer4_compact(
                         &history,
                         &session_key,
+                        Some(compact_ctx),
                     ).await;
                     if compact_result.success {
                         // 压缩成功，替换历史

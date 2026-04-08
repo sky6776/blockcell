@@ -10,6 +10,7 @@ mod tools;
 mod learn;
 mod clear;
 mod skill_mgmt;
+mod session_metrics;
 
 pub use help::HelpCommand;
 pub use tasks::TasksCommand;
@@ -19,3 +20,4 @@ pub use tools::ToolsCommand;
 pub use learn::LearnCommand;
 pub use clear::ClearCommand;
 pub use skill_mgmt::{ClearSkillsCommand, ForgetSkillCommand};
+pub use session_metrics::SessionMetricsCommand;

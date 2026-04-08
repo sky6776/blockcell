@@ -86,6 +86,21 @@ pub struct CompactSummary {
     total_tokens: usize,
 }
 
+/// Compact 摘要生成结果（包含 usage 数据）
+#[derive(Debug, Clone)]
+pub struct CompactSummaryResult {
+    /// 摘要内容
+    pub summary: CompactSummary,
+    /// 输入 tokens
+    pub input_tokens: u64,
+    /// 输出 tokens
+    pub output_tokens: u64,
+    /// 缓存读取 tokens
+    pub cache_read_tokens: u64,
+    /// 缓存创建 tokens
+    pub cache_creation_tokens: u64,
+}
+
 impl CompactSummary {
     /// 创建空摘要
     pub fn empty() -> Self {
@@ -154,7 +169,7 @@ pub async fn generate_compact_summary(
     system_prompt: Arc<String>,
     model: &str,
     messages: Vec<ChatMessage>,
-) -> Result<CompactSummary, CompactError> {
+) -> Result<CompactSummaryResult, CompactError> {
     use crate::forked::{run_forked_agent, ForkedAgentParams, CacheSafeParams, create_compact_can_use_tool};
     use super::NO_TOOLS_PREAMBLE;
 
@@ -197,11 +212,19 @@ pub async fn generate_compact_summary(
     tracing::info!(
         input_tokens = result.total_usage.input_tokens,
         output_tokens = result.total_usage.output_tokens,
+        cache_read_tokens = result.total_usage.cache_read_input_tokens,
+        cache_creation_tokens = result.total_usage.cache_creation_input_tokens,
         summary_tokens = summary.total_tokens(),
         "[compact] summary generated"
     );
 
-    Ok(summary)
+    Ok(CompactSummaryResult {
+        summary,
+        input_tokens: result.total_usage.input_tokens,
+        output_tokens: result.total_usage.output_tokens,
+        cache_read_tokens: result.total_usage.cache_read_input_tokens,
+        cache_creation_tokens: result.total_usage.cache_creation_input_tokens,
+    })
 }
 
 /// 从消息中解析摘要

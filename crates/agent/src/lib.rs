@@ -8,7 +8,7 @@ pub mod health;
 pub mod history_projector;
 pub mod intent;
 pub mod memory_adapter;
-pub(crate) mod metrics;
+pub mod session_metrics;
 pub mod prompt_skill_executor;
 pub mod runtime;
 pub mod auto_memory;

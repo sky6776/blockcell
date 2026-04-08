@@ -18,7 +18,7 @@ mod hooks;
 mod file_tracker;
 mod skill_tracker;
 
-pub use summary::{CompactSummary, CompactSummarySection, generate_compact_summary};
+pub use summary::{CompactSummary, CompactSummarySection, CompactSummaryResult, generate_compact_summary};
 pub use recovery::{
     CompactRecoveryContext, FileRecoveryState, SkillRecoveryState,
     create_recovery_context, generate_recovery_message,
@@ -94,6 +94,10 @@ pub struct CompactResult {
     pub pre_compact_tokens: usize,
     /// 压缩后 token 数（估算）
     pub post_compact_tokens: usize,
+    /// 缓存读取的 tokens（来自 LLM API 响应）
+    pub cache_read_tokens: u64,
+    /// 缓存创建的 tokens（来自 LLM API 响应）
+    pub cache_creation_tokens: u64,
     /// 是否成功
     pub success: bool,
     /// 错误信息（如果失败）
@@ -108,6 +112,8 @@ impl CompactResult {
             recovery_message: String::new(),
             pre_compact_tokens: 0,
             post_compact_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             success: false,
             error: Some(error.to_string()),
         }
@@ -119,12 +125,16 @@ impl CompactResult {
         recovery_message: String,
         pre_compact_tokens: usize,
         post_compact_tokens: usize,
+        cache_read_tokens: u64,
+        cache_creation_tokens: u64,
     ) -> Self {
         Self {
             summary_message,
             recovery_message,
             pre_compact_tokens,
             post_compact_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
             success: true,
             error: None,
         }
@@ -285,6 +295,8 @@ mod tests {
             "Recovery content".to_string(),
             100_000,
             20_000,
+            80_000,  // cache_read_tokens
+            10_000,  // cache_creation_tokens
         );
 
         assert!(result.success);
@@ -293,6 +305,8 @@ mod tests {
         assert_eq!(result.recovery_message, "Recovery content");
         assert_eq!(result.pre_compact_tokens, 100_000);
         assert_eq!(result.post_compact_tokens, 20_000);
+        assert_eq!(result.cache_read_tokens, 80_000);
+        assert_eq!(result.cache_creation_tokens, 10_000);
     }
 
     #[test]
@@ -302,6 +316,8 @@ mod tests {
             "Recovery".to_string(),
             100,
             50,
+            80,
+            10,
         );
 
         let message = result.to_compact_message();
