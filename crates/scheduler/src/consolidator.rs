@@ -295,7 +295,7 @@ impl DreamConsolidator {
             Ok(()) => {
                 // 记录 Layer 6 dream_finished 事件（成功，传递实际统计数据）
                 memory_event!(
-                    layer6, dream_finished_with_sessions,
+                    layer6, dream_finished,
                     stats.memories_created,
                     stats.memories_updated,
                     stats.memories_deleted,
@@ -961,30 +961,41 @@ impl DreamConsolidator {
         let mut total_bytes = 0u64;
         let mut file_mtimes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
 
-        if !fs::try_exists(memory_dir).await.unwrap_or(false) {
-            return MemoryDirState::default();
+        match fs::try_exists(memory_dir).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(path = %memory_dir.display(), "Memory directory does not exist");
+                return MemoryDirState::default();
+            }
+            Err(e) => {
+                tracing::debug!(path = %memory_dir.display(), error = %e, "Failed to check memory directory existence");
+                return MemoryDirState::default();
+            }
         }
 
-        let Ok(mut entries) = fs::read_dir(memory_dir).await else {
-            return MemoryDirState::default();
-        };
-
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if path.extension().map(|e| e == "md").unwrap_or(false) {
-                file_count += 1;
-                if let Ok(metadata) = fs::metadata(&path).await {
-                    total_bytes += metadata.len();
-                    if let Ok(modified) = metadata.modified() {
-                        let mtime = modified
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            file_mtimes.insert(name.to_string(), mtime);
+        match fs::read_dir(memory_dir).await {
+            Ok(mut entries) => {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let path = entry.path();
+                    if path.extension().map(|e| e == "md").unwrap_or(false) {
+                        file_count += 1;
+                        if let Ok(metadata) = fs::metadata(&path).await {
+                            total_bytes += metadata.len();
+                            if let Ok(modified) = metadata.modified() {
+                                let mtime = modified
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                    file_mtimes.insert(name.to_string(), mtime);
+                                }
+                            }
                         }
                     }
                 }
+            }
+            Err(e) => {
+                tracing::debug!(path = %memory_dir.display(), error = %e, "Failed to read memory directory");
             }
         }
 

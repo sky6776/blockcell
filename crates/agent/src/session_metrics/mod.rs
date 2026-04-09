@@ -402,27 +402,8 @@ macro_rules! memory_event {
         $crate::session_metrics::get_memory_metrics().layer6.record_dream_started();
     };
 
-    (layer6, dream_finished, $created:expr, $updated:expr, $deleted:expr, $pruned:expr) => {
-        tracing::info!(
-            target: "blockcell.session_metrics.layer6",
-            event = "dream_finished",
-            memories_created = $created,
-            memories_updated = $updated,
-            memories_deleted = $deleted,
-            sessions_pruned = $pruned,
-            "Dream consolidation completed"
-        );
-        $crate::session_metrics::get_memory_metrics().layer6.record_dream_finished(
-            $created as u64,
-            $updated as u64,
-            $deleted as u64,
-            $pruned as u64,
-            0 // sessions_processed - deprecated, use new macro
-        );
-    };
-
-    // Layer 6: dream_finished with sessions
-    (layer6, dream_finished_with_sessions, $created:expr, $updated:expr, $deleted:expr, $pruned:expr, $sessions:expr) => {
+    // Layer 6: dream_finished (includes sessions_processed)
+    (layer6, dream_finished, $created:expr, $updated:expr, $deleted:expr, $pruned:expr, $sessions:expr) => {
         tracing::info!(
             target: "blockcell.session_metrics.layer6",
             event = "dream_finished",
@@ -674,13 +655,14 @@ mod tests {
         metrics.layer6.reset();
 
         memory_event!(layer6, dream_started, 10, 24);
-        memory_event!(layer6, dream_finished, 5, 3, 1, 2);
+        memory_event!(layer6, dream_finished, 5, 3, 1, 2, 10);
 
         assert_eq!(metrics.layer6.dream_count(), 1);
         assert_eq!(metrics.layer6.memories_created(), 5);
         assert_eq!(metrics.layer6.memories_updated(), 3);
         assert_eq!(metrics.layer6.memories_deleted(), 1);
         assert_eq!(metrics.layer6.sessions_pruned(), 2);
+        assert_eq!(metrics.layer6.sessions_processed(), 10);
     }
 
     #[test]
