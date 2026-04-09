@@ -54,9 +54,11 @@ pub struct DreamStats {
 /// Memory 目录状态快照
 #[derive(Debug, Clone, Default)]
 struct MemoryDirState {
-    /// 文件数量
+    /// 文件数量 (保留用于未来日志/指标)
+    #[allow(dead_code)]
     file_count: usize,
-    /// 总字节数
+    /// 总字节数 (保留用于未来日志/指标)
+    #[allow(dead_code)]
     total_bytes: u64,
     /// 文件名 -> 修改时间映射
     file_mtimes: std::collections::HashMap<String, u64>,
