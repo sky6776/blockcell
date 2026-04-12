@@ -6,6 +6,7 @@ pub mod dispatcher;
 pub mod engine;
 pub mod evolution;
 pub mod manager;
+pub mod openclaw_parser;
 pub mod service;
 pub mod versioning;
 
@@ -22,7 +23,10 @@ pub use engine::{EngineConfig, ExecutionResult, RhaiEngine, SkillExecutor};
 pub use evolution::{
     EvolutionContext, LLMProvider, SkillEvolution, SkillLayout, SkillType, TriggerReason,
 };
-pub use manager::{Skill, SkillCard, SkillManager, SkillMeta, SkillTestFixture};
+pub use manager::{
+    Skill, SkillCard, SkillCommandSpec, SkillInstallSpec, SkillManager, SkillMeta, SkillSource,
+    SkillTestFixture,
+};
 pub use service::{
     is_builtin_tool, CapabilityErrorReport, ErrorReport, EvolutionService, EvolutionServiceConfig,
     SkillRecordSummary,

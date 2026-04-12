@@ -1,6 +1,7 @@
 use crate::auto_memory::MemoryInjector;
 use blockcell_core::types::ChatMessage;
 use blockcell_core::{Config, Paths};
+use blockcell_skills::manager::SkillSource;
 use blockcell_skills::{EvolutionService, EvolutionServiceConfig, LLMProvider, SkillManager};
 use blockcell_tools::MemoryStoreHandle;
 use std::collections::HashSet;
@@ -21,6 +22,8 @@ pub struct ActiveSkillContext {
     pub inject_prompt_md: bool,
     pub tools: Vec<String>,
     pub fallback_message: Option<String>,
+    /// 技能来源，用于运行时区分（如自进化屏蔽）
+    pub source: SkillSource,
 }
 
 pub struct ContextBuilder {
@@ -39,6 +42,7 @@ impl ContextBuilder {
         let mut skill_manager = SkillManager::new()
             .with_versioning(skills_dir.clone())
             .with_evolution(skills_dir, EvolutionServiceConfig::default());
+        skill_manager.set_openclaw_skill_enabled(_config.openclaw_skill_enabled);
         let _ = skill_manager.load_from_paths(&paths);
 
         Self {
@@ -185,6 +189,7 @@ impl ContextBuilder {
                 .fallback
                 .as_ref()
                 .and_then(|fallback| fallback.message.clone()),
+            source: skill.meta.source.clone(),
         })
     }
 
@@ -742,6 +747,7 @@ description: deploy demo
             inject_prompt_md: false,
             tools: vec!["finance_api".to_string()],
             fallback_message: Some("fallback".to_string()),
+            source: blockcell_skills::manager::SkillSource::BlockCell,
         };
 
         let prompt = builder.build_system_prompt_for_mode_with_channel(

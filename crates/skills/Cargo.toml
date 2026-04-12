@@ -17,3 +17,4 @@ async-trait = { workspace = true }
 md5 = "0.7"
 tar = "0.4"
 flate2 = "1.0"
+shellexpand = "3"

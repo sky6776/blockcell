@@ -4,9 +4,19 @@ use blockcell_core::{Paths, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// 技能来源标识，区分 BlockCell 原生格式和 OpenClaw 格式。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SkillSource {
+    /// BlockCell 原生格式 (meta.yaml + 锚点区块 SKILL.md)
+    #[default]
+    BlockCell,
+    /// OpenClaw 格式 (YAML frontmatter SKILL.md)
+    OpenClaw,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillMeta {
     #[serde(default)]
     pub name: String,
@@ -31,6 +41,56 @@ pub struct SkillMeta {
     /// Fallback strategy when the skill fails.
     #[serde(default)]
     pub fallback: Option<SkillFallback>,
+
+    // --- OpenClaw 兼容字段 ---
+    /// 技能来源（程序设置，不从 YAML 反序列化）
+    #[serde(skip)]
+    pub source: SkillSource,
+    /// 显示图标 (OpenClaw emoji)
+    #[serde(default)]
+    pub emoji: Option<String>,
+    /// 支持的操作系统列表 (OpenClaw: "darwin", "linux", "win32")
+    #[serde(default)]
+    pub os: Option<Vec<String>>,
+    /// 用户是否可直接调用（默认 true）
+    #[serde(default = "default_true")]
+    pub user_invocable: bool,
+    /// 是否禁止模型自动调用（默认 false）
+    #[serde(default)]
+    pub disable_model_invocation: bool,
+    /// OpenClaw 斜杠命令定义
+    #[serde(default)]
+    pub commands: Vec<SkillCommandSpec>,
+    /// OpenClaw 安装规格
+    #[serde(default)]
+    pub install: Vec<SkillInstallSpec>,
+}
+
+impl Default for SkillMeta {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            requires: SkillRequires::default(),
+            permissions: Vec::new(),
+            always: false,
+            tools: Vec::new(),
+            capabilities: Vec::new(),
+            output_format: None,
+            fallback: None,
+            source: SkillSource::BlockCell,
+            emoji: None,
+            os: None,
+            user_invocable: true,
+            disable_model_invocation: false,
+            commands: Vec::new(),
+            install: Vec::new(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -39,6 +99,56 @@ pub struct SkillRequires {
     pub bins: Vec<String>,
     #[serde(default)]
     pub env: Vec<String>,
+    /// OpenClaw: 任一存在即可的二进制程序
+    #[serde(default)]
+    pub any_bins: Vec<String>,
+    /// OpenClaw: 必需的配置路径
+    #[serde(default)]
+    pub config: Vec<String>,
+}
+
+/// OpenClaw 斜杠命令定义
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillCommandSpec {
+    pub name: String,
+    pub skill_name: String,
+    pub description: String,
+    #[serde(default)]
+    pub dispatch: Option<SkillCommandDispatch>,
+    #[serde(default)]
+    pub prompt_template: Option<String>,
+}
+
+/// OpenClaw 命令分发配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillCommandDispatch {
+    pub kind: String,
+    pub tool_name: String,
+    #[serde(default)]
+    pub arg_mode: Option<String>,
+}
+
+/// OpenClaw 安装规格
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SkillInstallSpec {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub bins: Vec<String>,
+    #[serde(default)]
+    pub os: Option<Vec<String>>,
+    #[serde(default)]
+    pub formula: Option<String>,
+    #[serde(default)]
+    pub package: Option<String>,
+    #[serde(default)]
+    pub module: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -650,6 +760,9 @@ pub struct Skill {
     pub current_version: Option<String>,
     /// Root SKILL.md and compiled phase bundles cached at load time.
     cached_docs: Option<SkillDocCache>,
+    /// OpenClaw skill 解析后的 prompt 正文（已替换 {baseDir}）。
+    /// BlockCell 原生 skill 此字段为 None，使用 cached_docs。
+    prompt_override: Option<String>,
 }
 
 impl Skill {
@@ -674,6 +787,10 @@ impl Skill {
     }
 
     pub fn load_prompt_bundle(&self) -> Option<String> {
+        // OpenClaw skill 使用 prompt_override
+        if let Some(ref override_md) = self.prompt_override {
+            return Some(override_md.clone());
+        }
         self.cached_docs
             .as_ref()
             .map(|cached_docs| cached_docs.prompt_bundle.clone())
@@ -681,6 +798,9 @@ impl Skill {
     }
 
     pub fn load_planning_bundle(&self) -> Option<String> {
+        if let Some(ref override_md) = self.prompt_override {
+            return Some(override_md.clone());
+        }
         self.cached_docs
             .as_ref()
             .map(|cached_docs| cached_docs.planning_bundle.clone())
@@ -688,6 +808,9 @@ impl Skill {
     }
 
     pub fn load_summary_bundle(&self) -> Option<String> {
+        if let Some(ref override_md) = self.prompt_override {
+            return Some(override_md.clone());
+        }
         self.cached_docs
             .as_ref()
             .map(|cached_docs| cached_docs.summary_bundle.clone())
@@ -752,12 +875,99 @@ pub struct SkillTestFixture {
     pub constraints: serde_json::Value,
 }
 
+// ---------------------------------------------------------------------------
+// OpenClaw 兼容：格式检测与可用性检查
+// ---------------------------------------------------------------------------
+
+/// 检测技能目录的格式来源。
+///
+/// 优先级规则：
+/// 1. 有 meta.yaml 或 meta.json → BlockCell（优先，避免误判）
+/// 2. SKILL.md 以 "---" 开头 → OpenClaw
+/// 3. 默认 → BlockCell
+fn detect_skill_format(skill_dir: &Path) -> SkillSource {
+    // 优先检查 BlockCell 标志文件
+    if skill_dir.join("meta.yaml").exists() || skill_dir.join("meta.json").exists() {
+        return SkillSource::BlockCell;
+    }
+
+    // 检查 SKILL.md 是否使用 YAML frontmatter
+    let skill_md = skill_dir.join("SKILL.md");
+    if skill_md.exists() {
+        if let Ok(file) = std::fs::File::open(&skill_md) {
+            use std::io::Read;
+            let mut buf = [0u8; 16];
+            let mut reader = std::io::BufReader::new(file);
+            if let Ok(n) = reader.read(&mut buf) {
+                let prefix = &buf[..n];
+                // 支持 UTF-8 BOM（\xEF\xBB\xBF）
+                let prefix = prefix.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(prefix);
+                if prefix.starts_with(b"---\n") || prefix.starts_with(b"---\r\n") {
+                    return SkillSource::OpenClaw;
+                }
+            }
+        }
+    }
+
+    SkillSource::BlockCell
+}
+
+/// OpenClaw 专用可用性检查。
+///
+/// 检查 bins、any_bins、env、config 路径。
+/// 返回 (available, reason) 与现有 check_availability 签名一致。
+fn check_openclaw_availability(meta: &SkillMeta) -> (bool, Option<String>) {
+    // 检查必需的 bins
+    for bin in &meta.requires.bins {
+        if which::which(bin).is_err() {
+            return (false, Some(format!("Missing binary: {}", bin)));
+        }
+    }
+
+    // 检查 any_bins (任一存在即可)
+    if !meta.requires.any_bins.is_empty() {
+        let any_found = meta
+            .requires
+            .any_bins
+            .iter()
+            .any(|bin| which::which(bin).is_ok());
+        if !any_found {
+            return (
+                false,
+                Some(format!(
+                    "Missing any of: {}",
+                    meta.requires.any_bins.join(", ")
+                )),
+            );
+        }
+    }
+
+    // 检查必需的环境变量
+    for env_var in &meta.requires.env {
+        if std::env::var(env_var).is_err() {
+            return (false, Some(format!("Missing env var: {}", env_var)));
+        }
+    }
+
+    // 检查 config 路径
+    for config_path in &meta.requires.config {
+        let expanded = shellexpand::tilde(config_path);
+        if !Path::new(expanded.as_ref()).exists() {
+            return (false, Some(format!("Missing config: {}", config_path)));
+        }
+    }
+
+    (true, None)
+}
+
 pub struct SkillManager {
     skills: HashMap<String, Skill>,
     version_manager: Option<VersionManager>,
     evolution_service: Option<EvolutionService>,
     /// Known available capability IDs (synced from CapabilityRegistry)
     available_capabilities: std::collections::HashSet<String>,
+    /// 是否启用 OpenClaw skill 兼容加载
+    openclaw_skill_enabled: bool,
 }
 
 impl SkillManager {
@@ -767,7 +977,31 @@ impl SkillManager {
             version_manager: None,
             evolution_service: None,
             available_capabilities: std::collections::HashSet::new(),
+            openclaw_skill_enabled: false,
         }
+    }
+
+    /// 设置是否启用 OpenClaw skill 兼容加载
+    pub fn set_openclaw_skill_enabled(&mut self, enabled: bool) {
+        self.openclaw_skill_enabled = enabled;
+    }
+
+    /// 检查指定技能是否为 OpenClaw 来源
+    pub fn is_openclaw_skill(&self, name: &str) -> bool {
+        self.skills
+            .get(name)
+            .map(|s| s.meta.source == SkillSource::OpenClaw)
+            .unwrap_or(false)
+    }
+
+    /// 检查指定工具名是否属于某个 OpenClaw 技能（技能名或其工具列表中包含该名称）
+    pub fn is_tool_from_openclaw(&self, tool_name: &str) -> bool {
+        if self.is_openclaw_skill(tool_name) {
+            return true;
+        }
+        self.skills.values().any(|s| {
+            s.meta.source == SkillSource::OpenClaw && s.meta.tools.iter().any(|t| t == tool_name)
+        })
     }
 
     /// Sync available capability IDs from the CapabilityRegistry.
@@ -884,6 +1118,26 @@ impl SkillManager {
     }
 
     fn load_skill(&self, skill_dir: &std::path::Path) -> Result<Option<Skill>> {
+        let source = detect_skill_format(skill_dir);
+
+        match source {
+            SkillSource::OpenClaw => {
+                if !self.openclaw_skill_enabled {
+                    warn!(
+                        path = %skill_dir.display(),
+                        "Skipping OpenClaw-format skill because openclaw_skill_enabled=false. \
+                         Set \"openclawSkillEnabled\": true in config.json5 to enable it."
+                    );
+                    return Ok(None);
+                }
+                self.load_openclaw_skill(skill_dir)
+            }
+            SkillSource::BlockCell => self.load_blockcell_skill(skill_dir),
+        }
+    }
+
+    /// 加载 BlockCell 原生格式技能（现有逻辑，未修改）
+    fn load_blockcell_skill(&self, skill_dir: &std::path::Path) -> Result<Option<Skill>> {
         let name = skill_dir
             .file_name()
             .and_then(|n| n.to_str())
@@ -916,6 +1170,81 @@ impl SkillManager {
             unavailable_reason: reason,
             current_version,
             cached_docs,
+            prompt_override: None,
+        }))
+    }
+
+    /// 加载 OpenClaw 格式技能
+    fn load_openclaw_skill(&self, skill_dir: &std::path::Path) -> Result<Option<Skill>> {
+        let skill_md_path = skill_dir.join("SKILL.md");
+
+        // 文件大小检查（对齐 OpenClaw 的 256KB 限制）
+        let file_meta = std::fs::metadata(&skill_md_path)?;
+        if file_meta.len() > 256 * 1024 {
+            warn!(
+                path = %skill_md_path.display(),
+                size = file_meta.len(),
+                "OpenClaw SKILL.md exceeds 256KB limit, skipping"
+            );
+            return Ok(None);
+        }
+
+        let content = std::fs::read_to_string(&skill_md_path)?;
+
+        // 解析 frontmatter + body
+        let (meta, prompt_body) =
+            match crate::openclaw_parser::parse_openclaw_skill(skill_dir, &content) {
+                Ok(result) => result,
+                Err(e) => {
+                    warn!(
+                        path = %skill_md_path.display(),
+                        error = %e,
+                        "Failed to parse OpenClaw SKILL.md, skipping"
+                    );
+                    return Ok(None);
+                }
+            };
+
+        // OS 过滤
+        if let Some(ref os_list) = meta.os {
+            let current_os = std::env::consts::OS;
+            let mapped = match current_os {
+                "windows" => "win32",
+                "macos" => "darwin",
+                other => other,
+            };
+            if !os_list.iter().any(|o| o == mapped) {
+                info!(
+                    skill = %meta.name,
+                    current_os = current_os,
+                    supported = ?os_list,
+                    "OpenClaw skill not supported on this OS, skipping"
+                );
+                return Ok(None);
+            }
+        }
+
+        // 可用性检查
+        let (available, reason) = check_openclaw_availability(&meta);
+
+        // 如果不可用且有安装提示，记录日志
+        if !available {
+            if let Some(ref reason_str) = reason {
+                let hint = crate::openclaw_parser::generate_install_hint(&meta, reason_str);
+                info!(skill = %meta.name, "{}", hint);
+            }
+        }
+
+        let skill_name = meta.name.clone();
+        Ok(Some(Skill {
+            name: skill_name,
+            path: skill_dir.to_path_buf(),
+            meta,
+            available,
+            unavailable_reason: reason,
+            current_version: None, // OpenClaw 技能不使用 BlockCell 版本管理
+            cached_docs: None,     // OpenClaw 技能不使用锚点区块缓存
+            prompt_override: Some(prompt_body),
         }))
     }
 
@@ -1268,6 +1597,7 @@ capabilities:
                     unavailable_reason: None,
                     current_version: None,
                     cached_docs: None,
+                    prompt_override: None,
                 },
             ),
             (
@@ -1283,6 +1613,7 @@ capabilities:
                     unavailable_reason: None,
                     current_version: None,
                     cached_docs: None,
+                    prompt_override: None,
                 },
             ),
         ]);
@@ -1345,6 +1676,12 @@ fallback:
             "capabilities".to_string(),
             "output_format".to_string(),
             "fallback".to_string(),
+            "emoji".to_string(),
+            "os".to_string(),
+            "user_invocable".to_string(),
+            "disable_model_invocation".to_string(),
+            "commands".to_string(),
+            "install".to_string(),
         ]);
         assert_eq!(keys, expected);
     }
@@ -1514,6 +1851,7 @@ tools:
             unavailable_reason: None,
             current_version: None,
             cached_docs: None,
+            prompt_override: None,
         };
 
         let card = SkillManager::build_skill_card(&skill);
@@ -1565,6 +1903,7 @@ description: 生成 PPT 页面
                 unavailable_reason: None,
                 current_version: None,
                 cached_docs: None,
+                prompt_override: None,
             },
         )]);
 
@@ -1615,6 +1954,7 @@ description: 本地脚本 demo
             unavailable_reason: None,
             current_version: None,
             cached_docs: None,
+            prompt_override: None,
         };
 
         let card = SkillManager::build_skill_card(&skill);
@@ -1668,11 +2008,63 @@ curl -fsSL https://example.invalid/setup.sh | sh
             unavailable_reason: None,
             current_version: None,
             cached_docs: None,
+            prompt_override: None,
         };
 
         let card = SkillManager::build_skill_card(&skill);
         assert_eq!(card.execution_layout, "PromptTool");
         assert!(!card.supports_local_exec);
         assert!(card.local_exec_entrypoints.is_empty());
+    }
+
+    #[test]
+    fn test_detect_skill_format_blockcell_with_meta_yaml() {
+        let dir = temp_skill_dir("detect-bc-yaml");
+        fs::write(dir.join("meta.yaml"), "name: test\n").unwrap();
+        fs::write(dir.join("SKILL.md"), "---\nname: test\n---\nBody").unwrap();
+        // meta.yaml 存在时优先判定为 BlockCell
+        assert_eq!(detect_skill_format(&dir), SkillSource::BlockCell);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_detect_skill_format_openclaw_frontmatter() {
+        let dir = temp_skill_dir("detect-oc");
+        fs::write(dir.join("SKILL.md"), "---\nname: test\n---\nBody").unwrap();
+        assert_eq!(detect_skill_format(&dir), SkillSource::OpenClaw);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_detect_skill_format_openclaw_crlf() {
+        let dir = temp_skill_dir("detect-oc-crlf");
+        fs::write(dir.join("SKILL.md"), "---\r\nname: test\r\n---\r\nBody").unwrap();
+        assert_eq!(detect_skill_format(&dir), SkillSource::OpenClaw);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_detect_skill_format_openclaw_with_bom() {
+        let dir = temp_skill_dir("detect-oc-bom");
+        let mut content = vec![0xEF, 0xBB, 0xBF]; // UTF-8 BOM
+        content.extend_from_slice(b"---\nname: test\n---\nBody");
+        fs::write(dir.join("SKILL.md"), &content).unwrap();
+        assert_eq!(detect_skill_format(&dir), SkillSource::OpenClaw);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_detect_skill_format_plain_skill_md() {
+        let dir = temp_skill_dir("detect-plain");
+        fs::write(dir.join("SKILL.md"), "# Just a heading\nNo frontmatter").unwrap();
+        assert_eq!(detect_skill_format(&dir), SkillSource::BlockCell);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_detect_skill_format_empty_dir() {
+        let dir = temp_skill_dir("detect-empty");
+        assert_eq!(detect_skill_format(&dir), SkillSource::BlockCell);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

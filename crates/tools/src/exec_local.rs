@@ -11,7 +11,8 @@ use crate::{Tool, ToolContext, ToolSchema};
 
 pub struct ExecLocalTool;
 
-pub(crate) const ALLOWED_RUNNERS: &[&str] = &["python3", "bash", "sh", "node", "php"];
+pub(crate) const ALLOWED_RUNNERS: &[&str] =
+    &["python3", "python", "bash", "sh", "node", "php", "uv"];
 
 pub(crate) fn validate_relative_skill_path(path: &str) -> Result<()> {
     let trimmed = path.trim();
@@ -51,6 +52,22 @@ pub(crate) fn validate_runner(runner: &str) -> Result<()> {
     }
 }
 
+/// Infer an appropriate runner from the script file extension when none is specified.
+/// Returns `None` if the extension is unknown (caller should attempt direct execution).
+pub(crate) fn infer_runner_from_extension(path: &str) -> Option<&'static str> {
+    if path.ends_with(".py") {
+        Some("python3")
+    } else if path.ends_with(".sh") {
+        Some("sh")
+    } else if path.ends_with(".js") || path.ends_with(".mjs") {
+        Some("node")
+    } else if path.ends_with(".php") {
+        Some("php")
+    } else {
+        None
+    }
+}
+
 pub(crate) fn truncate_output(text: String, max_chars: usize, suffix: &str) -> String {
     if text.chars().count() <= max_chars {
         return text;
@@ -84,17 +101,17 @@ impl Tool for ExecLocalTool {
         ToolSchema {
             name: "exec_local",
             description:
-                "Execute a local script or executable inside the active skill directory only.",
+                "Execute a local script or executable inside the active skill directory only. The `path` must be RELATIVE (e.g. `scripts/run.py`), never absolute. If the skill manual shows `{baseDir}/scripts/...`, strip the `{baseDir}/` prefix and pass only the relative portion.",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path to the script or executable inside the active skill directory."
+                        "description": "RELATIVE path to the script inside the active skill directory (e.g. `scripts/run.py`). Must NOT be absolute. The tool auto-infers the interpreter from the file extension (.py→python3, .sh→sh, .js→node)."
                     },
                     "runner": {
                         "type": "string",
-                        "description": "Optional interpreter or runner. Allowed: python3, bash, sh, node, php."
+                        "description": "Optional interpreter override. Allowed: python3, python, bash, sh, node, php, uv. Auto-inferred from extension when omitted."
                     },
                     "args": {
                         "type": "array",
@@ -146,18 +163,26 @@ impl Tool for ExecLocalTool {
 
     async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
         let skill_dir = ctx.active_skill_dir.ok_or_else(|| {
-            Error::PermissionDenied(
-                "`exec_local` is only available inside an active skill execution scope".to_string(),
+            // Use Tool error (not PermissionDenied) to avoid Permanent classification.
+            // Hint tells the LLM to use activate_skill first.
+            Error::Tool(
+                "exec_local requires an active skill context. \
+                Use the `activate_skill` tool first, e.g. \
+                activate_skill({skill_name: \"<skill-name>\", goal: \"<goal>\"})"
+                    .to_string(),
             )
         })?;
         let relative_path = params["path"]
             .as_str()
             .ok_or_else(|| Error::Validation("Missing required parameter: path".to_string()))?;
         let resolved_path = resolve_script_path(&skill_dir, relative_path)?;
-        let runner = params.get("runner").and_then(|value| value.as_str());
-        if let Some(runner) = runner {
+        let explicit_runner = params.get("runner").and_then(|value| value.as_str());
+        if let Some(runner) = explicit_runner {
             validate_runner(runner)?;
         }
+        // Auto-infer runner from file extension when not explicitly specified (Windows compat)
+        let effective_runner =
+            explicit_runner.or_else(|| infer_runner_from_extension(relative_path));
         let args = params
             .get("args")
             .and_then(|value| value.as_array())
@@ -184,7 +209,7 @@ impl Tool for ExecLocalTool {
         let timeout_secs = ctx.config.tools.exec.timeout as u64;
         let max_output_chars = 10_000usize;
 
-        let mut command = if let Some(runner) = runner {
+        let mut command = if let Some(runner) = effective_runner {
             let mut command = Command::new(runner);
             command.arg(&resolved_path);
             command
@@ -196,7 +221,9 @@ impl Tool for ExecLocalTool {
             .current_dir(&skill_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .env("PYTHONIOENCODING", "utf-8")
+            .env("PYTHONUNBUFFERED", "1");
 
         let output = timeout(Duration::from_secs(timeout_secs), command.output())
             .await
@@ -220,11 +247,11 @@ impl Tool for ExecLocalTool {
         );
 
         let command_parts = std::iter::once(
-            runner
+            effective_runner
                 .map(str::to_string)
                 .unwrap_or_else(|| resolved_path.display().to_string()),
         )
-        .chain(if runner.is_some() {
+        .chain(if effective_runner.is_some() {
             Some(resolved_path.display().to_string())
         } else {
             None
