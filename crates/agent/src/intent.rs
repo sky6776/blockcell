@@ -4,6 +4,7 @@ use blockcell_tools::ToolRegistry;
 use regex::Regex;
 use std::collections::HashSet;
 use std::sync::OnceLock;
+use tracing::warn;
 
 /// Intent categories for user messages.
 /// Used to determine which tools, rules, and domain knowledge to load.
@@ -562,6 +563,11 @@ impl<'a> IntentToolResolver<'a> {
                         for tool in &profile.deny_tools {
                             result.retain(|t| t != tool);
                         }
+                    } else {
+                        warn!(
+                            profile_id = %profile_id,
+                            "Profile not found in load_all_tools mode, deny_tools filtering skipped"
+                        );
                     }
                     result.sort();
                     return Some(result);
@@ -1434,5 +1440,243 @@ mod tests {
         assert_eq!(tools.len(), 2);
         assert!(tools.contains(&"read_file".to_string()));
         assert!(tools.contains(&"edit_file".to_string()));
+    }
+
+    #[test]
+    fn test_load_all_tools_without_available_tools_returns_none() {
+        // 当 enabled=false, load_all_tools=true, available_tools=None 时，应返回 None
+        // 因为代码检查 if let Some(available) = available_tools
+        let raw = r#"{
+            "intentRouter": {
+                "enabled": false,
+                "loadAllTools": true,
+                "defaultProfile": "default",
+                "profiles": {
+                    "default": {
+                        "coreTools": [],
+                        "intentTools": {
+                            "Chat": { "inheritBase": false, "tools": [] },
+                            "Unknown": []
+                        },
+                        "denyTools": []
+                    }
+                }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(raw).unwrap();
+        let resolver = IntentToolResolver::new(&config);
+
+        // available_tools=None 应返回 None，然后走原有逻辑
+        let tools = resolver.resolve_tool_names(None, &[IntentCategory::Unknown], None);
+        // 应走 Unknown profile 原有逻辑返回工具
+        assert!(tools.is_some());
+    }
+
+    #[test]
+    fn test_load_all_tools_empty_available_returns_empty() {
+        // 当 available_tools 为空集合时，应返回空 Vec
+        let raw = r#"{
+            "intentRouter": {
+                "enabled": false,
+                "loadAllTools": true,
+                "defaultProfile": "default",
+                "profiles": {
+                    "default": {
+                        "coreTools": [],
+                        "intentTools": {
+                            "Chat": { "inheritBase": false, "tools": [] },
+                            "Unknown": []
+                        },
+                        "denyTools": []
+                    }
+                }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(raw).unwrap();
+        let resolver = IntentToolResolver::new(&config);
+
+        let available: HashSet<String> = HashSet::new();
+        let tools = resolver
+            .resolve_tool_names(None, &[IntentCategory::Unknown], Some(&available))
+            .expect("should resolve tools");
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn test_load_all_tools_multiple_deny_tools() {
+        // 当有多个 deny_tools 时，都应被过滤
+        let raw = r#"{
+            "intentRouter": {
+                "enabled": false,
+                "loadAllTools": true,
+                "defaultProfile": "default",
+                "profiles": {
+                    "default": {
+                        "coreTools": [],
+                        "intentTools": {
+                            "Chat": { "inheritBase": false, "tools": [] },
+                            "Unknown": []
+                        },
+                        "denyTools": ["exec", "delete_file", "shell"]
+                    }
+                }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(raw).unwrap();
+        let resolver = IntentToolResolver::new(&config);
+
+        let available: HashSet<String> =
+            ["read_file", "write_file", "exec", "delete_file", "shell", "web_search"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let tools = resolver
+            .resolve_tool_names(None, &[IntentCategory::Unknown], Some(&available))
+            .expect("should resolve tools");
+
+        // 3 个工具被 deny，剩余 3 个
+        assert_eq!(tools.len(), 3);
+        assert!(tools.contains(&"read_file".to_string()));
+        assert!(tools.contains(&"write_file".to_string()));
+        assert!(tools.contains(&"web_search".to_string()));
+        assert!(!tools.contains(&"exec".to_string()));
+        assert!(!tools.contains(&"delete_file".to_string()));
+        assert!(!tools.contains(&"shell".to_string()));
+    }
+
+    #[test]
+    fn test_load_all_tools_missing_profile_skips_deny_but_returns_all() {
+        // 当 defaultProfile 不存在于 profiles 时：
+        // - resolve_intent_profile_id 返回 Some("nonexistent")
+        // - router.profiles.get("nonexistent") 返回 None
+        // - 代码跳过 deny_tools 过滤（并打印警告）
+        // - 但仍返回所有可用工具
+        let raw = r#"{
+            "intentRouter": {
+                "enabled": false,
+                "loadAllTools": true,
+                "defaultProfile": "nonexistent",
+                "profiles": {
+                    "other": {
+                        "coreTools": [],
+                        "intentTools": {
+                            "Chat": { "inheritBase": false, "tools": [] },
+                            "Unknown": []
+                        },
+                        "denyTools": ["exec"]
+                    }
+                }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(raw).unwrap();
+        let resolver = IntentToolResolver::new(&config);
+
+        let available: HashSet<String> =
+            ["read_file", "exec", "web_search"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+
+        // resolve_intent_profile_id(None) 返回 defaultProfile="nonexistent"
+        // profiles.get("nonexistent") 返回 None，跳过 deny_tools 过滤，但仍返回所有工具
+        let tools = resolver
+            .resolve_tool_names(None, &[IntentCategory::Unknown], Some(&available))
+            .expect("should return all tools even when profile missing");
+
+        // 因为 profile 不存在，deny_tools 未过滤，返回所有 3 个工具
+        assert_eq!(tools.len(), 3);
+        assert!(tools.contains(&"read_file".to_string()));
+        assert!(tools.contains(&"exec".to_string()));
+        assert!(tools.contains(&"web_search".to_string()));
+    }
+
+    #[test]
+    fn test_load_all_tools_uses_defaults_intent_profile() {
+        // 当使用 agents.defaults.intentProfile 指向有效 profile 时，deny_tools 应生效
+        // 但注意：resolve_intent_profile_id(None) 返回 defaultProfile，不是 defaults.intentProfile
+        // 要使用 defaults.intentProfile，需要设置 defaultProfile 为该值
+        let raw = r#"{
+            "intentRouter": {
+                "enabled": false,
+                "loadAllTools": true,
+                "defaultProfile": "other",
+                "profiles": {
+                    "other": {
+                        "coreTools": [],
+                        "intentTools": {
+                            "Chat": { "inheritBase": false, "tools": [] },
+                            "Unknown": []
+                        },
+                        "denyTools": ["exec"]
+                    }
+                }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(raw).unwrap();
+        let resolver = IntentToolResolver::new(&config);
+
+        let available: HashSet<String> =
+            ["read_file", "exec", "web_search"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+
+        // resolve_intent_profile_id(None) 返回 defaultProfile="other"
+        // profiles.get("other") 找到 profile，应用 deny_tools 过滤
+        let tools = resolver
+            .resolve_tool_names(None, &[IntentCategory::Unknown], Some(&available))
+            .expect("should resolve tools");
+
+        // exec 应被 deny
+        assert_eq!(tools.len(), 2);
+        assert!(tools.contains(&"read_file".to_string()));
+        assert!(tools.contains(&"web_search".to_string()));
+        assert!(!tools.contains(&"exec".to_string()));
+    }
+
+    #[test]
+    fn test_enabled_false_ignores_intent_parameter() {
+        // 当 enabled=false, load_all_tools=true 时，intent 参数不影响结果
+        let raw = r#"{
+            "intentRouter": {
+                "enabled": false,
+                "loadAllTools": true,
+                "defaultProfile": "default",
+                "profiles": {
+                    "default": {
+                        "coreTools": [],
+                        "intentTools": {
+                            "Chat": { "inheritBase": false, "tools": [] },
+                            "Unknown": []
+                        },
+                        "denyTools": []
+                    }
+                }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(raw).unwrap();
+        let resolver = IntentToolResolver::new(&config);
+
+        let available: HashSet<String> =
+            ["read_file", "write_file", "exec"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+
+        // 不同 intent 应返回相同结果
+        let tools_chat = resolver
+            .resolve_tool_names(None, &[IntentCategory::Chat], Some(&available))
+            .expect("should resolve tools");
+        let tools_unknown = resolver
+            .resolve_tool_names(None, &[IntentCategory::Unknown], Some(&available))
+            .expect("should resolve tools");
+        let tools_fileops = resolver
+            .resolve_tool_names(None, &[IntentCategory::FileOps], Some(&available))
+            .expect("should resolve tools");
+
+        // load_all_tools=true 时，所有 intent 都返回相同的全量工具
+        assert_eq!(tools_chat, tools_unknown);
+        assert_eq!(tools_chat, tools_fileops);
+        assert_eq!(tools_chat.len(), 3);
     }
 }

@@ -953,8 +953,24 @@ fn resolve_effective_tool_names(
             .unwrap_or(false);
 
         if load_all {
-            // 全量加载模式：返回所有可用工具
+            // 全量加载模式：返回所有可用工具（扣除 deny_tools）
             let mut tool_names: Vec<String> = available_tools.iter().cloned().collect();
+            // 应用 deny_tools 过滤
+            if let Some(router) = config.intent_router.as_ref() {
+                let profile_id = config.resolve_intent_profile_id(agent_id);
+                if let Some(profile_id) = profile_id {
+                    if let Some(profile) = router.profiles.get(&profile_id) {
+                        for tool in &profile.deny_tools {
+                            tool_names.retain(|name| name != tool);
+                        }
+                    } else {
+                        warn!(
+                            profile_id = %profile_id,
+                            "Profile not found in load_all_tools mode, deny_tools filtering skipped"
+                        );
+                    }
+                }
+            }
             // 应用 napcat 过滤
             if !config.channels.napcat.enabled {
                 tool_names.retain(|name| !name.starts_with("napcat_"));
@@ -8266,5 +8282,196 @@ description: local demo
         assert_eq!(json["chat_id"], "webui-chat-9");
         assert_eq!(json["content"], "第15条内容已经整理完成");
         assert_eq!(json["background_delivery"], true);
+    }
+
+    // resolve_effective_tool_names 测试
+    #[test]
+    fn test_resolve_effective_tool_names_load_all_applies_deny_tools() {
+        // 当 enabled=false 且 load_all_tools=true 时，应应用 deny_tools 过滤
+        let raw = r#"{
+            "intentRouter": {
+                "enabled": false,
+                "loadAllTools": true,
+                "defaultProfile": "default",
+                "profiles": {
+                    "default": {
+                        "coreTools": [],
+                        "intentTools": {
+                            "Chat": { "inheritBase": false, "tools": [] },
+                            "Unknown": []
+                        },
+                        "denyTools": ["exec"]
+                    }
+                }
+            },
+            "channels": {
+                "napcat": { "enabled": false }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(raw).unwrap();
+        let available: HashSet<String> =
+            ["read_file", "write_file", "exec", "web_search", "napcat_send"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let tools = resolve_effective_tool_names(
+            &config,
+            InteractionMode::General,
+            None,
+            None,
+            &[IntentCategory::Unknown],
+            &available,
+        );
+
+        // exec 被 deny_tools 过滤，napcat_send 被 napcat.enabled=false 过滤
+        assert_eq!(tools.len(), 3);
+        assert!(tools.contains(&"read_file".to_string()));
+        assert!(tools.contains(&"write_file".to_string()));
+        assert!(tools.contains(&"web_search".to_string()));
+        assert!(!tools.contains(&"exec".to_string()));
+        assert!(!tools.contains(&"napcat_send".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_effective_tool_names_load_all_applies_napcat_filter() {
+        // 当 napcat.enabled=true 时，napcat 工具应可用
+        let raw = r#"{
+            "intentRouter": {
+                "enabled": false,
+                "loadAllTools": true,
+                "defaultProfile": "default",
+                "profiles": {
+                    "default": {
+                        "coreTools": [],
+                        "intentTools": {
+                            "Chat": { "inheritBase": false, "tools": [] },
+                            "Unknown": []
+                        },
+                        "denyTools": []
+                    }
+                }
+            },
+            "channels": {
+                "napcat": { "enabled": true }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(raw).unwrap();
+        let available: HashSet<String> =
+            ["read_file", "napcat_send", "napcat_receive"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let tools = resolve_effective_tool_names(
+            &config,
+            InteractionMode::General,
+            None,
+            None,
+            &[IntentCategory::Unknown],
+            &available,
+        );
+
+        // napcat 工具应可用（enabled=true）
+        assert_eq!(tools.len(), 3);
+        assert!(tools.contains(&"read_file".to_string()));
+        assert!(tools.contains(&"napcat_send".to_string()));
+        assert!(tools.contains(&"napcat_receive".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_effective_tool_names_load_all_extends_skill_tools() {
+        // 当有 active_skill 时，应扩展 skill.tools
+        let raw = r#"{
+            "intentRouter": {
+                "enabled": false,
+                "loadAllTools": true,
+                "defaultProfile": "default",
+                "profiles": {
+                    "default": {
+                        "coreTools": [],
+                        "intentTools": {
+                            "Chat": { "inheritBase": false, "tools": [] },
+                            "Unknown": []
+                        },
+                        "denyTools": []
+                    }
+                }
+            },
+            "channels": {
+                "napcat": { "enabled": false }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(raw).unwrap();
+        let available: HashSet<String> =
+            ["read_file", "write_file"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let skill = ActiveSkillContext {
+            name: "test_skill".to_string(),
+            prompt_md: String::new(),
+            inject_prompt_md: false,
+            tools: vec!["skill_tool_1".to_string(), "skill_tool_2".to_string()],
+            fallback_message: None,
+            source: blockcell_skills::manager::SkillSource::BlockCell,
+        };
+        let tools = resolve_effective_tool_names(
+            &config,
+            InteractionMode::Skill,
+            None,
+            Some(&skill),
+            &[IntentCategory::Unknown],
+            &available,
+        );
+
+        // 应包含 available tools + skill.tools
+        assert_eq!(tools.len(), 4);
+        assert!(tools.contains(&"read_file".to_string()));
+        assert!(tools.contains(&"write_file".to_string()));
+        assert!(tools.contains(&"skill_tool_1".to_string()));
+        assert!(tools.contains(&"skill_tool_2".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_effective_tool_names_enabled_true_uses_intent_classification() {
+        // 当 enabled=true 时，应走意图分类流程，忽略 load_all_tools
+        let raw = r#"{
+            "intentRouter": {
+                "enabled": true,
+                "loadAllTools": true,
+                "defaultProfile": "default",
+                "profiles": {
+                    "default": {
+                        "coreTools": ["read_file"],
+                        "intentTools": {
+                            "Chat": { "inheritBase": false, "tools": [] },
+                            "FileOps": ["edit_file"]
+                        },
+                        "denyTools": []
+                    }
+                }
+            },
+            "channels": {
+                "napcat": { "enabled": false }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(raw).unwrap();
+        let available: HashSet<String> =
+            ["read_file", "edit_file", "exec", "web_search"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+
+        // FileOps 意图应返回 read_file (core) + edit_file (intent)
+        let tools = resolve_effective_tool_names(
+            &config,
+            InteractionMode::General,
+            None,
+            None,
+            &[IntentCategory::FileOps],
+            &available,
+        );
+        assert_eq!(tools.len(), 2);
+        assert!(tools.contains(&"read_file".to_string()));
+        assert!(tools.contains(&"edit_file".to_string()));
     }
 }

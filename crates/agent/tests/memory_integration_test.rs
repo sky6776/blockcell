@@ -58,7 +58,7 @@ mod tests {
     #[test]
     fn test_post_sampling_hook_none() {
         let config = MemorySystemConfig::default();
-        let memory_system = MemorySystem::new(
+        let mut memory_system = MemorySystem::new(
             config,
             PathBuf::from("/tmp/workspace"),
             PathBuf::from("/tmp/config"),
@@ -67,7 +67,7 @@ mod tests {
 
         let messages = vec![ChatMessage::user("Hello"), ChatMessage::assistant("Hi!")];
 
-        let action = evaluate_memory_hooks(&memory_system, &messages, 100);
+        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100);
         assert!(matches!(action, PostSamplingAction::None));
     }
 
@@ -79,7 +79,7 @@ mod tests {
             compact_threshold: 0.8,
             ..Default::default()
         };
-        let memory_system = MemorySystem::new(
+        let mut memory_system = MemorySystem::new(
             config,
             PathBuf::from("/tmp/workspace"),
             PathBuf::from("/tmp/config"),
@@ -87,7 +87,7 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("Test")];
-        let action = evaluate_memory_hooks(&memory_system, &messages, 100);
+        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100);
 
         assert!(matches!(action, PostSamplingAction::Compact));
     }
@@ -1290,7 +1290,7 @@ _No errors encountered._
             ..Default::default()
         };
 
-        let memory_system = MemorySystem::new(
+        let mut memory_system = MemorySystem::new(
             config,
             PathBuf::from("/tmp/workspace"),
             PathBuf::from("/tmp/config"),
@@ -1308,7 +1308,7 @@ _No errors encountered._
             .collect();
 
         // 当 Token 超过阈值时，应返回 Compact 而不是其他 Action
-        let action = evaluate_memory_hooks(&memory_system, &messages, 100);
+        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100);
 
         // Compact 优先级最高
         assert!(matches!(action, PostSamplingAction::Compact));
