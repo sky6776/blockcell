@@ -686,7 +686,7 @@ mod tests {
     #[test]
     fn test_evaluate_memory_hooks_none() {
         let config = MemorySystemConfig::default();
-        let memory_system = MemorySystem::new(
+        let mut memory_system = MemorySystem::new(
             config,
             PathBuf::from("/workspace"),
             PathBuf::from("/config"),
@@ -695,7 +695,7 @@ mod tests {
 
         let messages = vec![ChatMessage::user("Hello"), ChatMessage::assistant("Hi!")];
 
-        let action = evaluate_memory_hooks(&memory_system, &messages, 100);
+        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100);
         assert!(matches!(action, PostSamplingAction::None));
     }
 
@@ -706,7 +706,7 @@ mod tests {
             compact_threshold: 0.8,
             ..Default::default()
         };
-        let memory_system = MemorySystem::new(
+        let mut memory_system = MemorySystem::new(
             config,
             PathBuf::from("/workspace"),
             PathBuf::from("/config"),
@@ -714,7 +714,7 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("Test")];
-        let action = evaluate_memory_hooks(&memory_system, &messages, 100);
+        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100);
 
         assert!(matches!(action, PostSamplingAction::Compact));
     }
@@ -838,7 +838,7 @@ mod tests {
             auto_memory_enabled: true,
             ..Default::default()
         };
-        let memory_system = MemorySystem::new(
+        let mut memory_system = MemorySystem::new(
             config,
             PathBuf::from("/workspace"),
             PathBuf::from("/config"),
@@ -855,7 +855,7 @@ mod tests {
             })
             .collect();
 
-        let action = evaluate_memory_hooks(&memory_system, &messages, 100);
+        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100);
 
         // Compact 优先级最高
         assert!(matches!(action, PostSamplingAction::Compact));
