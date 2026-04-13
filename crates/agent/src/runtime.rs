@@ -939,6 +939,38 @@ fn resolve_effective_tool_names(
     intents: &[IntentCategory],
     available_tools: &HashSet<String>,
 ) -> Vec<String> {
+    // 1. 先检查 intent_router.enabled
+    let router_enabled = config.intent_router
+        .as_ref()
+        .map(|r| r.enabled)
+        .unwrap_or(true);
+
+    if !router_enabled {
+        // 2. enabled=false 时，检查 load_all_tools
+        let load_all = config.intent_router
+            .as_ref()
+            .map(|r| r.load_all_tools)
+            .unwrap_or(false);
+
+        if load_all {
+            // 全量加载模式：返回所有可用工具
+            let mut tool_names: Vec<String> = available_tools.iter().cloned().collect();
+            // 应用 napcat 过滤
+            if !config.channels.napcat.enabled {
+                tool_names.retain(|name| !name.starts_with("napcat_"));
+            }
+            // 应用 skill 工具（如果有 active skill）
+            if let Some(skill) = active_skill {
+                tool_names.extend(skill.tools.iter().cloned());
+            }
+            tool_names.sort();
+            tool_names.dedup();
+            return tool_names;
+        }
+        // load_all_tools=false: 走 Unknown profile（原有逻辑会处理）
+    }
+
+    // enabled=true 或 load_all_tools=false: 原有意图分类逻辑不变
     let mut tool_names = global_core_tool_names();
 
     let mut profile_tools = match mode {

@@ -455,6 +455,11 @@ fn default_intent_rule_priority() -> u8 {
 pub struct IntentRouterConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 当 enabled=false 时，是否全量加载所有可用工具。
+    /// - load_all_tools=true: 全量加载所有工具，让 LLM 自己选择
+    /// - load_all_tools=false: 走 Unknown profile（由配置决定工具）
+    #[serde(default)]
+    pub load_all_tools: bool,
     #[serde(default = "default_intent_router_profile")]
     pub default_profile: String,
     #[serde(default)]
@@ -470,6 +475,7 @@ impl Default for IntentRouterConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            load_all_tools: false,
             default_profile: default_intent_router_profile(),
             agent_profiles: HashMap::new(),
             profiles: default_intent_router_profiles(),
@@ -2118,6 +2124,11 @@ impl Config {
             if let Ok(raw) = std::fs::read_to_string(&config_path) {
                 if !raw.contains("openclawSkillEnabled") {
                     tracing::info!("Adding missing openclawSkillEnabled field to config");
+                    needs_save = true;
+                }
+                // Ensure loadAllTools field exists in intentRouter (if present)
+                if raw.contains("intentRouter") && !raw.contains("loadAllTools") {
+                    tracing::info!("Adding missing loadAllTools field to intentRouter config");
                     needs_save = true;
                 }
             }

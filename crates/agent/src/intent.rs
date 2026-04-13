@@ -549,6 +549,29 @@ impl<'a> IntentToolResolver<'a> {
             &default_router
         };
 
+        // 1. 先判断 enabled
+        if !router.enabled {
+            // 2. enabled=false 时，判断 load_all_tools
+            if router.load_all_tools {
+                // 全量加载：返回所有可用工具（扣除 deny_tools）
+                if let Some(available) = available_tools {
+                    let mut result: Vec<String> = available.iter().cloned().collect();
+                    // 应用 deny_tools 过滤
+                    let profile_id = self.config.resolve_intent_profile_id(agent_id)?;
+                    if let Some(profile) = router.profiles.get(&profile_id) {
+                        for tool in &profile.deny_tools {
+                            result.retain(|t| t != tool);
+                        }
+                    }
+                    result.sort();
+                    return Some(result);
+                }
+            }
+            // load_all_tools=false: 走 Unknown profile（原有逻辑）
+            // effective_intents = vec![IntentCategory::Unknown]
+        }
+
+        // enabled=true: 意图分类流程（原有逻辑）
         let profile_id = self.config.resolve_intent_profile_id(agent_id)?;
         let profile = router.profiles.get(&profile_id)?;
 
@@ -1249,5 +1272,167 @@ mod tests {
 
         assert!(tools.contains(&"read_file".to_string()));
         assert!(tools.contains(&"browse".to_string()));
+    }
+
+    #[test]
+    fn test_load_all_tools_returns_all_available_tools() {
+        // 当 enabled=false 且 load_all_tools=true 时，返回所有可用工具
+        let raw = r#"{
+            "intentRouter": {
+                "enabled": false,
+                "loadAllTools": true,
+                "defaultProfile": "default",
+                "profiles": {
+                    "default": {
+                        "coreTools": [],
+                        "intentTools": {
+                            "Chat": { "inheritBase": false, "tools": [] },
+                            "Unknown": []
+                        },
+                        "denyTools": []
+                    }
+                }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(raw).unwrap();
+        let resolver = IntentToolResolver::new(&config);
+
+        let available: HashSet<String> =
+            ["read_file", "write_file", "exec", "web_search"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let tools = resolver
+            .resolve_tool_names(None, &[IntentCategory::Unknown], Some(&available))
+            .expect("should resolve tools");
+
+        // 应返回所有 4 个可用工具
+        assert_eq!(tools.len(), 4);
+        assert!(tools.contains(&"read_file".to_string()));
+        assert!(tools.contains(&"write_file".to_string()));
+        assert!(tools.contains(&"exec".to_string()));
+        assert!(tools.contains(&"web_search".to_string()));
+    }
+
+    #[test]
+    fn test_load_all_tools_applies_deny_tools() {
+        // 当 enabled=false 且 load_all_tools=true 时，仍应用 deny_tools 过滤
+        let raw = r#"{
+            "intentRouter": {
+                "enabled": false,
+                "loadAllTools": true,
+                "defaultProfile": "default",
+                "profiles": {
+                    "default": {
+                        "coreTools": [],
+                        "intentTools": {
+                            "Chat": { "inheritBase": false, "tools": [] },
+                            "Unknown": []
+                        },
+                        "denyTools": ["exec"]
+                    }
+                }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(raw).unwrap();
+        let resolver = IntentToolResolver::new(&config);
+
+        let available: HashSet<String> =
+            ["read_file", "write_file", "exec", "web_search"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let tools = resolver
+            .resolve_tool_names(None, &[IntentCategory::Unknown], Some(&available))
+            .expect("should resolve tools");
+
+        // 应返回 3 个工具（exec 被 deny）
+        assert_eq!(tools.len(), 3);
+        assert!(tools.contains(&"read_file".to_string()));
+        assert!(tools.contains(&"write_file".to_string()));
+        assert!(tools.contains(&"web_search".to_string()));
+        assert!(!tools.contains(&"exec".to_string()));
+    }
+
+    #[test]
+    fn test_load_all_tools_false_follows_unknown_profile() {
+        // 当 enabled=false 且 load_all_tools=false 时，走 Unknown profile
+        let raw = r#"{
+            "intentRouter": {
+                "enabled": false,
+                "loadAllTools": false,
+                "defaultProfile": "default",
+                "profiles": {
+                    "default": {
+                        "coreTools": ["read_file"],
+                        "intentTools": {
+                            "Chat": { "inheritBase": false, "tools": [] },
+                            "Unknown": ["web_search"]
+                        },
+                        "denyTools": []
+                    }
+                }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(raw).unwrap();
+        let resolver = IntentToolResolver::new(&config);
+
+        let available: HashSet<String> =
+            ["read_file", "write_file", "exec", "web_search"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let tools = resolver
+            .resolve_tool_names(None, &[IntentCategory::Unknown], Some(&available))
+            .expect("should resolve tools");
+
+        // 应返回 Unknown profile 配置的工具：read_file (core) + web_search (intent)
+        assert_eq!(tools.len(), 2);
+        assert!(tools.contains(&"read_file".to_string()));
+        assert!(tools.contains(&"web_search".to_string()));
+    }
+
+    #[test]
+    fn test_enabled_true_ignores_load_all_tools() {
+        // 当 enabled=true 时，忽略 load_all_tools，走意图分类流程
+        let raw = r#"{
+            "intentRouter": {
+                "enabled": true,
+                "loadAllTools": true,
+                "defaultProfile": "default",
+                "profiles": {
+                    "default": {
+                        "coreTools": ["read_file"],
+                        "intentTools": {
+                            "Chat": { "inheritBase": false, "tools": [] },
+                            "FileOps": ["edit_file"]
+                        },
+                        "denyTools": []
+                    }
+                }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(raw).unwrap();
+        let resolver = IntentToolResolver::new(&config);
+
+        let available: HashSet<String> =
+            ["read_file", "edit_file", "exec", "web_search"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+
+        // Chat 意图应返回空（Chat profile 配置 inheritBase=false, tools=[]）
+        let tools = resolver
+            .resolve_tool_names(None, &[IntentCategory::Chat], Some(&available))
+            .expect("should resolve tools");
+        assert!(tools.is_empty());
+
+        // FileOps 意图应返回 read_file (core) + edit_file (intent)
+        let tools = resolver
+            .resolve_tool_names(None, &[IntentCategory::FileOps], Some(&available))
+            .expect("should resolve tools");
+        assert_eq!(tools.len(), 2);
+        assert!(tools.contains(&"read_file".to_string()));
+        assert!(tools.contains(&"edit_file".to_string()));
     }
 }
