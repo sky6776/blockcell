@@ -3,6 +3,7 @@ use blockcell_core::{Error, Result};
 use serde_json::{json, Value};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -13,6 +14,55 @@ pub struct ExecLocalTool;
 
 pub(crate) const ALLOWED_RUNNERS: &[&str] =
     &["python3", "python", "bash", "sh", "node", "php", "uv"];
+
+/// Python runner cache states.
+/// 0 = not detected yet
+/// 1 = python3 worked (cached)
+/// 2 = python worked (cached)
+const PYTHON_STATE_UNKNOWN: u8 = 0;
+const PYTHON_STATE_PYTHON3: u8 = 1;
+const PYTHON_STATE_PYTHON: u8 = 2;
+
+static PYTHON_RUNNER_STATE: AtomicU8 = AtomicU8::new(PYTHON_STATE_UNKNOWN);
+
+/// Preferred order to try Python runners.
+const PYTHON_PREFERS: [&'static str; 2] = ["python3", "python"];
+
+/// Check if stderr indicates a Python environment issue that should trigger fallback.
+fn should_fallback(stderr: &str) -> bool {
+    stderr.contains("ModuleNotFoundError")
+        || stderr.contains("No module named")
+        || stderr.contains("command not found")
+        || stderr.contains("is not recognized as an internal or external command")
+        || stderr.contains("can't open file")
+        || stderr.contains("No such file or directory")
+}
+
+/// Get cached Python runner if available.
+fn get_cached_python_runner() -> Option<&'static str> {
+    match PYTHON_RUNNER_STATE.load(Ordering::Relaxed) {
+        PYTHON_STATE_PYTHON3 => Some("python3"),
+        PYTHON_STATE_PYTHON => Some("python"),
+        _ => None,
+    }
+}
+
+/// Cache the successful Python runner.
+fn cache_python_runner(runner: &str) {
+    let state = if runner == "python3" {
+        PYTHON_STATE_PYTHON3
+    } else {
+        PYTHON_STATE_PYTHON
+    };
+    PYTHON_RUNNER_STATE.store(state, Ordering::Relaxed);
+    tracing::debug!("Cached Python runner: {}", runner);
+}
+
+/// Clear the cached Python runner (for retry after failure).
+fn clear_python_runner_cache() {
+    PYTHON_RUNNER_STATE.store(PYTHON_STATE_UNKNOWN, Ordering::Relaxed);
+    tracing::debug!("Cleared Python runner cache");
+}
 
 pub(crate) fn validate_relative_skill_path(path: &str) -> Result<()> {
     let trimmed = path.trim();
@@ -54,9 +104,11 @@ pub(crate) fn validate_runner(runner: &str) -> Result<()> {
 
 /// Infer an appropriate runner from the script file extension when none is specified.
 /// Returns `None` if the extension is unknown (caller should attempt direct execution).
+/// For Python scripts, uses cached runner if available, otherwise returns "python3" as first try.
 pub(crate) fn infer_runner_from_extension(path: &str) -> Option<&'static str> {
     if path.ends_with(".py") {
-        Some("python3")
+        // Use cached runner if available, otherwise default to python3 (first in prefer list)
+        get_cached_python_runner().or(Some("python3"))
     } else if path.ends_with(".sh") {
         Some("sh")
     } else if path.ends_with(".js") || path.ends_with(".mjs") {
@@ -106,19 +158,39 @@ pub(crate) fn resolve_script_path(skill_dir: &Path, relative_path: &str) -> Resu
     Ok(canonical_target)
 }
 
+/// Build a Python command with proper UTF-8 handling.
+fn build_python_command(runner: &str, script_path: &Path, args: &[String]) -> Command {
+    let mut command = Command::new(runner);
+    // On Windows, add -X utf8 flag for proper UTF-8 output handling
+    #[cfg(windows)]
+    {
+        command.arg("-X");
+        command.arg("utf8");
+    }
+    command.arg(script_path);
+    command.args(args);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUNBUFFERED", "1");
+    command
+}
+
 #[async_trait]
 impl Tool for ExecLocalTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "exec_local",
             description:
-                "Execute a local script or executable inside the active skill directory only. The `path` must be RELATIVE (e.g. `scripts/run.py`), never absolute. If the skill manual shows `{baseDir}/scripts/...`, strip the `{baseDir}/` prefix and pass only the relative portion.",
+                "Execute a local script or executable inside the active skill directory only. The `path` must be RELATIVE (e.g. `scripts/run.py`), never absolute. If the skill manual shows `{baseDir}/scripts/...`, strip the `{baseDir}` prefix and pass only the relative portion.",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "RELATIVE path to the script inside the active skill directory (e.g. `scripts/run.py`). Must NOT be absolute. The tool auto-infers the interpreter from the file extension (.py→python3, .sh→sh, .js→node)."
+                        "description": "RELATIVE path to the script inside the active skill directory (e.g. `scripts/run.py`). Must NOT be absolute. The tool auto-infers the interpreter from the file extension (.py→python3/python with fallback, .sh→sh, .js→node)."
                     },
                     "runner": {
                         "type": "string",
@@ -191,9 +263,6 @@ impl Tool for ExecLocalTool {
         if let Some(runner) = explicit_runner {
             validate_runner(runner)?;
         }
-        // Auto-infer runner from file extension when not explicitly specified (Windows compat)
-        let effective_runner =
-            explicit_runner.or_else(|| infer_runner_from_extension(relative_path));
         let args = params
             .get("args")
             .and_then(|value| value.as_array())
@@ -220,40 +289,230 @@ impl Tool for ExecLocalTool {
         let timeout_secs = ctx.config.tools.exec.timeout as u64;
         let max_output_chars = 10_000usize;
 
+        // Handle Python scripts with fallback mechanism
+        if relative_path.ends_with(".py") && explicit_runner.is_none() {
+            return self
+                .execute_python_with_fallback(
+                    &skill_dir,
+                    &resolved_path,
+                    &args,
+                    timeout_secs,
+                    max_output_chars,
+                )
+                .await;
+        }
+
+        // Non-Python scripts or explicit runner: execute directly
+        let effective_runner =
+            explicit_runner.or_else(|| infer_runner_from_extension(relative_path));
+        self.execute_single_runner(
+            effective_runner,
+            &skill_dir,
+            &resolved_path,
+            &args,
+            timeout_secs,
+            max_output_chars,
+        )
+        .await
+    }
+}
+
+impl ExecLocalTool {
+    /// Execute Python script with automatic fallback between python3 and python.
+    async fn execute_python_with_fallback(
+        &self,
+        skill_dir: &Path,
+        resolved_path: &Path,
+        args: &[String],
+        timeout_secs: u64,
+        max_output_chars: usize,
+    ) -> Result<Value> {
+        // Track the cached runner that failed (if any) to skip it in the loop
+        let failed_cached_runner: Option<&'static str>;
+
+        // Try cached runner first
+        if let Some(cached) = get_cached_python_runner() {
+            let result = self
+                .execute_single_runner(
+                    Some(cached),
+                    skill_dir,
+                    resolved_path,
+                    args,
+                    timeout_secs,
+                    max_output_chars,
+                )
+                .await;
+
+            // If cached runner succeeds, return result
+            if let Ok(ref value) = result {
+                if value["exit_code"].as_i64() == Some(0) {
+                    return result;
+                }
+            }
+
+            // Check if we should fallback (environment issue, not script error)
+            if let Ok(ref value) = result {
+                let stderr = value["stderr"].as_str().unwrap_or_default();
+                if should_fallback(stderr) {
+                    tracing::debug!(
+                        "Cached Python runner '{}' failed with environment error, clearing cache",
+                        cached
+                    );
+                    clear_python_runner_cache();
+                    // Remember which runner failed so we skip it in the loop
+                    failed_cached_runner = Some(cached);
+                } else {
+                    // Script error, not environment issue - return as-is
+                    return result;
+                }
+            } else {
+                failed_cached_runner = None;
+            }
+        } else {
+            failed_cached_runner = None;
+        }
+
+        // No cache or cache invalidated: try runners in order (skip already-tried runner)
+        for runner in PYTHON_PREFERS {
+            // Skip the runner we already tried from cache
+            if Some(runner) == failed_cached_runner {
+                tracing::debug!(
+                    "Skipping runner '{}' (already tried from cache)",
+                    runner
+                );
+                continue;
+            }
+
+            tracing::debug!("Trying Python runner: {}", runner);
+            let result = self
+                .execute_single_runner(
+                    Some(runner),
+                    skill_dir,
+                    resolved_path,
+                    args,
+                    timeout_secs,
+                    max_output_chars,
+                )
+                .await;
+
+            if let Ok(ref value) = result {
+                let exit_code = value["exit_code"].as_i64().unwrap_or(-1);
+                let stderr = value["stderr"].as_str().unwrap_or_default();
+
+                if exit_code == 0 {
+                    // Success: cache this runner
+                    cache_python_runner(runner);
+                    tracing::info!(
+                        "Python runner '{}' succeeded, cached for future use",
+                        runner
+                    );
+                    return result;
+                }
+
+                // Check if this is an environment error (should try other runner)
+                if should_fallback(stderr) {
+                    tracing::debug!(
+                        "Python runner '{}' failed with environment error, trying next",
+                        runner
+                    );
+                    continue;
+                } else {
+                    // Script error, not environment - return this error
+                    tracing::debug!(
+                        "Python runner '{}' failed with script error, not trying fallback",
+                        runner
+                    );
+                    return result;
+                }
+            }
+        }
+
+        // All runners failed
+        Err(Error::Tool(
+            "No working Python interpreter found. Tried: python3, python".to_string(),
+        ))
+    }
+
+    /// Execute script with a single runner (no fallback).
+    async fn execute_single_runner(
+        &self,
+        effective_runner: Option<&str>,
+        skill_dir: &Path,
+        resolved_path: &Path,
+        args: &[String],
+        timeout_secs: u64,
+        max_output_chars: usize,
+    ) -> Result<Value> {
         let mut command = if let Some(runner) = effective_runner {
-            let mut command = Command::new(runner);
-            // For `uv`, use `uv run -- python3 -X utf8 <script>` to:
-            // 1. Enable uv's dependency management
-            // 2. Force UTF-8 mode (uv doesn't pass PYTHONIOENCODING to subprocess)
             if runner == "uv" {
+                // For `uv`, use `uv run -- python3 -X utf8 <script>`
+                let mut command = Command::new("uv");
                 command.arg("run");
                 command.arg("--");
                 command.arg("python3");
                 command.arg("-X");
                 command.arg("utf8");
+                command.arg(resolved_path);
+                command.args(args);
+                command
             } else if runner == "python3" || runner == "python" {
-                // On Windows, python3 needs -X utf8 flag to handle UTF-8 output properly
-                // (MSYS2/MinGW python3 ignores PYTHONIOENCODING env var)
-                #[cfg(windows)]
-                {
-                    command.arg("-X");
-                    command.arg("utf8");
-                }
+                // Use specialized Python command builder
+                let mut command = build_python_command(runner, resolved_path, args);
+                command.current_dir(skill_dir);
+                return self
+                    .run_command(
+                        command,
+                        resolved_path,
+                        effective_runner,
+                        args,
+                        timeout_secs,
+                        max_output_chars,
+                    )
+                    .await;
+            } else {
+                // Other runners (sh, bash, node, php)
+                let mut command = Command::new(runner);
+                command.arg(resolved_path);
+                command.args(args);
+                command
             }
-            command.arg(&resolved_path);
-            command
         } else {
-            Command::new(&resolved_path)
+            // Direct execution (no runner)
+            let mut command = Command::new(resolved_path);
+            command.args(args);
+            command
         };
+
+        // Set common options for non-Python runners
         command
-            .args(&args)
-            .current_dir(&skill_dir)
+            .current_dir(skill_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("PYTHONIOENCODING", "utf-8")
             .env("PYTHONUNBUFFERED", "1");
 
+        self.run_command(
+            command,
+            resolved_path,
+            effective_runner,
+            args,
+            timeout_secs,
+            max_output_chars,
+        )
+        .await
+    }
+
+    /// Run the command and process output.
+    async fn run_command(
+        &self,
+        mut command: Command,
+        resolved_path: &Path,
+        effective_runner: Option<&str>,
+        args: &[String],
+        timeout_secs: u64,
+        max_output_chars: usize,
+    ) -> Result<Value> {
         let output = timeout(Duration::from_secs(timeout_secs), command.output())
             .await
             .map_err(|_| {
@@ -275,7 +534,7 @@ impl Tool for ExecLocalTool {
             "... (stderr truncated)",
         );
 
-        // Build command_parts for logging/output: `runner [run -- python3 -X utf8] script [args...]`
+        // Build command_parts for logging/output
         let command_parts: Vec<String> = if effective_runner == Some("uv") {
             vec![
                 "uv".to_string(),
@@ -290,7 +549,6 @@ impl Tool for ExecLocalTool {
             .chain(args.iter().cloned())
             .collect()
         } else if effective_runner == Some("python3") || effective_runner == Some("python") {
-            // On Windows, python3 needs -X utf8 flag to handle UTF-8 output properly
             std::iter::once(effective_runner.map(str::to_string))
                 .flatten()
                 .chain(if cfg!(windows) {
@@ -405,6 +663,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_exec_local_runs_top_level_skill_py() {
+        // Clear cache for test isolation
+        clear_python_runner_cache();
+
         let skill_dir = temp_skill_dir("blockcell-exec-local-skill-py");
         let script_path = skill_dir.join("SKILL.py");
         fs::write(
@@ -419,7 +680,6 @@ mod tests {
                 tool_context(skill_dir.clone()),
                 json!({
                     "path": "SKILL.py",
-                    "runner": "python3",
                     "args": ["demo", "local"],
                     "cwd_mode": "skill"
                 }),
@@ -480,5 +740,41 @@ mod tests {
                 "runner": "perl"
             }))
             .is_err());
+    }
+
+    #[test]
+    fn test_should_fallback_detects_environment_errors() {
+        assert!(should_fallback(
+            "ModuleNotFoundError: No module named 'requests'"
+        ));
+        assert!(should_fallback("python: can't open file 'script.py'"));
+        assert!(should_fallback("python3: command not found"));
+        assert!(should_fallback(
+            "'python' is not recognized as an internal or external command"
+        ));
+
+        // Script errors should NOT trigger fallback
+        assert!(!should_fallback("SyntaxError: invalid syntax"));
+        assert!(!should_fallback("TypeError: 'str' object is not callable"));
+        assert!(!should_fallback("ValueError: invalid value"));
+    }
+
+    #[test]
+    fn test_python_runner_cache_operations() {
+        // Clear cache
+        clear_python_runner_cache();
+        assert_eq!(get_cached_python_runner(), None);
+
+        // Cache python3
+        cache_python_runner("python3");
+        assert_eq!(get_cached_python_runner(), Some("python3"));
+
+        // Cache python (overwrites)
+        cache_python_runner("python");
+        assert_eq!(get_cached_python_runner(), Some("python"));
+
+        // Clear again
+        clear_python_runner_cache();
+        assert_eq!(get_cached_python_runner(), None);
     }
 }

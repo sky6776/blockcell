@@ -918,7 +918,7 @@ mod tests {
         let result = c.classify("分析这个 data.csv 文件");
         assert!(result.contains(&IntentCategory::DataAnalysis));
         assert!(result[0] == IntentCategory::DataAnalysis); // DataAnalysis 是主要意图
-        // 负例：闲聊中的图表字样不应触发
+                                                            // 负例：闲聊中的图表字样不应触发
         assert_ne!(
             c.classify("今天天气真好"),
             vec![IntentCategory::DataAnalysis]
@@ -1303,11 +1303,10 @@ mod tests {
         let config: Config = serde_json::from_str(raw).unwrap();
         let resolver = IntentToolResolver::new(&config);
 
-        let available: HashSet<String> =
-            ["read_file", "write_file", "exec", "web_search"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let available: HashSet<String> = ["read_file", "write_file", "exec", "web_search"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let tools = resolver
             .resolve_tool_names(None, &[IntentCategory::Unknown], Some(&available))
             .expect("should resolve tools");
@@ -1343,11 +1342,10 @@ mod tests {
         let config: Config = serde_json::from_str(raw).unwrap();
         let resolver = IntentToolResolver::new(&config);
 
-        let available: HashSet<String> =
-            ["read_file", "write_file", "exec", "web_search"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let available: HashSet<String> = ["read_file", "write_file", "exec", "web_search"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let tools = resolver
             .resolve_tool_names(None, &[IntentCategory::Unknown], Some(&available))
             .expect("should resolve tools");
@@ -1383,11 +1381,10 @@ mod tests {
         let config: Config = serde_json::from_str(raw).unwrap();
         let resolver = IntentToolResolver::new(&config);
 
-        let available: HashSet<String> =
-            ["read_file", "write_file", "exec", "web_search"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let available: HashSet<String> = ["read_file", "write_file", "exec", "web_search"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let tools = resolver
             .resolve_tool_names(None, &[IntentCategory::Unknown], Some(&available))
             .expect("should resolve tools");
@@ -1421,11 +1418,10 @@ mod tests {
         let config: Config = serde_json::from_str(raw).unwrap();
         let resolver = IntentToolResolver::new(&config);
 
-        let available: HashSet<String> =
-            ["read_file", "edit_file", "exec", "web_search"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let available: HashSet<String> = ["read_file", "edit_file", "exec", "web_search"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
         // Chat 意图应返回空（Chat profile 配置 inheritBase=false, tools=[]）
         let tools = resolver
@@ -1525,11 +1521,17 @@ mod tests {
         let config: Config = serde_json::from_str(raw).unwrap();
         let resolver = IntentToolResolver::new(&config);
 
-        let available: HashSet<String> =
-            ["read_file", "write_file", "exec", "delete_file", "shell", "web_search"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let available: HashSet<String> = [
+            "read_file",
+            "write_file",
+            "exec",
+            "delete_file",
+            "shell",
+            "web_search",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let tools = resolver
             .resolve_tool_names(None, &[IntentCategory::Unknown], Some(&available))
             .expect("should resolve tools");
@@ -1571,11 +1573,10 @@ mod tests {
         let config: Config = serde_json::from_str(raw).unwrap();
         let resolver = IntentToolResolver::new(&config);
 
-        let available: HashSet<String> =
-            ["read_file", "exec", "web_search"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let available: HashSet<String> = ["read_file", "exec", "web_search"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
         // resolve_intent_profile_id(None) 返回 defaultProfile="nonexistent"
         // profiles.get("nonexistent") 返回 None，跳过 deny_tools 过滤，但仍返回所有工具
@@ -1615,11 +1616,10 @@ mod tests {
         let config: Config = serde_json::from_str(raw).unwrap();
         let resolver = IntentToolResolver::new(&config);
 
-        let available: HashSet<String> =
-            ["read_file", "exec", "web_search"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let available: HashSet<String> = ["read_file", "exec", "web_search"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
         // resolve_intent_profile_id(None) 返回 defaultProfile="other"
         // profiles.get("other") 找到 profile，应用 deny_tools 过滤
@@ -1657,11 +1657,10 @@ mod tests {
         let config: Config = serde_json::from_str(raw).unwrap();
         let resolver = IntentToolResolver::new(&config);
 
-        let available: HashSet<String> =
-            ["read_file", "write_file", "exec"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let available: HashSet<String> = ["read_file", "write_file", "exec"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
         // 不同 intent 应返回相同结果
         let tools_chat = resolver

@@ -940,14 +940,16 @@ fn resolve_effective_tool_names(
     available_tools: &HashSet<String>,
 ) -> Vec<String> {
     // 1. 先检查 intent_router.enabled
-    let router_enabled = config.intent_router
+    let router_enabled = config
+        .intent_router
         .as_ref()
         .map(|r| r.enabled)
         .unwrap_or(true);
 
     if !router_enabled {
         // 2. enabled=false 时，检查 load_all_tools
-        let load_all = config.intent_router
+        let load_all = config
+            .intent_router
             .as_ref()
             .map(|r| r.load_all_tools)
             .unwrap_or(false);
@@ -8309,11 +8311,16 @@ description: local demo
             }
         }"#;
         let config: Config = serde_json::from_str(raw).unwrap();
-        let available: HashSet<String> =
-            ["read_file", "write_file", "exec", "web_search", "napcat_send"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let available: HashSet<String> = [
+            "read_file",
+            "write_file",
+            "exec",
+            "web_search",
+            "napcat_send",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let tools = resolve_effective_tool_names(
             &config,
             InteractionMode::General,
@@ -8356,11 +8363,10 @@ description: local demo
             }
         }"#;
         let config: Config = serde_json::from_str(raw).unwrap();
-        let available: HashSet<String> =
-            ["read_file", "napcat_send", "napcat_receive"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let available: HashSet<String> = ["read_file", "napcat_send", "napcat_receive"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let tools = resolve_effective_tool_names(
             &config,
             InteractionMode::General,
@@ -8401,11 +8407,10 @@ description: local demo
             }
         }"#;
         let config: Config = serde_json::from_str(raw).unwrap();
-        let available: HashSet<String> =
-            ["read_file", "write_file"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let available: HashSet<String> = ["read_file", "write_file"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let skill = ActiveSkillContext {
             name: "test_skill".to_string(),
             prompt_md: String::new(),
@@ -8455,11 +8460,10 @@ description: local demo
             }
         }"#;
         let config: Config = serde_json::from_str(raw).unwrap();
-        let available: HashSet<String> =
-            ["read_file", "edit_file", "exec", "web_search"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let available: HashSet<String> = ["read_file", "edit_file", "exec", "web_search"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
         // FileOps 意图应返回 read_file (core) + edit_file (intent)
         let tools = resolve_effective_tool_names(
