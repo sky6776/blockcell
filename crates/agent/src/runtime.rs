@@ -3969,6 +3969,20 @@ impl AgentRuntime {
                     if is_error {
                         let failure_kind = classify_tool_failure(&result);
                         match failure_kind {
+                            ToolFailureKind::SkillContextMissing => {
+                                // Skill context missing — give friendly hint to activate skill first
+                                let hint = format!(
+                                    "💡 工具 `{}` 需要先激活技能才能使用。\n\
+                                     请先调用 `activate_skill` 工具激活技能，例如：\n\
+                                     ```\n\
+                                     activate_skill({{skill_name: \"<技能名>\", goal: \"<目标>\"}})\n\
+                                     ```\n\
+                                     激活后再调用 `{}` 执行技能脚本。",
+                                    tool_call.name, tool_call.name
+                                );
+                                info!(tool = %tool_call.name, "Skill context missing — suggesting activate_skill");
+                                current_messages.push(ChatMessage::user(&hint));
+                            }
                             ToolFailureKind::Permanent | ToolFailureKind::Transient => {
                                 let count =
                                     tool_fail_counts.entry(tool_call.name.clone()).or_insert(0);
