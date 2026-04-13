@@ -181,24 +181,36 @@ impl IntentClassifier {
                 negative_dyn: vec![],
                 priority: 65,
             },
-            // ── FileOps (priority 60) ──
+            // ── FileOps (priority 55) - 通用文件操作，优先级低于专用类别 ──
             IntentRule {
                 category: IntentCategory::FileOps,
                 keywords: vec![
                     "读文件", "写文件", "创建文件", "删除文件", "列目录", "列出文件",
-                    "重命名", "打开文件", "编辑文件", "复制文件", "移动文件",
+                    "重命名", "复制文件", "移动文件",
                     "read file", "write file", "create file", "delete file",
-                    "list dir", "open file", "edit file", "rename file",
+                    "list dir", "rename file",
                 ],
                 patterns: vec![
-                    Regex::new(r"(?i)\.(rs|py|go|js|ts|json|toml|yaml|yml|md|txt|csv|sh|log|conf|cfg|ini)\b").unwrap(),
-                    Regex::new(r"(?i)(read|write|edit|create|delete|rename|copy|move)\s+(file|directory|folder|dir)").unwrap(),
+                    // 扩展名匹配：要求前面是空格或行首，排除 URL 路径中的扩展名
+                    Regex::new(r"(?i)(^|\s)[a-zA-Z0-9_\-]+\.(rs|py|go|js|ts|json|json5|toml|yaml|yml|md|txt|sh|log|conf|cfg|ini|lock)\b").unwrap(),
+                    // 操作 + 文件关键词（允许中间词）
+                    Regex::new(r"(?i)(read|write|edit|create|delete|rename|copy|move|list|cat|ls|mkdir|rm|cp|mv|touch|chmod).*?(file|directory|folder|dir|文件|目录|文件夹)").unwrap(),
+                    // 中文操作 + 文件（允许中间词）
+                    Regex::new(r"(读|写|编辑|创建|删除|重命名|复制|移动|列出).*?(文件|目录|文件夹)").unwrap(),
+                    // 命令行工具
                     Regex::new(r"(?i)\b(cat|ls|mkdir|rm|cp|mv|touch|chmod)\s+").unwrap(),
                 ],
-                negative: vec![],
+                negative: vec![
+                    // 排除 IoT 设备控制关键词
+                    "灯", "空调", "窗帘", "风扇", "暖气", "热水器",
+                    // 排除 SystemControl 应用控制关键词
+                    "应用", "软件", "程序", "app",
+                    // 排除 Media 媒体关键词
+                    "mp3", "mp4", "wav", "avi", "mkv", "jpg", "jpeg", "png", "gif", "webp",
+                ],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
-                priority: 60,
+                priority: 55,
             },
             // ── WebSearch (priority 55) ──
             IntentRule {
@@ -211,7 +223,10 @@ impl IntentClassifier {
                     Regex::new(r"(?i)\b(what\s+is|how\s+to|where\s+is|when\s+did|who\s+is)\b").unwrap(),
                     Regex::new(r"(?i)(网上|网页|互联网|internet|web)\s*(搜|找|查|看)").unwrap(),
                 ],
-                negative: vec!["股价", "行情", "stock price"],
+                negative: vec![
+                    // 排除金融关键词：股价行情搜索应触发 Finance 而非 WebSearch
+                    "股价", "行情", "股票", "币", "币价", "stock price", "币种",
+                ],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
                 priority: 55,
@@ -228,7 +243,9 @@ impl IntentClassifier {
                 patterns: vec![
                     Regex::new(r"(?i)(数据|data)\s*(处理|分析|清洗|转换|导出|挖掘)").unwrap(),
                     Regex::new(r"(?i)(生成|绘制|画)\s*(图|表|报告)").unwrap(),
-                    Regex::new(r"(?i)\.(csv|xlsx|xls|parquet)\b").unwrap(),
+                    // 数据文件扩展名（单独匹配，不与其他文件操作词组合）
+                    Regex::new(r"(?i)\b\.(csv|xlsx|xls|parquet)\b").unwrap(),
+                    Regex::new(r"(?i)(分析|处理)\s*.*?\.(csv|xlsx|xls|parquet)").unwrap(),
                 ],
                 negative: vec![],
                 keywords_dyn: vec![],
@@ -243,31 +260,35 @@ impl IntentClassifier {
                     "send email", "send message", "notify", "email to",
                 ],
                 patterns: vec![
-                    Regex::new(r"(?i)(发送|send)\s*(邮件|email|消息|message|通知|notification)").unwrap(),
-                    Regex::new(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}").unwrap(),
+                    Regex::new(r"(?i)(发送|send|写|写一封)\s*(邮件|email|消息|message|通知|notification)").unwrap(),
+                    Regex::new(r"(?i)(email|邮件)\s*(给|to)\s*[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}").unwrap(),
                 ],
-                negative: vec![],
+                negative: vec![
+                    // 排除提到邮箱地址但不是要发邮件的场景
+                    "邮箱是", "我的邮箱", "联系我", "email is", "my email",
+                ],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
                 priority: 60,
             },
-            // ── SystemControl (priority 60) ──
+            // ── SystemControl (priority 65) - 系统控制优先级高于通用 FileOps ──
             IntentRule {
                 category: IntentCategory::SystemControl,
                 keywords: vec![
                     "系统信息", "cpu", "内存", "磁盘", "进程", "截图", "相机", "拍照",
-                    "打开应用", "关闭应用", "系统状态",
+                    "打开应用", "关闭应用", "系统状态", "cpu使用率", "打开微信",
                     "system info", "cpu usage", "disk space",
                     "process", "screenshot", "camera",
                 ],
                 patterns: vec![
-                    Regex::new(r"(?i)(打开|关闭|重启|安装|卸载)\s*(应用|软件|程序|app)").unwrap(),
+                    Regex::new(r"(?i)(打开|关闭|重启|安装|卸载)\s*(应用|软件|程序|app|微信|qq|浏览器)").unwrap(),
                     Regex::new(r"(?i)(系统|system)\s*(负载|使用率|状态|监控)").unwrap(),
+                    Regex::new(r"(?i)查看.*?(cpu|内存|磁盘|进程)").unwrap(),
                 ],
                 negative: vec![],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
-                priority: 60,
+                priority: 65,
             },
             // ── Organization (priority 55) ──
             IntentRule {
@@ -287,7 +308,7 @@ impl IntentClassifier {
                 negative_dyn: vec![],
                 priority: 55,
             },
-            // ── IoT (priority 65) ──
+            // ── IoT (priority 65) - 设备控制优先级高于通用 FileOps ──
             IntentRule {
                 category: IntentCategory::IoT,
                 keywords: vec![
@@ -297,7 +318,8 @@ impl IntentClassifier {
                     "thermostat", "zigbee",
                 ],
                 patterns: vec![
-                    Regex::new(r"(?i)(打开|关闭|调节)\s*(灯|空调|窗帘|风扇|暖气|热水器)").unwrap(),
+                    // 允许中间词如 "客厅的灯"
+                    Regex::new(r"(?i)(打开|关闭|调节).*?(灯|空调|窗帘|风扇|暖气|热水器)").unwrap(),
                     Regex::new(r"(?i)\b(mqtt|zigbee|z-wave|homeassistant|home\s*assistant)\b").unwrap(),
                 ],
                 negative: vec![],
@@ -305,7 +327,7 @@ impl IntentClassifier {
                 negative_dyn: vec![],
                 priority: 65,
             },
-            // ── Media (priority 60) ──
+            // ── Media (priority 65) - 媒体处理优先级高于通用 FileOps ──
             IntentRule {
                 category: IntentCategory::Media,
                 keywords: vec![
@@ -315,16 +337,22 @@ impl IntentClassifier {
                     "video process", "audio",
                 ],
                 patterns: vec![
-                    Regex::new(r"(?i)(识别|提取|转换)\s*(图片|图像|音频|视频|文字|语音)").unwrap(),
-                    Regex::new(r"(?i)\.(mp3|mp4|wav|avi|mkv|jpg|jpeg|png|gif|webp)\b").unwrap(),
+                    // 允许中间词如 "这张图片里的文字"
+                    Regex::new(r"(?i)(识别|提取|转换|处理).*?(图片|图像|音频|视频|文字|语音)").unwrap(),
+                    // 媒体文件扩展名：要求前面是空格或行首，排除 URL 和陈述事实场景
+                    Regex::new(r"(?i)(^|\s)[a-zA-Z0-9_\-]+\.(mp3|mp4|wav|avi|mkv|jpg|jpeg|png|gif|webp)\b").unwrap(),
                     Regex::new(r"(?i)(语音|voice|audio)\s*(识别|转文|to\s*text)").unwrap(),
+                    Regex::new(r"(?i)(把|将).*?(音频|视频|语音).*?(转成|转换为).*?(文字|文本)").unwrap(),
                 ],
-                negative: vec![],
+                negative: vec![
+                    // 排除陈述事实而非请求操作的关键词
+                    "下载了", "上传了", "保存了", "收到了", "watched", "saved",
+                ],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
-                priority: 60,
+                priority: 65,
             },
-            // ── DevOps (priority 60) ──
+            // ── DevOps (priority 65) - 运维优先级高于通用 FileOps ──
             IntentRule {
                 category: IntentCategory::DevOps,
                 keywords: vec![
@@ -335,13 +363,16 @@ impl IntentClassifier {
                 ],
                 patterns: vec![
                     Regex::new(r"(?i)\b(GET|POST|PUT|DELETE|PATCH)\s+https?://").unwrap(),
-                    Regex::new(r"(?i)\b(ping|curl|wget|nmap|ssh|scp)\s+").unwrap(),
+                    Regex::new(r"(?i)\b(ping|curl|wget|nmap|ssh|scp)\s+\S").unwrap(),
                     Regex::new(r"(?i)\b(docker|kubectl|helm)\s+(run|build|push|deploy|apply)").unwrap(),
                 ],
-                negative: vec![],
+                negative: vec![
+                    // 排除问答句式：询问命令是什么
+                    "是什么", "什么意思", "怎么用", "怎么写", "how to use", "what is",
+                ],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
-                priority: 60,
+                priority: 65,
             },
             // ── Lifestyle (priority 50) ──
             IntentRule {
@@ -854,10 +885,10 @@ mod tests {
             c.classify("画一个折线图"),
             vec![IntentCategory::DataAnalysis]
         );
-        assert_eq!(
-            c.classify("分析这个 data.csv 文件"),
-            vec![IntentCategory::DataAnalysis]
-        );
+        // csv 文件同时触发 DataAnalysis + FileOps（数据分析需要读取文件）
+        let result = c.classify("分析这个 data.csv 文件");
+        assert!(result.contains(&IntentCategory::DataAnalysis));
+        assert!(result[0] == IntentCategory::DataAnalysis); // DataAnalysis 是主要意图
         // 负例：闲聊中的图表字样不应触发
         assert_ne!(
             c.classify("今天天气真好"),

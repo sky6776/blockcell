@@ -330,6 +330,8 @@ impl VersionManager {
                 .ok()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| legacy_py_path.display().to_string());
+            // Normalize path separators to Unix format for cross-platform consistency
+            let rel = rel.replace('\\', "/");
             let layout = if has_skill_md {
                 SkillLayout::Hybrid
             } else {
@@ -344,6 +346,8 @@ impl VersionManager {
                 .ok()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| local_script_path.display().to_string());
+            // Normalize path separators to Unix format for cross-platform consistency
+            let rel = rel.replace('\\', "/");
             let layout = if has_skill_md {
                 SkillLayout::Hybrid
             } else {
@@ -640,9 +644,16 @@ impl VersionManager {
         let dec = flate2::read::GzDecoder::new(file);
         let mut archive = tar::Archive::new(dec);
 
-        // 解压到临时目录
-        let temp_dir =
-            std::env::temp_dir().join(format!("skill_import_{}", chrono::Utc::now().timestamp()));
+        // 解压到临时目录（使用纳秒时间戳避免并行测试冲突）
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "skill_import_{}_{}",
+            std::process::id(),
+            now_ns
+        ));
         std::fs::create_dir_all(&temp_dir)?;
         archive.unpack(&temp_dir)?;
 
