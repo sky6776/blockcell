@@ -376,10 +376,7 @@ impl ExecLocalTool {
         for runner in PYTHON_PREFERS {
             // Skip the runner we already tried from cache
             if Some(runner) == failed_cached_runner {
-                tracing::debug!(
-                    "Skipping runner '{}' (already tried from cache)",
-                    runner
-                );
+                tracing::debug!("Skipping runner '{}' (already tried from cache)", runner);
                 continue;
             }
 
