@@ -3,6 +3,7 @@ use blockcell_core::{Config, Error, Result};
 use blockcell_tools::ToolRegistry;
 use regex::Regex;
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 /// Intent categories for user messages.
 /// Used to determine which tools, rules, and domain knowledge to load.
@@ -81,10 +82,30 @@ impl IntentCategory {
 
 struct IntentRule {
     category: IntentCategory,
+    /// 内置规则的关键词（静态字符串）
     keywords: Vec<&'static str>,
+    /// 来自配置文件的动态关键词
+    keywords_dyn: Vec<String>,
     patterns: Vec<Regex>,
+    /// 内置规则的否定词（静态字符串）
     negative: Vec<&'static str>,
+    /// 来自配置文件的动态否定词
+    negative_dyn: Vec<String>,
     priority: u8,
+}
+
+impl Default for IntentRule {
+    fn default() -> Self {
+        Self {
+            category: IntentCategory::Unknown,
+            keywords: vec![],
+            keywords_dyn: vec![],
+            patterns: vec![],
+            negative: vec![],
+            negative_dyn: vec![],
+            priority: 0,
+        }
+    }
 }
 
 pub struct IntentClassifier {
@@ -97,7 +118,14 @@ impl Default for IntentClassifier {
     }
 }
 
+static GLOBAL_CLASSIFIER: OnceLock<IntentClassifier> = OnceLock::new();
+
 impl IntentClassifier {
+    /// 返回全局单例，避免每条消息重复编译正则。
+    pub fn global() -> &'static IntentClassifier {
+        GLOBAL_CLASSIFIER.get_or_init(Self::new)
+    }
+
     pub fn new() -> Self {
         let rules = vec![
             // ── Chat (highest priority) ──
@@ -112,11 +140,287 @@ impl IntentClassifier {
                     Regex::new(r"(?i)^(哈哈|嘿嘿|呵呵|lol|haha|😂|👍|🙏|❤️|😊)[\s!！。.？?~～]*$").unwrap(),
                 ],
                 negative: vec![],
+                keywords_dyn: vec![],
+                negative_dyn: vec![],
                 priority: 10,
+            },
+            // ── Finance (priority 65) ──
+            IntentRule {
+                category: IntentCategory::Finance,
+                keywords: vec![
+                    "股价", "行情", "涨跌", "k线", "市值", "etf", "基金", "期货",
+                    "股票", "买入", "卖出", "仓位", "盈亏", "止损", "市盈率", "分红",
+                    "stock", "trading", "portfolio", "market cap", "fund", "futures",
+                    "dividend", "bull market", "bear market", "shares",
+                    "a股", "港股", "美股", "纳斯达克", "道琼斯", "上证", "深证", "沪深",
+                ],
+                patterns: vec![
+                    Regex::new(r"(?i)\b(stock\s*price|market\s*cap|p/e\s*ratio|pe\s*ratio)\b").unwrap(),
+                    Regex::new(r"\d+(\.\d+)?\s*(元|美元|港元|点位)").unwrap(),
+                ],
+                negative: vec![],
+                keywords_dyn: vec![],
+                negative_dyn: vec![],
+                priority: 65,
+            },
+            // ── Blockchain (priority 65) ──
+            IntentRule {
+                category: IntentCategory::Blockchain,
+                keywords: vec![
+                    "区块链", "链上", "钱包", "合约", "nft", "代币", "挖矿", "gas费",
+                    "转账", "defi", "dao", "公链", "私钥", "助记词",
+                    "blockchain", "crypto", "bitcoin", "ethereum", "solana",
+                    "wallet", "token", "mining",
+                ],
+                patterns: vec![
+                    Regex::new(r"0x[0-9a-fA-F]{40}").unwrap(),
+                    Regex::new(r"(?i)\b(BTC|ETH|BNB|SOL|USDT|USDC|MATIC|AVAX)\b").unwrap(),
+                ],
+                negative: vec![],
+                keywords_dyn: vec![],
+                negative_dyn: vec![],
+                priority: 65,
+            },
+            // ── FileOps (priority 60) ──
+            IntentRule {
+                category: IntentCategory::FileOps,
+                keywords: vec![
+                    "读文件", "写文件", "创建文件", "删除文件", "列目录", "列出文件",
+                    "重命名", "打开文件", "编辑文件", "复制文件", "移动文件",
+                    "read file", "write file", "create file", "delete file",
+                    "list dir", "open file", "edit file", "rename file",
+                ],
+                patterns: vec![
+                    Regex::new(r"(?i)\.(rs|py|go|js|ts|json|toml|yaml|yml|md|txt|csv|sh|log|conf|cfg|ini)\b").unwrap(),
+                    Regex::new(r"(?i)(read|write|edit|create|delete|rename|copy|move)\s+(file|directory|folder|dir)").unwrap(),
+                    Regex::new(r"(?i)\b(cat|ls|mkdir|rm|cp|mv|touch|chmod)\s+").unwrap(),
+                ],
+                negative: vec![],
+                keywords_dyn: vec![],
+                negative_dyn: vec![],
+                priority: 60,
+            },
+            // ── WebSearch (priority 55) ──
+            IntentRule {
+                category: IntentCategory::WebSearch,
+                keywords: vec![
+                    "搜索", "查一下", "查询", "找一找", "查找", "搜一搜", "百度", "谷歌", "网上找",
+                    "search", "google", "bing", "look up", "find out", "browse",
+                ],
+                patterns: vec![
+                    Regex::new(r"(?i)\b(what\s+is|how\s+to|where\s+is|when\s+did|who\s+is)\b").unwrap(),
+                    Regex::new(r"(?i)(网上|网页|互联网|internet|web)\s*(搜|找|查|看)").unwrap(),
+                ],
+                negative: vec!["股价", "行情", "stock price"],
+                keywords_dyn: vec![],
+                negative_dyn: vec![],
+                priority: 55,
+            },
+            // ── DataAnalysis (priority 60) ──
+            IntentRule {
+                category: IntentCategory::DataAnalysis,
+                keywords: vec![
+                    "数据分析", "图表", "可视化", "统计", "报表", "画图",
+                    "折线图", "柱状图", "饼图", "散点图",
+                    "analyze", "chart", "graph", "plot", "visualize",
+                    "statistics", "report", "dashboard",
+                ],
+                patterns: vec![
+                    Regex::new(r"(?i)(数据|data)\s*(处理|分析|清洗|转换|导出|挖掘)").unwrap(),
+                    Regex::new(r"(?i)(生成|绘制|画)\s*(图|表|报告)").unwrap(),
+                    Regex::new(r"(?i)\.(csv|xlsx|xls|parquet)\b").unwrap(),
+                ],
+                negative: vec![],
+                keywords_dyn: vec![],
+                negative_dyn: vec![],
+                priority: 60,
+            },
+            // ── Communication (priority 60) ──
+            IntentRule {
+                category: IntentCategory::Communication,
+                keywords: vec![
+                    "发邮件", "发消息", "发短信", "通知", "群发", "回复消息", "发送邮件",
+                    "send email", "send message", "notify", "email to",
+                ],
+                patterns: vec![
+                    Regex::new(r"(?i)(发送|send)\s*(邮件|email|消息|message|通知|notification)").unwrap(),
+                    Regex::new(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}").unwrap(),
+                ],
+                negative: vec![],
+                keywords_dyn: vec![],
+                negative_dyn: vec![],
+                priority: 60,
+            },
+            // ── SystemControl (priority 60) ──
+            IntentRule {
+                category: IntentCategory::SystemControl,
+                keywords: vec![
+                    "系统信息", "cpu", "内存", "磁盘", "进程", "截图", "相机", "拍照",
+                    "打开应用", "关闭应用", "系统状态",
+                    "system info", "cpu usage", "disk space",
+                    "process", "screenshot", "camera",
+                ],
+                patterns: vec![
+                    Regex::new(r"(?i)(打开|关闭|重启|安装|卸载)\s*(应用|软件|程序|app)").unwrap(),
+                    Regex::new(r"(?i)(系统|system)\s*(负载|使用率|状态|监控)").unwrap(),
+                ],
+                negative: vec![],
+                keywords_dyn: vec![],
+                negative_dyn: vec![],
+                priority: 60,
+            },
+            // ── Organization (priority 55) ──
+            IntentRule {
+                category: IntentCategory::Organization,
+                keywords: vec![
+                    "定时", "提醒", "日程", "任务", "计划", "待办", "cron", "记住",
+                    "记录", "备忘", "记事",
+                    "remind me", "schedule task", "todo list", "calendar event",
+                ],
+                patterns: vec![
+                    Regex::new(r"(?i)(设置|创建|添加)\s*(提醒|任务|日程|闹钟)").unwrap(),
+                    Regex::new(r"\d+\s*(分钟|小时|天|周)\s*(后|内|提醒)").unwrap(),
+                    Regex::new(r"(?i)(every|每)\s*(day|天|hour|小时|week|周)").unwrap(),
+                ],
+                negative: vec![],
+                keywords_dyn: vec![],
+                negative_dyn: vec![],
+                priority: 55,
+            },
+            // ── IoT (priority 65) ──
+            IntentRule {
+                category: IntentCategory::IoT,
+                keywords: vec![
+                    "iot", "智能家居", "传感器", "设备控制", "mqtt",
+                    "温度计", "湿度", "灯光",
+                    "smart home", "sensor", "temperature", "humidity",
+                    "thermostat", "zigbee",
+                ],
+                patterns: vec![
+                    Regex::new(r"(?i)(打开|关闭|调节)\s*(灯|空调|窗帘|风扇|暖气|热水器)").unwrap(),
+                    Regex::new(r"(?i)\b(mqtt|zigbee|z-wave|homeassistant|home\s*assistant)\b").unwrap(),
+                ],
+                negative: vec![],
+                keywords_dyn: vec![],
+                negative_dyn: vec![],
+                priority: 65,
+            },
+            // ── Media (priority 60) ──
+            IntentRule {
+                category: IntentCategory::Media,
+                keywords: vec![
+                    "语音转文字", "文字转语音", "ocr", "识图", "图片理解",
+                    "视频处理", "音频", "转写", "字幕",
+                    "transcribe", "tts", "text to speech", "image recognition",
+                    "video process", "audio",
+                ],
+                patterns: vec![
+                    Regex::new(r"(?i)(识别|提取|转换)\s*(图片|图像|音频|视频|文字|语音)").unwrap(),
+                    Regex::new(r"(?i)\.(mp3|mp4|wav|avi|mkv|jpg|jpeg|png|gif|webp)\b").unwrap(),
+                    Regex::new(r"(?i)(语音|voice|audio)\s*(识别|转文|to\s*text)").unwrap(),
+                ],
+                negative: vec![],
+                keywords_dyn: vec![],
+                negative_dyn: vec![],
+                priority: 60,
+            },
+            // ── DevOps (priority 60) ──
+            IntentRule {
+                category: IntentCategory::DevOps,
+                keywords: vec![
+                    "部署", "运维", "监控", "端口", "加密", "解密",
+                    "哈希", "证书", "ssh", "docker", "kubernetes", "k8s",
+                    "deploy", "devops", "encrypt", "decrypt",
+                    "hash", "certificate", "firewall",
+                ],
+                patterns: vec![
+                    Regex::new(r"(?i)\b(GET|POST|PUT|DELETE|PATCH)\s+https?://").unwrap(),
+                    Regex::new(r"(?i)\b(ping|curl|wget|nmap|ssh|scp)\s+").unwrap(),
+                    Regex::new(r"(?i)\b(docker|kubectl|helm)\s+(run|build|push|deploy|apply)").unwrap(),
+                ],
+                negative: vec![],
+                keywords_dyn: vec![],
+                negative_dyn: vec![],
+                priority: 60,
+            },
+            // ── Lifestyle (priority 50) ──
+            IntentRule {
+                category: IntentCategory::Lifestyle,
+                keywords: vec![
+                    "健康", "运动", "饮食", "卡路里", "跑步", "睡眠",
+                    "天气", "菜谱", "旅游", "生活", "体重", "减肥",
+                    "health", "exercise", "diet", "calories", "sleep",
+                    "weather", "recipe", "travel",
+                ],
+                patterns: vec![
+                    Regex::new(r"(?i)(今天|明天|后天)\s*(天气|气温|下雨|温度)").unwrap(),
+                    Regex::new(r"(?i)(推荐|建议)\s*(菜|食谱|运动|健身)").unwrap(),
+                ],
+                negative: vec![],
+                keywords_dyn: vec![],
+                negative_dyn: vec![],
+                priority: 50,
             },
         ];
 
         Self { rules }
+    }
+
+    /// 在内置规则基础上，叠加来自配置文件的自定义规则，返回新的分类器实例。
+    /// 当 `extra_rules` 为空时等价于 `Self::new()`。
+    ///
+    /// 配置规则始终在内置规则之后追加，优先级由配置中的 priority 字段决定。
+    /// 如果配置文件中出现重复 category，只会记录第一次，忽略后续重复项并发出警告。
+    pub fn with_extra_rules(extra_rules: &[blockcell_core::config::IntentRuleConfig]) -> Self {
+        let mut classifier = Self::new();
+        // 用 String 而非 &IntentCategory 引用，避免 borrow 冲突
+        let mut seen_extra_categories: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for rule_cfg in extra_rules {
+            let Some(category) = IntentCategory::from_name(&rule_cfg.category) else {
+                tracing::warn!(
+                    category = %rule_cfg.category,
+                    "intentRouter.intentRules 中包含未知的意图类别，已跳过"
+                );
+                continue;
+            };
+            // 配置文件出现重复 category 时，只记录第一次并警告
+            if !seen_extra_categories.insert(rule_cfg.category.clone()) {
+                tracing::warn!(
+                    category = %rule_cfg.category,
+                    "intentRouter.intentRules 中重复的 category 已跳过"
+                );
+                continue;
+            }
+            let mut patterns = Vec::new();
+            for pat in &rule_cfg.patterns {
+                match Regex::new(pat) {
+                    Ok(re) => patterns.push(re),
+                    Err(e) => {
+                        tracing::warn!(
+                            pattern = %pat,
+                            error = %e,
+                            "intentRouter.intentRules 中的正则表达式无效，已跳过"
+                        );
+                    }
+                }
+            }
+            // 预先 lowercase，避免每次匹配时重复分配
+            let keywords_dyn: Vec<String> =
+                rule_cfg.keywords.iter().map(|s| s.to_lowercase()).collect();
+            let negative_dyn: Vec<String> =
+                rule_cfg.negative.iter().map(|s| s.to_lowercase()).collect();
+            classifier.rules.push(IntentRule {
+                category,
+                keywords: vec![],
+                keywords_dyn,
+                patterns,
+                negative: vec![],
+                negative_dyn,
+                priority: rule_cfg.priority,
+            });
+        }
+        classifier
     }
 
     /// Classify user input into one or more intent categories.
@@ -135,8 +439,8 @@ impl IntentClassifier {
             return vec![IntentCategory::Unknown];
         }
 
-        // Sort by priority descending
-        matches.sort_by(|a, b| b.1.cmp(&a.1));
+        // Sort by priority descending; use category name as secondary key for determinism
+        matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
         matches.dedup_by(|a, b| a.0 == b.0);
 
         // If Chat is the only match, return it alone
@@ -156,8 +460,13 @@ impl IntentClassifier {
     }
 
     fn rule_matches(&self, rule: &IntentRule, input: &str, input_lower: &str) -> bool {
-        // Check negative keywords first
-        for neg in &rule.negative {
+        // Check negative keywords first (static + pre-lowercased dynamic)
+        for neg in rule
+            .negative
+            .iter()
+            .copied()
+            .chain(rule.negative_dyn.iter().map(String::as_str))
+        {
             if input_lower.contains(&neg.to_lowercase()) {
                 return false;
             }
@@ -170,9 +479,14 @@ impl IntentClassifier {
             }
         }
 
-        // Check keywords
+        // Check keywords (static + pre-lowercased dynamic — avoid double-lowercasing)
         for keyword in &rule.keywords {
             if input_lower.contains(&keyword.to_lowercase()) {
+                return true;
+            }
+        }
+        for keyword in rule.keywords_dyn.iter() {
+            if input_lower.contains(keyword.as_str()) {
                 return true;
             }
         }
@@ -423,22 +737,323 @@ mod tests {
     #[test]
     fn test_non_chat_classification_falls_back_to_unknown() {
         let classifier = IntentClassifier::new();
+        // 现在这些有了明确意图规则，不再是 Unknown
         assert_eq!(
             classifier.classify("查一下茅台股价"),
-            vec![IntentCategory::Unknown]
+            vec![IntentCategory::Finance]
         );
         assert_eq!(
             classifier.classify("0x1234567890abcdef1234567890abcdef12345678 这个地址安全吗"),
-            vec![IntentCategory::Unknown]
+            vec![IntentCategory::Blockchain]
         );
         assert_eq!(
             classifier.classify("帮我读一下 config.json5"),
-            vec![IntentCategory::Unknown]
+            vec![IntentCategory::FileOps]
         );
+        // 完全模糊的输入仍然是 Unknown
         assert_eq!(
             classifier.classify("帮我做一件复杂的事情"),
             vec![IntentCategory::Unknown]
         );
+    }
+
+    #[test]
+    fn test_finance_classification() {
+        let c = IntentClassifier::new();
+        assert_eq!(c.classify("查一下茅台股价"), vec![IntentCategory::Finance]);
+        assert_eq!(
+            c.classify("我想了解一下A股行情"),
+            vec![IntentCategory::Finance]
+        );
+        assert_eq!(c.classify("介绍一下ETF基金"), vec![IntentCategory::Finance]);
+        // 负例：普通问候不应触发 Finance
+        assert_ne!(c.classify("你好"), vec![IntentCategory::Finance]);
+        assert_ne!(c.classify("再见"), vec![IntentCategory::Finance]);
+    }
+
+    #[test]
+    fn test_blockchain_classification() {
+        let c = IntentClassifier::new();
+        assert_eq!(
+            c.classify("0x742d35Cc6634C0532925a3b844Bc454e4438f44e 这个地址安全吗"),
+            vec![IntentCategory::Blockchain]
+        );
+        assert_eq!(
+            c.classify("钱包里的ETH怎么转账"),
+            vec![IntentCategory::Blockchain]
+        );
+        assert_eq!(
+            c.classify("区块链上的NFT怎么铸造"),
+            vec![IntentCategory::Blockchain]
+        );
+        // 负例
+        assert_ne!(c.classify("你好"), vec![IntentCategory::Blockchain]);
+    }
+
+    #[test]
+    fn test_fileops_classification() {
+        let c = IntentClassifier::new();
+        assert_eq!(
+            c.classify("帮我读一下 config.json5"),
+            vec![IntentCategory::FileOps]
+        );
+        assert_eq!(
+            c.classify("列出当前目录的文件"),
+            vec![IntentCategory::FileOps]
+        );
+        assert_eq!(
+            c.classify("edit the README.md file"),
+            vec![IntentCategory::FileOps]
+        );
+        assert_eq!(
+            c.classify("创建一个新的 main.rs 文件"),
+            vec![IntentCategory::FileOps]
+        );
+        // 负例：URL 中的文件扩展名（无空格边界）不应触发 FileOps
+        assert_ne!(
+            c.classify("打开 https://example.com/main.rs 看看"),
+            vec![IntentCategory::FileOps]
+        );
+        // 负例："rs" 作为单词一部分不触发
+        assert_ne!(
+            c.classify("我喜欢 rust 和 python"),
+            vec![IntentCategory::FileOps]
+        );
+        // 负例
+        assert_ne!(c.classify("谢谢"), vec![IntentCategory::FileOps]);
+    }
+
+    #[test]
+    fn test_websearch_classification() {
+        let c = IntentClassifier::new();
+        assert_eq!(
+            c.classify("搜索一下量子计算"),
+            vec![IntentCategory::WebSearch]
+        );
+        assert_eq!(
+            c.classify("google how to learn rust"),
+            vec![IntentCategory::WebSearch]
+        );
+        assert_eq!(
+            c.classify("what is a neural network"),
+            vec![IntentCategory::WebSearch]
+        );
+        // 股价搜索应该命中 Finance negative 过滤，不触发 WebSearch
+        let result = c.classify("搜索一下股价行情");
+        assert!(!result.contains(&IntentCategory::WebSearch));
+    }
+
+    #[test]
+    fn test_dataanalysis_classification() {
+        let c = IntentClassifier::new();
+        assert_eq!(
+            c.classify("帮我做一个数据分析"),
+            vec![IntentCategory::DataAnalysis]
+        );
+        assert_eq!(
+            c.classify("画一个折线图"),
+            vec![IntentCategory::DataAnalysis]
+        );
+        assert_eq!(
+            c.classify("分析这个 data.csv 文件"),
+            vec![IntentCategory::DataAnalysis]
+        );
+        // 负例：闲聊中的图表字样不应触发
+        assert_ne!(
+            c.classify("今天天气真好"),
+            vec![IntentCategory::DataAnalysis]
+        );
+    }
+
+    #[test]
+    fn test_communication_classification() {
+        let c = IntentClassifier::new();
+        assert_eq!(
+            c.classify("发邮件给 boss@company.com"),
+            vec![IntentCategory::Communication]
+        );
+        assert_eq!(
+            c.classify("帮我发一条消息通知团队"),
+            vec![IntentCategory::Communication]
+        );
+        // 负例：提到邮件地址但不是要发邮件
+        assert_ne!(
+            c.classify("我的邮箱是 user@domain.com，记得联系我"),
+            vec![IntentCategory::Communication]
+        );
+    }
+
+    #[test]
+    fn test_systemcontrol_classification() {
+        let c = IntentClassifier::new();
+        assert_eq!(
+            c.classify("查看当前CPU使用率"),
+            vec![IntentCategory::SystemControl]
+        );
+        assert_eq!(
+            c.classify("打开微信应用"),
+            vec![IntentCategory::SystemControl]
+        );
+        assert_eq!(
+            c.classify("系统负载状态怎么样"),
+            vec![IntentCategory::SystemControl]
+        );
+        // 负例：内存作为日常用语不应触发
+        assert_ne!(
+            c.classify("我最近记忆力不太好"),
+            vec![IntentCategory::SystemControl]
+        );
+    }
+
+    #[test]
+    fn test_organization_classification() {
+        let c = IntentClassifier::new();
+        assert_eq!(
+            c.classify("30分钟后提醒我开会"),
+            vec![IntentCategory::Organization]
+        );
+        assert_eq!(
+            c.classify("添加一个每天的提醒"),
+            vec![IntentCategory::Organization]
+        );
+        assert_eq!(
+            c.classify("设置一个早上8点的日程"),
+            vec![IntentCategory::Organization]
+        );
+        // 负例：cargo task 是构建命令，不是任务管理
+        assert_ne!(
+            c.classify("cargo task build"),
+            vec![IntentCategory::Organization]
+        );
+    }
+
+    #[test]
+    fn test_iot_classification() {
+        let c = IntentClassifier::new();
+        assert_eq!(c.classify("打开客厅的灯"), vec![IntentCategory::IoT]);
+        assert_eq!(c.classify("调节空调温度"), vec![IntentCategory::IoT]);
+        assert_eq!(c.classify("关闭窗帘"), vec![IntentCategory::IoT]);
+        // 负例：问温度是 Lifestyle，不是 IoT
+        assert_ne!(c.classify("今天温度多少度"), vec![IntentCategory::IoT]);
+    }
+
+    #[test]
+    fn test_media_classification() {
+        let c = IntentClassifier::new();
+        assert_eq!(
+            c.classify("帮我识别这张图片里的文字"),
+            vec![IntentCategory::Media]
+        );
+        assert_eq!(
+            c.classify("把这段音频转成文字"),
+            vec![IntentCategory::Media]
+        );
+        assert_eq!(
+            c.classify("处理一下这个 video.mp4 文件"),
+            vec![IntentCategory::Media]
+        );
+        // 负例：提到 mp4 但只是闲聊不应触发
+        assert_ne!(
+            c.classify("我下载了一个 video.mp4 视频"),
+            vec![IntentCategory::Media]
+        );
+    }
+
+    #[test]
+    fn test_devops_classification() {
+        let c = IntentClassifier::new();
+        assert_eq!(
+            c.classify("POST https://api.example.com/users"),
+            vec![IntentCategory::DevOps]
+        );
+        assert_eq!(c.classify("ping 192.168.1.1"), vec![IntentCategory::DevOps]);
+        assert_eq!(
+            c.classify("docker build -t myapp ."),
+            vec![IntentCategory::DevOps]
+        );
+        // 负例：问 curl 命令是什么不应触发 DevOps（是问问题，不是用工具）
+        assert_ne!(c.classify("curl 命令是什么"), vec![IntentCategory::DevOps]);
+    }
+
+    #[test]
+    fn test_lifestyle_classification() {
+        let c = IntentClassifier::new();
+        assert_eq!(
+            c.classify("今天天气怎么样"),
+            vec![IntentCategory::Lifestyle]
+        );
+        assert_eq!(
+            c.classify("推荐一个健康的菜谱"),
+            vec![IntentCategory::Lifestyle]
+        );
+        assert_eq!(
+            c.classify("明天温度多少度"),
+            vec![IntentCategory::Lifestyle]
+        );
+        // 负例：问内存价格不应触发 Lifestyle
+        assert_ne!(
+            c.classify("内存价格最近怎么样"),
+            vec![IntentCategory::Lifestyle]
+        );
+    }
+
+    #[test]
+    fn test_unknown_for_truly_ambiguous_input() {
+        let c = IntentClassifier::new();
+        assert_eq!(
+            c.classify("帮我做一件复杂的事情"),
+            vec![IntentCategory::Unknown]
+        );
+        assert_eq!(
+            c.classify("balabala xyzzy quux"),
+            vec![IntentCategory::Unknown]
+        );
+    }
+
+    #[test]
+    fn test_global_singleton_is_same_instance() {
+        let a = IntentClassifier::global();
+        let b = IntentClassifier::global();
+        // 同一个 static 引用，地址应该相同
+        assert!(std::ptr::eq(a, b));
+    }
+
+    #[test]
+    fn test_with_extra_rules_adds_and_deduplicates() {
+        // 测试追加配置规则时：内置规则保留；重复 extra category 只添加第一个并警告
+        let extra = vec![
+            blockcell_core::config::IntentRuleConfig {
+                category: "Finance".to_string(),
+                keywords: vec!["狗狗币".to_string(), "屎币".to_string()],
+                patterns: vec![],
+                negative: vec![],
+                priority: 70,
+            },
+            blockcell_core::config::IntentRuleConfig {
+                category: "Finance".to_string(), // 重复 category，跳过
+                keywords: vec!["其他币".to_string()],
+                patterns: vec![],
+                negative: vec![],
+                priority: 70,
+            },
+            blockcell_core::config::IntentRuleConfig {
+                category: "IoT".to_string(),
+                keywords: vec!["热水器".to_string()],
+                patterns: vec![],
+                negative: vec![],
+                priority: 65,
+            },
+        ];
+        let c = IntentClassifier::with_extra_rules(&extra);
+        // 第一个 Finance extra 规则中的两个关键词都应该匹配
+        assert_eq!(
+            c.classify("查一下狗狗币价格"),
+            vec![IntentCategory::Finance]
+        );
+        assert_eq!(c.classify("查一下屎币"), vec![IntentCategory::Finance]);
+        // 第二个 Finance extra 被跳过，所以"其他币"不触发 Finance（只有内置关键词"股价"等会触发）
+        assert_ne!(c.classify("查一下其他币"), vec![IntentCategory::Finance]);
+        assert_eq!(c.classify("打开热水器"), vec![IntentCategory::IoT]);
     }
 
     #[test]

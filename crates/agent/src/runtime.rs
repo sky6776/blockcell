@@ -3286,7 +3286,21 @@ impl AgentRuntime {
             }
         }
 
-        let classifier = crate::intent::IntentClassifier::new();
+        // 配置文件中有自定义意图规则时，叠加到内置规则上；否则使用全局单例（避免重复编译正则）
+        let config_intent_rules = self
+            .config
+            .intent_router
+            .as_ref()
+            .map(|r| r.intent_rules.as_slice())
+            .unwrap_or(&[]);
+        let _classifier_owned;
+        let classifier: &crate::intent::IntentClassifier = if config_intent_rules.is_empty() {
+            crate::intent::IntentClassifier::global()
+        } else {
+            _classifier_owned =
+                crate::intent::IntentClassifier::with_extra_rules(config_intent_rules);
+            &_classifier_owned
+        };
 
         // Load disabled toggles for filtering
         let disabled_tools = load_disabled_toggles(&self.paths, "tools");
@@ -3303,7 +3317,7 @@ impl AgentRuntime {
             .decide_interaction(
                 &msg,
                 &disabled_skills,
-                &classifier,
+                classifier,
                 &history,
                 &session_metadata,
             )
@@ -4883,44 +4897,62 @@ impl AgentRuntime {
                     tool_call.name
                 ));
             } else if let Some(evo_service) = self.context_builder.evolution_service() {
-                // Preserve any legacy top-level Rhai asset as supplemental evolution context.
-                let source_snippet = self
+                // OpenClaw skill 不触发自进化
+                let is_openclaw = self
                     .context_builder
                     .skill_manager()
-                    .and_then(|sm| sm.get(&tool_call.name))
-                    .and_then(|skill| skill.load_rhai());
-                match evo_service
-                    .report_error(&tool_call.name, &result_str, source_snippet, vec![])
-                    .await
-                {
-                    Ok(report) => {
-                        if report.evolution_triggered.is_some() {
-                            learning_hint = Some(format!(
-                                "[系统] 技能 `{}` 执行失败，已自动触发进化学习。\
+                    .is_some_and(|sm| sm.is_tool_from_openclaw(&tool_call.name));
+                if is_openclaw {
+                    debug!(
+                        tool = %tool_call.name,
+                        "Skipping evolution for OpenClaw skill"
+                    );
+                } else {
+                    // Preserve any legacy top-level Rhai asset as supplemental evolution context.
+                    let source_snippet = self
+                        .context_builder
+                        .skill_manager()
+                        .and_then(|sm| sm.get(&tool_call.name))
+                        .and_then(|skill| skill.load_rhai());
+                    match evo_service
+                        .report_error(&tool_call.name, &result_str, source_snippet, vec![])
+                        .await
+                    {
+                        Ok(report) => {
+                            if report.evolution_triggered.is_some() {
+                                learning_hint = Some(format!(
+                                    "[系统] 技能 `{}` 执行失败，已自动触发进化学习。\
                                 请向用户坦诚说明：你暂时还不具备这个技能，但已经开始学习，\
                                 学会后会自动生效。同时尝试用其他方式帮助用户解决当前问题。",
-                                tool_call.name
-                            ));
-                        } else if report.evolution_in_progress {
-                            learning_hint = Some(format!(
-                                "[系统] 技能 `{}` 执行失败，该技能正在学习改进中。\
+                                    tool_call.name
+                                ));
+                            } else if report.evolution_in_progress {
+                                learning_hint = Some(format!(
+                                    "[系统] 技能 `{}` 执行失败，该技能正在学习改进中。\
                                 请告诉用户：这个技能正在学习中，请稍后再试。",
-                                tool_call.name
-                            ));
+                                    tool_call.name
+                                ));
+                            }
                         }
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "Evolution report_error failed");
+                        Err(e) => {
+                            debug!(error = %e, "Evolution report_error failed");
+                        }
                     }
                 }
             }
         }
-        // 报告调用结果给灰度统计
+        // 报告调用结果给灰度统计（OpenClaw skill 跳过）
         if let Some(evo_service) = self.context_builder.evolution_service() {
-            let reported_name = tool_call.name.clone();
-            evo_service
-                .report_skill_call(&reported_name, is_error)
-                .await;
+            let is_openclaw = self
+                .context_builder
+                .skill_manager()
+                .is_some_and(|sm| sm.is_tool_from_openclaw(&tool_call.name));
+            if !is_openclaw {
+                let reported_name = tool_call.name.clone();
+                evo_service
+                    .report_skill_call(&reported_name, is_error)
+                    .await;
+            }
         }
 
         // Emit tool_call_result event to WebSocket clients
@@ -6696,6 +6728,7 @@ mod tests {
             inject_prompt_md: true,
             tools: vec!["finance_api".to_string()],
             fallback_message: None,
+            source: blockcell_skills::manager::SkillSource::BlockCell,
         };
 
         let tool_names = resolve_effective_tool_names(
@@ -7115,6 +7148,7 @@ description: script demo
             inject_prompt_md: true,
             tools: vec![],
             fallback_message: None,
+            source: blockcell_skills::manager::SkillSource::BlockCell,
         };
 
         let tool_names = runtime.resolved_skill_tool_names(&active_skill);
@@ -7660,6 +7694,7 @@ description: local demo
             inject_prompt_md: true,
             tools: vec!["write_file".to_string()],
             fallback_message: None,
+            source: blockcell_skills::manager::SkillSource::BlockCell,
         };
 
         let continued = suppress_prompt_reinjection_for_continued_skill(

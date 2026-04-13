@@ -83,17 +83,17 @@ impl Tool for ExecSkillScriptTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "exec_skill_script",
-            description: "Execute a skill-local script asset. `.rhai` runs in-process; other paths run like exec_local.",
+            description: "Execute a skill-local script asset. `.rhai` runs in-process; other paths run like exec_local. The `path` must be RELATIVE (e.g. `scripts/run.py`), never absolute. If the skill manual shows `{baseDir}/scripts/...`, strip the `{baseDir}/` prefix.",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path to the script or executable inside the active skill directory."
+                        "description": "RELATIVE path to the script inside the active skill directory (e.g. `scripts/run.py`). Must NOT be absolute. The tool auto-infers the interpreter from the file extension (.py→python3, .sh→sh, .js→node)."
                     },
                     "runner": {
                         "type": "string",
-                        "description": "Optional interpreter for process-backed assets. Allowed: python3, bash, sh, node, php."
+                        "description": "Optional interpreter override. Allowed: python3, python, bash, sh, node, php, uv. Auto-inferred from extension when omitted."
                     },
                     "args": {
                         "type": "array",
@@ -156,8 +156,12 @@ impl Tool for ExecSkillScriptTool {
 
     async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
         let skill_dir = ctx.active_skill_dir.clone().ok_or_else(|| {
-            Error::PermissionDenied(
-                "`exec_skill_script` is only available inside an active skill execution scope"
+            // Use Tool error (not PermissionDenied) to avoid Permanent classification.
+            // Hint tells the LLM to use activate_skill first.
+            Error::Tool(
+                "exec_skill_script requires an active skill context. \
+                Use the `activate_skill` tool first, e.g. \
+                activate_skill({skill_name: \"<skill-name>\", goal: \"<goal>\"})"
                     .to_string(),
             )
         })?;

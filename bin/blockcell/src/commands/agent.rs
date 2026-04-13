@@ -751,7 +751,10 @@ pub async fn run(
             while let Some(msg) = outbound_rx.recv().await {
                 match msg.channel.as_str() {
                     "cli" => {
-                        // Skip: already printed via streaming events
+                        // Print content if present (skill loops use non-streaming calls)
+                        if !msg.content.is_empty() {
+                            let _ = printer_tx.send(msg).await;
+                        }
                     }
                     "cron" => {
                         let _ = printer_tx.send(msg).await;

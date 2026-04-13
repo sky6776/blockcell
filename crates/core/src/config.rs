@@ -424,6 +424,32 @@ pub struct IntentToolProfileConfig {
     pub deny_tools: Vec<String>,
 }
 
+/// 配置文件中自定义的意图匹配规则，与代码内置规则互补。
+/// 每条规则对应一个 IntentCategory，命中即叠加到分类结果中。
+/// 注意：`category` 必须填写，空字符串会被 `with_extra_rules` 跳过并 warn。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntentRuleConfig {
+    /// 意图类别名称，对应 IntentCategory::as_str()，如 "Finance"、"FileOps"
+    pub category: String,
+    /// 关键词列表（大小写不敏感，出现即命中）
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    /// 正则表达式列表（任意一条匹配即命中）
+    #[serde(default)]
+    pub patterns: Vec<String>,
+    /// 否定关键词（出现时跳过该规则）
+    #[serde(default)]
+    pub negative: Vec<String>,
+    /// 优先级（0-255，越高越优先）
+    #[serde(default = "default_intent_rule_priority")]
+    pub priority: u8,
+}
+
+fn default_intent_rule_priority() -> u8 {
+    60
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IntentRouterConfig {
@@ -435,6 +461,9 @@ pub struct IntentRouterConfig {
     pub agent_profiles: HashMap<String, String>,
     #[serde(default = "default_intent_router_profiles")]
     pub profiles: HashMap<String, IntentToolProfileConfig>,
+    /// 配置文件中自定义的意图匹配规则，与代码内置规则互补（叠加，不覆盖）。
+    #[serde(default)]
+    pub intent_rules: Vec<IntentRuleConfig>,
 }
 
 impl Default for IntentRouterConfig {
@@ -444,6 +473,7 @@ impl Default for IntentRouterConfig {
             default_profile: default_intent_router_profile(),
             agent_profiles: HashMap::new(),
             profiles: default_intent_router_profiles(),
+            intent_rules: Vec::new(),
         }
     }
 }
@@ -1758,6 +1788,9 @@ pub struct Config {
     /// Higher values reduce CPU/disk I/O but lower time precision.
     #[serde(default = "default_cron_tick_interval")]
     pub cron_tick_interval_secs: u64,
+    /// 是否启用 OpenClaw skill 兼容加载（默认 false）
+    #[serde(default)]
+    pub openclaw_skill_enabled: bool,
 }
 
 fn default_cron_tick_interval() -> u64 {
@@ -1903,6 +1936,7 @@ impl Default for Config {
             security: SecurityConfig::default(),
             default_timezone: None,
             cron_tick_interval_secs: default_cron_tick_interval(),
+            openclaw_skill_enabled: false,
         }
     }
 }
@@ -2077,7 +2111,17 @@ impl Config {
         };
 
         // Check if we need to update the config file with missing fields
-        let needs_save = config.default_timezone.is_none() && config_path.exists();
+        let mut needs_save = config.default_timezone.is_none() && config_path.exists();
+
+        // Ensure openclawSkillEnabled field exists in config file
+        if config_path.exists() {
+            if let Ok(raw) = std::fs::read_to_string(&config_path) {
+                if !raw.contains("openclawSkillEnabled") {
+                    tracing::info!("Adding missing openclawSkillEnabled field to config");
+                    needs_save = true;
+                }
+            }
+        }
 
         // Detect timezone if not set (only for existing configs with missing field)
         let config = if config.default_timezone.is_none() {
