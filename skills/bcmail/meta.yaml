@@ -1,0 +1,15 @@
+name: bcmail
+description: 通过本地 bcmail CLI 收发邮件、搜索收件箱，并按邮箱域名自动选择 IMAP/SMTP 配置。
+tools:
+  - exec
+requires:
+  bins:
+    - python3
+  env:
+    - BCMAIL_EMAIL
+    - BCMAIL_PASSWORD
+permissions:
+  - system.exec
+fallback:
+  strategy: degrade
+  message: 当前无法完成邮件操作，请先检查 BCMAIL_EMAIL、BCMAIL_PASSWORD、本地 Python 环境和网络连接。
