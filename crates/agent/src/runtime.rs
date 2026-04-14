@@ -940,14 +940,16 @@ fn resolve_effective_tool_names(
     available_tools: &HashSet<String>,
 ) -> Vec<String> {
     // 1. 先检查 intent_router.enabled
-    let router_enabled = config.intent_router
+    let router_enabled = config
+        .intent_router
         .as_ref()
         .map(|r| r.enabled)
         .unwrap_or(true);
 
     if !router_enabled {
         // 2. enabled=false 时，检查 load_all_tools
-        let load_all = config.intent_router
+        let load_all = config
+            .intent_router
             .as_ref()
             .map(|r| r.load_all_tools)
             .unwrap_or(false);
@@ -3967,6 +3969,20 @@ impl AgentRuntime {
                     if is_error {
                         let failure_kind = classify_tool_failure(&result);
                         match failure_kind {
+                            ToolFailureKind::SkillContextMissing => {
+                                // Skill context missing — give friendly hint to activate skill first
+                                let hint = format!(
+                                    "💡 工具 `{}` 需要先激活技能才能使用。\n\
+                                     请先调用 `activate_skill` 工具激活技能，例如：\n\
+                                     ```\n\
+                                     activate_skill({{skill_name: \"<技能名>\", goal: \"<目标>\"}})\n\
+                                     ```\n\
+                                     激活后再调用 `{}` 执行技能脚本。",
+                                    tool_call.name, tool_call.name
+                                );
+                                info!(tool = %tool_call.name, "Skill context missing — suggesting activate_skill");
+                                current_messages.push(ChatMessage::user(&hint));
+                            }
                             ToolFailureKind::Permanent | ToolFailureKind::Transient => {
                                 let count =
                                     tool_fail_counts.entry(tool_call.name.clone()).or_insert(0);
@@ -8309,11 +8325,16 @@ description: local demo
             }
         }"#;
         let config: Config = serde_json::from_str(raw).unwrap();
-        let available: HashSet<String> =
-            ["read_file", "write_file", "exec", "web_search", "napcat_send"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let available: HashSet<String> = [
+            "read_file",
+            "write_file",
+            "exec",
+            "web_search",
+            "napcat_send",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let tools = resolve_effective_tool_names(
             &config,
             InteractionMode::General,
@@ -8356,11 +8377,10 @@ description: local demo
             }
         }"#;
         let config: Config = serde_json::from_str(raw).unwrap();
-        let available: HashSet<String> =
-            ["read_file", "napcat_send", "napcat_receive"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let available: HashSet<String> = ["read_file", "napcat_send", "napcat_receive"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let tools = resolve_effective_tool_names(
             &config,
             InteractionMode::General,
@@ -8401,11 +8421,10 @@ description: local demo
             }
         }"#;
         let config: Config = serde_json::from_str(raw).unwrap();
-        let available: HashSet<String> =
-            ["read_file", "write_file"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let available: HashSet<String> = ["read_file", "write_file"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let skill = ActiveSkillContext {
             name: "test_skill".to_string(),
             prompt_md: String::new(),
@@ -8455,11 +8474,10 @@ description: local demo
             }
         }"#;
         let config: Config = serde_json::from_str(raw).unwrap();
-        let available: HashSet<String> =
-            ["read_file", "edit_file", "exec", "web_search"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let available: HashSet<String> = ["read_file", "edit_file", "exec", "web_search"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
         // FileOps 意图应返回 read_file (core) + edit_file (intent)
         let tools = resolve_effective_tool_names(

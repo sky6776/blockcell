@@ -649,11 +649,8 @@ impl VersionManager {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let temp_dir = std::env::temp_dir().join(format!(
-            "skill_import_{}_{}",
-            std::process::id(),
-            now_ns
-        ));
+        let temp_dir =
+            std::env::temp_dir().join(format!("skill_import_{}_{}", std::process::id(), now_ns));
         std::fs::create_dir_all(&temp_dir)?;
         archive.unpack(&temp_dir)?;
 

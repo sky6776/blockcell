@@ -97,11 +97,24 @@ pub(crate) enum ToolFailureKind {
     Permanent,
     /// Domain/resource-level miss — the requested object/path/page does not exist.
     ResourceMissing,
+    /// Skill context missing — need to call activate_skill first.
+    SkillContextMissing,
 }
 
 /// Classify a tool error result string into transient or permanent.
 pub(crate) fn classify_tool_failure(result: &str) -> ToolFailureKind {
     let lower = result.to_ascii_lowercase();
+
+    // Skill context missing — needs activate_skill first
+    // This is a recoverable error: LLM just needs to activate the skill before retrying
+    // Covers: exec_local, exec_skill_script and any future skill-dependent tools
+    if lower.contains("requires an active skill context")
+        || lower.contains("skill context")
+        || (lower.contains("activate_skill") && lower.contains("first"))
+        || lower.contains("active_skill_dir")
+    {
+        return ToolFailureKind::SkillContextMissing;
+    }
 
     // Permanent errors — no point retrying
     if lower.contains("api key")
@@ -196,6 +209,36 @@ mod tests {
         assert_eq!(
             classify_tool_failure("HTTP 404 Not Found"),
             ToolFailureKind::ResourceMissing
+        );
+    }
+
+    #[test]
+    fn test_classify_tool_failure_skill_context_missing() {
+        // Main error message from exec_local/exec_skill_script
+        assert_eq!(
+            classify_tool_failure("exec_skill_script requires an active skill context. Use the `activate_skill` tool first"),
+            ToolFailureKind::SkillContextMissing
+        );
+        assert_eq!(
+            classify_tool_failure(
+                "exec_local requires an active skill context. Use the `activate_skill` tool first"
+            ),
+            ToolFailureKind::SkillContextMissing
+        );
+        // Generic "skill context" detection
+        assert_eq!(
+            classify_tool_failure("Tool error: skill context is not set"),
+            ToolFailureKind::SkillContextMissing
+        );
+        // "activate_skill" + "first" combination
+        assert_eq!(
+            classify_tool_failure("Error: please call activate_skill first"),
+            ToolFailureKind::SkillContextMissing
+        );
+        // active_skill_dir reference
+        assert_eq!(
+            classify_tool_failure("Tool error: active_skill_dir is None"),
+            ToolFailureKind::SkillContextMissing
         );
     }
 
