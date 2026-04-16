@@ -1495,6 +1495,36 @@ pub struct ChannelsConfig {
     pub weixin: WeixinConfig,
 }
 
+/// 日志配置。
+/// 控制日志输出方式和等级。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogConfig {
+    /// 日志等级: trace, debug, info, warn, error, off。默认: info
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    /// 是否输出到文件。默认: false
+    #[serde(default)]
+    pub file_enabled: bool,
+    /// 是否输出到控制台。默认: true
+    #[serde(default = "default_true")]
+    pub console_enabled: bool,
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            file_enabled: false,
+            console_enabled: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayConfig {
@@ -1783,6 +1813,9 @@ pub struct Config {
     pub intent_router: Option<IntentRouterConfig>,
     #[serde(default)]
     pub auto_upgrade: AutoUpgradeConfig,
+    /// 日志配置（等级、输出方式）
+    #[serde(default)]
+    pub log: LogConfig,
     #[serde(default)]
     pub security: SecurityConfig,
     /// Default timezone for cron jobs and time-related operations.
@@ -1939,6 +1972,7 @@ impl Default for Config {
             tools: ToolsConfig::default(),
             intent_router: Some(IntentRouterConfig::default()),
             auto_upgrade: AutoUpgradeConfig::default(),
+            log: LogConfig::default(),
             security: SecurityConfig::default(),
             default_timezone: None,
             cron_tick_interval_secs: default_cron_tick_interval(),
@@ -2130,6 +2164,25 @@ impl Config {
                 if raw.contains("intentRouter") && !raw.contains("loadAllTools") {
                     tracing::info!("Adding missing loadAllTools field to intentRouter config");
                     needs_save = true;
+                }
+                // Ensure log config section exists
+                if !raw.contains("\"log\"") && !raw.contains("log:") {
+                    tracing::info!("Adding missing log config section to config");
+                    needs_save = true;
+                } else {
+                    // log section exists, check for missing fields
+                    if !raw.contains("consoleEnabled") {
+                        tracing::info!("Adding missing consoleEnabled field to log config (default: true)");
+                        needs_save = true;
+                    }
+                    if !raw.contains("fileEnabled") {
+                        tracing::info!("Adding missing fileEnabled field to log config (default: false)");
+                        needs_save = true;
+                    }
+                    if !raw.contains("level") {
+                        tracing::info!("Adding missing level field to log config (default: info)");
+                        needs_save = true;
+                    }
                 }
             }
         }

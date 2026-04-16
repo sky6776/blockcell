@@ -26,7 +26,7 @@ const PYTHON_STATE_PYTHON: u8 = 2;
 static PYTHON_RUNNER_STATE: AtomicU8 = AtomicU8::new(PYTHON_STATE_UNKNOWN);
 
 /// Preferred order to try Python runners.
-const PYTHON_PREFERS: [&'static str; 2] = ["python3", "python"];
+const PYTHON_PREFERS: [&str; 2] = ["python3", "python"];
 
 /// Check if stderr indicates a Python environment issue that should trigger fallback.
 fn should_fallback(stderr: &str) -> bool {

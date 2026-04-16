@@ -1,5 +1,13 @@
 use blockcell_core::Paths;
 
+/// Check if file is a log file (agent.log or agent.log.YYYY-MM-DD)
+fn is_log_file(path: &std::path::Path) -> bool {
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    file_name == "agent.log"
+        || file_name.starts_with("agent.log.")
+        || file_name.ends_with(".jsonl")
+}
+
 /// Show recent agent logs.
 pub async fn show(
     lines: usize,
@@ -7,7 +15,7 @@ pub async fn show(
     session: Option<String>,
 ) -> anyhow::Result<()> {
     let paths = Paths::default();
-    let logs_dir = paths.workspace().join("logs");
+    let logs_dir = paths.logs_dir();
 
     if !logs_dir.exists() {
         println!("(No logs. Logs are generated automatically when the agent runs.)");
@@ -19,21 +27,15 @@ pub async fn show(
     if let Ok(entries) = std::fs::read_dir(&logs_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|e| e == "log" || e == "jsonl") {
+            if path.is_file() && is_log_file(&path) {
                 log_files.push(path);
             }
         }
     }
 
     if log_files.is_empty() {
-        // Also check for a single log file
-        let single_log = logs_dir.join("agent.log");
-        if single_log.exists() {
-            log_files.push(single_log);
-        } else {
-            println!("(No log files)");
-            return Ok(());
-        }
+        println!("(No log files)");
+        return Ok(());
     }
 
     log_files.sort_by(|a, b| {
@@ -85,7 +87,7 @@ pub async fn show(
 /// Follow logs in real-time (tail -f style).
 pub async fn follow(filter: Option<String>, session: Option<String>) -> anyhow::Result<()> {
     let paths = Paths::default();
-    let logs_dir = paths.workspace().join("logs");
+    let logs_dir = paths.logs_dir();
 
     if !logs_dir.exists() {
         println!("(No logs directory. Start the agent first.)");
@@ -97,15 +99,10 @@ pub async fn follow(filter: Option<String>, session: Option<String>) -> anyhow::
     if let Ok(entries) = std::fs::read_dir(&logs_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|e| e == "log" || e == "jsonl") {
+            if path.is_file() && is_log_file(&path) {
                 log_files.push(path);
             }
         }
-    }
-
-    let single_log = logs_dir.join("agent.log");
-    if log_files.is_empty() && single_log.exists() {
-        log_files.push(single_log);
     }
 
     if log_files.is_empty() {
@@ -172,12 +169,14 @@ pub async fn follow(filter: Option<String>, session: Option<String>) -> anyhow::
 
 /// Clear log files.
 pub async fn clear(force: bool) -> anyhow::Result<()> {
+    use blockcell_core::logging::clear_all_logs;
+
     let paths = Paths::default();
-    let logs_dir = paths.workspace().join("logs");
+    let logs_dir = paths.logs_dir();
 
     if !logs_dir.exists() {
         println!("(No logs)");
-        return Ok(());
+        return Ok(())
     }
 
     if !force {
@@ -194,17 +193,8 @@ pub async fn clear(force: bool) -> anyhow::Result<()> {
         }
     }
 
-    let mut count = 0;
-    if let Ok(entries) = std::fs::read_dir(&logs_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                let _ = std::fs::remove_file(&path);
-                count += 1;
-            }
-        }
-    }
-
-    println!("✓ Cleared {} log file(s)", count);
+    let (count, size) = clear_all_logs(&logs_dir);
+    let size_mb = size as f64 / 1024.0 / 1024.0;
+    println!("✓ Cleared {} log file(s) ({:.2} MB)", count, size_mb);
     Ok(())
 }

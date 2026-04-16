@@ -1,3 +1,4 @@
+pub mod logging;
 pub mod capability;
 pub mod config;
 pub mod error;

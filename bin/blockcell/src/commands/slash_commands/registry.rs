@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::commands::slash_commands::handlers::{
     ClearCommand, ClearSkillsCommand, CompactCommand, ExitCommand, ForgetSkillCommand, HelpCommand,
-    LearnCommand, QuitCommand, SessionMetricsCommand, SkillsCommand, TasksCommand, ToolsCommand,
+    LearnCommand, LogCommand, QuitCommand, SessionMetricsCommand, SkillsCommand, TasksCommand, ToolsCommand,
 };
 
 /// 创建默认命令处理器
@@ -31,6 +31,9 @@ pub fn create_default_handler() -> SlashCommandHandler {
 
     // 监控命令
     handler.register(SessionMetricsCommand);
+
+    // 日志控制命令
+    handler.register(LogCommand);
 
     // 渠道限制命令
     handler.register(QuitCommand);

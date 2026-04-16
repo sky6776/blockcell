@@ -125,6 +125,11 @@ impl Paths {
         self.base.join("workspace")
     }
 
+    /// Path to logs directory (under workspace)
+    pub fn logs_dir(&self) -> PathBuf {
+        self.workspace().join("logs")
+    }
+
     pub fn sessions_dir(&self) -> PathBuf {
         self.base.join("sessions")
     }
@@ -264,6 +269,7 @@ impl Paths {
         std::fs::create_dir_all(self.evolved_tools_dir())?;
         std::fs::create_dir_all(self.tool_artifacts_dir())?;
         std::fs::create_dir_all(self.tool_evolution_records_dir())?;
+        std::fs::create_dir_all(self.logs_dir())?;
         // Bootstrap BLOCKCELL.md with default template if it does not exist
         let blockcell_md = self.blockcell_md();
         if !blockcell_md.exists() {
@@ -329,6 +335,15 @@ mod tests {
         assert_eq!(
             ops_paths.audit_dir(),
             PathBuf::from("/tmp/blockcell/agents/ops/audit")
+        );
+    }
+
+    #[test]
+    fn test_logs_dir_returns_expected_path() {
+        let paths = Paths::with_base(PathBuf::from("/tmp/blockcell"));
+        assert_eq!(
+            paths.logs_dir(),
+            PathBuf::from("/tmp/blockcell/workspace/logs")
         );
     }
 }

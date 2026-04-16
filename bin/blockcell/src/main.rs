@@ -1,7 +1,8 @@
 mod commands;
 
 use clap::{Parser, Subcommand};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use blockcell_core::logging;
+use blockcell_core::Paths;
 
 #[derive(Parser)]
 #[command(name = "blockcell")]
@@ -775,20 +776,28 @@ enum MemoryCommands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Setup tracing
-    let filter = if cli.verbose {
-        EnvFilter::new("debug,chat::request=info,chat::response=info")
-    } else {
-        EnvFilter::new("info")
-    };
+    // 初始化路径和配置
+    let paths = Paths::default();
+    let logs_dir = paths.logs_dir();
 
-    // Support switch from env
-    let filter = EnvFilter::try_from_default_env().unwrap_or(filter);
+    // 加载配置（如果配置文件存在）
+    // 如果不存在，使用默认配置（日志默认不输出）
+    let config = blockcell_core::Config::load_or_default(&paths)
+        .map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
 
-    tracing_subscriber::registry()
-        .with(fmt::layer().with_writer(std::io::stderr))
-        .with(filter)
-        .init();
+    // 清理旧日志（保留 3 天）
+    logging::cleanup_old_logs(&logs_dir, 3);
+
+    // 使用配置中的日志参数初始化日志系统
+    // 默认：info 等级，控制台不输出，文件不输出
+    if let Err(e) = logging::init_logging(
+        &logs_dir,
+        &config.log.level,
+        config.log.console_enabled,
+        config.log.file_enabled,
+    ) {
+        eprintln!("Failed to initialize logging: {}", e);
+    }
 
     match cli.command {
         Commands::Onboard {
