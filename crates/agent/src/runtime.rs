@@ -2706,6 +2706,7 @@ impl AgentRuntime {
             cron_deliver_target,
         } = ctx;
         let final_response = strip_fake_tool_calls(final_response.trim());
+        info!(target: "chat::output", content = %final_response, "Final response");
 
         if let Some(stub) = self
             .response_cache
@@ -3062,6 +3063,7 @@ impl AgentRuntime {
             session_key.clone()
         };
         info!(session_key = %session_key, "Processing message");
+        info!(target: "chat::user", content = %msg.content, "User input");
         self.update_main_session_target(&msg);
 
         // ── Refresh memory injector cache if Layer 5 extraction completed ──
@@ -3715,6 +3717,9 @@ impl AgentRuntime {
                 finish_reason = %response.finish_reason,
                 "LLM response received"
             );
+            if let Some(ref content) = response.content {
+                info!(target: "chat::response", content = %content, "LLM response content");
+            }
             debug!(target: "chat::response", response = serde_json::to_string(&response).unwrap_or_default(), "Response detail");
 
             // Handle tool calls

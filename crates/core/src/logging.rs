@@ -146,11 +146,19 @@ where
         let mut visitor = MessageVisitor::new();
         event.record(&mut visitor);
 
-        let _ = writeln!(
-            stdout,
-            "{} [{}] {}: {}",
-            timestamp, level, module, visitor.message
-        );
+        if visitor.fields.is_empty() {
+            let _ = writeln!(
+                stdout,
+                "{} [{}] {}: {}",
+                timestamp, level, module, visitor.message
+            );
+        } else {
+            let _ = writeln!(
+                stdout,
+                "{} [{}] {}: {} | {}",
+                timestamp, level, module, visitor.message, visitor.fields
+            );
+        }
     }
 }
 
@@ -188,23 +196,34 @@ where
         event.record(&mut visitor);
 
         let mut writer = self.writer.lock().unwrap();
-        let _ = writeln!(
-            writer,
-            "{} [{}] {}: {}",
-            timestamp, level, module, visitor.message
-        );
+        if visitor.fields.is_empty() {
+            let _ = writeln!(
+                writer,
+                "{} [{}] {}: {}",
+                timestamp, level, module, visitor.message
+            );
+        } else {
+            let _ = writeln!(
+                writer,
+                "{} [{}] {}: {} | {}",
+                timestamp, level, module, visitor.message, visitor.fields
+            );
+        }
     }
 }
 
 /// 消息访问器
 struct MessageVisitor {
     message: String,
+    /// 非消息字段，格式: key1=val1, key2=val2
+    fields: String,
 }
 
 impl MessageVisitor {
     fn new() -> Self {
         Self {
             message: String::new(),
+            fields: String::new(),
         }
     }
 }
@@ -213,6 +232,11 @@ impl tracing::field::Visit for MessageVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
             self.message = format!("{:?}", value);
+        } else {
+            if !self.fields.is_empty() {
+                self.fields.push_str(", ");
+            }
+            self.fields.push_str(&format!("{}={:?}", field.name(), value));
         }
     }
 }
