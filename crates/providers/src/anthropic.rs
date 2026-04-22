@@ -62,6 +62,16 @@ impl AnthropicProvider {
             .unwrap_or(ANTHROPIC_API_BASE)
             .trim_end_matches('/')
             .to_string();
+        // Anthropic SDK convention: base_url should end with /v1 so that
+        // {base_url}/messages resolves to the correct endpoint.
+        // When using custom api_base (e.g. MiniMax's "https://api.minimaxi.com/anthropic"),
+        // the user follows the ANTHROPIC_BASE_URL convention which does NOT include /v1,
+        // so we auto-append it. The default ANTHROPIC_API_BASE already includes /v1.
+        let resolved_base = if !resolved_base.ends_with("/v1") {
+            format!("{}/v1", resolved_base)
+        } else {
+            resolved_base
+        };
         let client = build_http_client(
             provider_proxy,
             global_proxy,
@@ -926,5 +936,20 @@ mod tests {
         assert_eq!(merged[0]["role"], "user");
         assert_eq!(merged[0]["content"], "hello\n\nworld");
         assert_eq!(merged[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn test_api_base_v1_auto_append() {
+        // Custom api_base without /v1 should auto-append it
+        let provider = AnthropicProvider::new("test-key", Some("https://api.minimaxi.com/anthropic"), "test-model", 1024, 0.7);
+        assert_eq!(provider.api_base, "https://api.minimaxi.com/anthropic/v1");
+
+        // Custom api_base already with /v1 should not double-append
+        let provider2 = AnthropicProvider::new("test-key", Some("https://api.minimaxi.com/anthropic/v1"), "test-model", 1024, 0.7);
+        assert_eq!(provider2.api_base, "https://api.minimaxi.com/anthropic/v1");
+
+        // Default (no api_base) uses the built-in constant which already has /v1
+        let provider3 = AnthropicProvider::new("test-key", None, "test-model", 1024, 0.7);
+        assert_eq!(provider3.api_base, "https://api.anthropic.com/v1");
     }
 }
