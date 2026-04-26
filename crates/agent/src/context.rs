@@ -4,9 +4,10 @@ use blockcell_core::{Config, Paths};
 use blockcell_skills::manager::SkillSource;
 use blockcell_skills::{EvolutionService, EvolutionServiceConfig, LLMProvider, SkillManager};
 use blockcell_tools::MemoryStoreHandle;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InteractionMode {
@@ -29,6 +30,8 @@ pub struct ActiveSkillContext {
 pub struct ContextBuilder {
     paths: Paths,
     skill_manager: Option<SkillManager>,
+    ghost_learning_enabled: bool,
+    file_memory_snapshots: Mutex<HashMap<String, FrozenFileMemorySnapshot>>,
     memory_store: Option<MemoryStoreHandle>,
     /// Layer 5 记忆注入器 (7 层记忆系统)
     memory_injector: Option<MemoryInjector>,
@@ -36,18 +39,52 @@ pub struct ContextBuilder {
     capability_brief: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct FrozenFileMemorySnapshot {
+    user: Option<String>,
+    memory: Option<String>,
+}
+
+impl FrozenFileMemorySnapshot {
+    fn load(paths: &Paths) -> Self {
+        Self {
+            user: std::fs::read_to_string(paths.user_md()).ok(),
+            memory: std::fs::read_to_string(paths.memory_md()).ok(),
+        }
+    }
+}
+
+fn replace_prompt_section(mut prompt: String, header: &str, replacement: Option<&str>) -> String {
+    let Some(start) = prompt.find(header) else {
+        return prompt;
+    };
+    let body_start = start + header.len();
+    let next_section = prompt[body_start..]
+        .find("\n## ")
+        .map(|offset| body_start + offset + 1)
+        .unwrap_or(prompt.len());
+    let section = replacement
+        .filter(|content| !content.trim().is_empty())
+        .map(|content| format!("{}{}\n\n", header, content))
+        .unwrap_or_default();
+    prompt.replace_range(start..next_section, &section);
+    prompt
+}
+
 impl ContextBuilder {
-    pub fn new(paths: Paths, _config: Config) -> Self {
+    pub fn new(paths: Paths, config: Config) -> Self {
         let skills_dir = paths.skills_dir();
         let mut skill_manager = SkillManager::new()
             .with_versioning(skills_dir.clone())
             .with_evolution(skills_dir, EvolutionServiceConfig::default());
-        skill_manager.set_openclaw_skill_enabled(_config.openclaw_skill_enabled);
+        skill_manager.set_openclaw_skill_enabled(config.openclaw_skill_enabled);
         let _ = skill_manager.load_from_paths(&paths);
 
         Self {
             paths,
             skill_manager: Some(skill_manager),
+            ghost_learning_enabled: config.agents.ghost.learning.enabled,
+            file_memory_snapshots: Mutex::new(HashMap::new()),
             memory_store: None,
             memory_injector: None,
             capability_brief: None,
@@ -150,6 +187,17 @@ impl ContextBuilder {
         )
     }
 
+    fn frozen_file_memory_snapshot(&self, session_key: &str) -> FrozenFileMemorySnapshot {
+        let mut snapshots = self
+            .file_memory_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        snapshots
+            .entry(session_key.to_string())
+            .or_insert_with(|| FrozenFileMemorySnapshot::load(&self.paths))
+            .clone()
+    }
+
     pub fn resolve_active_skill(
         &self,
         user_input: &str,
@@ -234,6 +282,43 @@ impl ContextBuilder {
             prompt.push_str("\n\n");
         }
 
+        if let Some(content) = self.load_file_if_exists(self.paths.memory_md()) {
+            prompt.push_str("## Durable File Memory\n");
+            prompt.push_str(&content);
+            prompt.push_str("\n\n");
+        }
+
+        if self.ghost_learning_enabled && !is_chat {
+            prompt.push_str("## Ghost Learning\n");
+            prompt.push_str(
+                "BlockCell may review successful interactions after the response to learn durable user preferences, stable project facts, reusable workflows, and prompt-only learned skills.\n",
+            );
+            prompt.push_str(
+                "- Save only durable facts that will still matter later: user preferences, recurring corrections, stable project facts, environment details, tool quirks, and conventions.\n",
+            );
+            prompt.push_str(
+                "- Do not save task progress, temporary TODOs, completed-work logs, one-off outcomes, or short-lived status as durable memory.\n",
+            );
+            prompt.push_str(
+                "- Write memories as declarative facts, not commands to yourself. Example: 'User prefers concise responses' is good; 'Always respond concisely' is not.\n",
+            );
+            prompt.push_str(
+                "- Procedures and workflows belong in skills, not memory. When a complex method succeeds, a tricky error is fixed, or the user corrects your approach, state the reusable workflow naturally and concisely so Ghost can review it later.\n",
+            );
+            prompt.push_str(
+                "- If the user references prior conversations or you suspect relevant history exists, use `session_search` before asking the user to repeat context.\n",
+            );
+            prompt.push_str(
+                "- If an available learned skill is relevant, load it with `skill_view` before proceeding, even if you think you already know the task.\n",
+            );
+            prompt.push_str(
+                "- If a loaded skill is stale, incomplete, or wrong, patch it with `skill_manage(action=\"patch\")` after validating the fix.\n",
+            );
+            prompt.push_str(
+                "- Current user instructions always override learned memory and generated skills.\n\n",
+            );
+        }
+
         if !is_chat {
             prompt.push_str("\n## Tools\n");
             prompt.push_str("- Use tools when needed; otherwise answer directly.\n");
@@ -294,11 +379,6 @@ impl ContextBuilder {
                     _ => {}
                 }
             } else {
-                if let Some(content) = self.load_file_if_exists(self.paths.memory_md()) {
-                    prompt.push_str("## Long-term Memory (Legacy File)\n");
-                    prompt.push_str(&content);
-                    prompt.push_str("\n\n");
-                }
                 let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
                 if let Some(content) = self.load_file_if_exists(self.paths.daily_memory(&today)) {
                     prompt.push_str("## Today's Notes (Legacy File)\n");
@@ -393,6 +473,52 @@ impl ContextBuilder {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn build_system_prompt_for_mode_with_channel_and_memory_snapshot(
+        &self,
+        mode: InteractionMode,
+        active_skill: Option<&ActiveSkillContext>,
+        disabled_skills: &HashSet<String>,
+        disabled_tools: &HashSet<String>,
+        channel: &str,
+        user_query: &str,
+        available_tool_names: &[String],
+        tool_prompt_rules: &[String],
+        memory_snapshot: Option<&FrozenFileMemorySnapshot>,
+    ) -> String {
+        if memory_snapshot.is_none() {
+            return self.build_system_prompt_for_mode_with_channel(
+                mode,
+                active_skill,
+                disabled_skills,
+                disabled_tools,
+                channel,
+                user_query,
+                available_tool_names,
+                tool_prompt_rules,
+            );
+        }
+
+        let snapshot = memory_snapshot.expect("checked above");
+        let mut prompt = self.build_system_prompt_for_mode_with_channel(
+            mode,
+            active_skill,
+            disabled_skills,
+            disabled_tools,
+            channel,
+            user_query,
+            available_tool_names,
+            tool_prompt_rules,
+        );
+
+        prompt = replace_prompt_section(prompt, "## User Preferences\n", snapshot.user.as_deref());
+        replace_prompt_section(
+            prompt,
+            "## Durable File Memory\n",
+            snapshot.memory.as_deref(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn build_messages_for_mode_with_channel(
         &self,
         history: &[ChatMessage],
@@ -420,7 +546,64 @@ impl ContextBuilder {
             tool_prompt_rules,
         );
         messages.push(ChatMessage::system(&system_prompt));
+        self.append_history_and_user_message(
+            &mut messages,
+            history,
+            user_content,
+            media,
+            pending_intent,
+        );
+        messages
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_messages_for_session_mode_with_channel(
+        &self,
+        session_key: &str,
+        history: &[ChatMessage],
+        user_content: &str,
+        media: &[String],
+        mode: InteractionMode,
+        active_skill: Option<&ActiveSkillContext>,
+        disabled_skills: &HashSet<String>,
+        disabled_tools: &HashSet<String>,
+        channel: &str,
+        pending_intent: bool,
+        available_tool_names: &[String],
+        tool_prompt_rules: &[String],
+    ) -> Vec<ChatMessage> {
+        let mut messages = Vec::new();
+        let memory_snapshot = self.frozen_file_memory_snapshot(session_key);
+        let system_prompt = self.build_system_prompt_for_mode_with_channel_and_memory_snapshot(
+            mode,
+            active_skill,
+            disabled_skills,
+            disabled_tools,
+            channel,
+            user_content,
+            available_tool_names,
+            tool_prompt_rules,
+            Some(&memory_snapshot),
+        );
+        messages.push(ChatMessage::system(&system_prompt));
+        self.append_history_and_user_message(
+            &mut messages,
+            history,
+            user_content,
+            media,
+            pending_intent,
+        );
+        messages
+    }
+
+    fn append_history_and_user_message(
+        &self,
+        messages: &mut Vec<ChatMessage>,
+        history: &[ChatMessage],
+        user_content: &str,
+        media: &[String],
+        pending_intent: bool,
+    ) {
         let user_msg = if media.is_empty() {
             let trimmed = Self::trim_text_head_tail(user_content, 4000);
             ChatMessage::user(&trimmed)
@@ -451,16 +634,11 @@ impl ContextBuilder {
             }
         };
 
-        // 直接使用完整 history，不再截断
-        // 由 Layer 4 (Full Compact) 负责 LLM 语义压缩
-        // 由 find_safe_history_start 确保不出现孤立的 tool 消息
         let safe_start = Self::find_safe_history_start(history);
         for msg in &history[safe_start..] {
             messages.push(msg.clone());
         }
-
         messages.push(user_msg);
-        messages
     }
 
     fn build_multimodal_message(&self, text: &str, media: &[String]) -> ChatMessage {
@@ -623,6 +801,54 @@ impl ContextBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blockcell_core::Result;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+
+    fn test_chat_message_text(msg: &ChatMessage) -> String {
+        match &msg.content {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        }
+    }
+
+    struct EmptyMemoryStore;
+
+    impl blockcell_tools::MemoryStoreOps for EmptyMemoryStore {
+        fn upsert_json(&self, _params_json: Value) -> Result<Value> {
+            Ok(json!({}))
+        }
+        fn query_json(&self, _params_json: Value) -> Result<Value> {
+            Ok(json!([]))
+        }
+        fn soft_delete(&self, _id: &str) -> Result<bool> {
+            Ok(false)
+        }
+        fn batch_soft_delete_json(&self, _params_json: Value) -> Result<usize> {
+            Ok(0)
+        }
+        fn restore(&self, _id: &str) -> Result<bool> {
+            Ok(false)
+        }
+        fn stats_json(&self) -> Result<Value> {
+            Ok(json!({}))
+        }
+        fn generate_brief(&self, _long_term_max: usize, _short_term_max: usize) -> Result<String> {
+            Ok(String::new())
+        }
+        fn generate_brief_for_query(&self, _query: &str, _max_items: usize) -> Result<String> {
+            Ok(String::new())
+        }
+        fn upsert_session_summary(&self, _session_key: &str, _summary: &str) -> Result<()> {
+            Ok(())
+        }
+        fn get_session_summary(&self, _session_key: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn maintenance(&self, _recycle_days: i64) -> Result<(usize, usize)> {
+            Ok((0, 0))
+        }
+    }
     use std::fs;
 
     #[test]
@@ -794,5 +1020,140 @@ description: deploy demo
         assert!(content.contains("查看 .env 的内容"));
         assert!(!content.contains("[Follow-up Reference]"));
         assert!(!content.contains("/Users/apple/.blockcell/.env"));
+    }
+    #[test]
+    fn test_build_system_prompt_always_injects_file_memory() {
+        let base =
+            std::env::temp_dir().join(format!("blockcell-context-test-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::with_base(base);
+        paths.ensure_dirs().expect("ensure dirs");
+        std::fs::write(
+            paths.memory_md(),
+            "Project fact: release verification starts with rollback planning.",
+        )
+        .expect("write memory md");
+        let mut builder = ContextBuilder::new(paths, Config::default());
+        builder.set_memory_store(Arc::new(EmptyMemoryStore));
+
+        let prompt = builder.build_system_prompt_for_mode_with_channel(
+            InteractionMode::General,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            "cli",
+            "release verification",
+            &[],
+            &[],
+        );
+
+        assert!(prompt.contains("## Durable File Memory"));
+        assert!(prompt.contains("release verification starts with rollback planning"));
+    }
+
+    #[test]
+    fn test_file_memory_prompt_snapshot_is_frozen_per_session() {
+        let base =
+            std::env::temp_dir().join(format!("blockcell-context-test-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::with_base(base);
+        paths.ensure_dirs().expect("ensure dirs");
+        std::fs::write(paths.memory_md(), "Initial durable memory.").expect("write memory md");
+        let builder = ContextBuilder::new(paths.clone(), Config::default());
+
+        let first = builder.build_messages_for_session_mode_with_channel(
+            "session-a",
+            &[],
+            "hello",
+            &[],
+            InteractionMode::General,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            "cli",
+            false,
+            &[],
+            &[],
+        );
+        std::fs::write(paths.memory_md(), "Updated durable memory.").expect("rewrite memory md");
+        let same_session = builder.build_messages_for_session_mode_with_channel(
+            "session-a",
+            &[],
+            "hello again",
+            &[],
+            InteractionMode::General,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            "cli",
+            false,
+            &[],
+            &[],
+        );
+        let next_session = builder.build_messages_for_session_mode_with_channel(
+            "session-b",
+            &[],
+            "new session",
+            &[],
+            InteractionMode::General,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            "cli",
+            false,
+            &[],
+            &[],
+        );
+
+        let first_prompt = first
+            .first()
+            .map(test_chat_message_text)
+            .unwrap_or_default();
+        let same_prompt = same_session
+            .first()
+            .map(test_chat_message_text)
+            .unwrap_or_default();
+        let next_prompt = next_session
+            .first()
+            .map(test_chat_message_text)
+            .unwrap_or_default();
+        assert!(first_prompt.contains("Initial durable memory."));
+        assert!(same_prompt.contains("Initial durable memory."));
+        assert!(!same_prompt.contains("Updated durable memory."));
+        assert!(next_prompt.contains("Updated durable memory."));
+    }
+
+    #[test]
+    fn test_build_system_prompt_injects_ghost_learning_guidance_when_enabled() {
+        let mut config = Config::default();
+        config.agents.ghost.learning.enabled = true;
+        let builder = ContextBuilder::new(
+            Paths::with_base(
+                std::env::temp_dir()
+                    .join(format!("blockcell-context-test-{}", uuid::Uuid::new_v4())),
+            ),
+            config,
+        );
+
+        let prompt = builder.build_system_prompt_for_mode_with_channel(
+            InteractionMode::General,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            "cli",
+            "用户以后 prefers canary deploys",
+            &[],
+            &[],
+        );
+
+        assert!(prompt.contains("## Ghost Learning"));
+        assert!(prompt.contains("durable user preferences"));
+        assert!(prompt.contains("reusable workflows"));
+        assert!(prompt.contains("prompt-only learned skills"));
+        assert!(prompt.contains("Write memories as declarative facts"));
+        assert!(prompt.contains("Procedures and workflows belong in skills"));
+        assert!(prompt.contains("use `session_search`"));
+        assert!(prompt.contains("load it with `skill_view`"));
+        assert!(prompt.contains("patch it with `skill_manage(action=\"patch\")`"));
+        assert!(prompt.contains("Do not save task progress"));
+        assert!(!prompt.contains("skill candidates"));
     }
 }

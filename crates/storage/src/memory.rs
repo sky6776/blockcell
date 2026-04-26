@@ -2443,7 +2443,7 @@ Language: Chinese
         assert_eq!(
             *embedder.document_inputs.lock().unwrap(),
             vec![
-                "Title: favorite database\nSummary: Prefers LanceDB\nTags: vector, database"
+                "Title: favorite database\nSummary: Prefers RabitQ\nTags: vector, database"
                     .to_string()
             ]
         );

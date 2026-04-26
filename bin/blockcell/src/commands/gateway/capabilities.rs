@@ -866,6 +866,10 @@ pub(super) async fn handle_evolution_test(
         runtime.set_memory_store(store);
     }
 
+    if let Err(e) = runtime.init_memory_file_store() {
+        warn!(error = %e, "Failed to initialize file memory store");
+    }
+
     let start = std::time::Instant::now();
 
     let inbound = InboundMessage {
@@ -1206,6 +1210,7 @@ pub(super) async fn handle_stats(State(state): State<GatewayState>) -> impl Into
     // Active tasks = queued + running
     let active_tasks = queued + running;
     let (active_model, _, _) = active_model_and_provider(&state.config);
+    let ghost_metrics = blockcell_agent::ghost_metrics_summary(&state.paths);
 
     Json(serde_json::json!({
         "uptime_secs": start.elapsed().as_secs(),
@@ -1219,5 +1224,6 @@ pub(super) async fn handle_stats(State(state): State<GatewayState>) -> impl Into
             "failed": failed,
         },
         "tools_count": state.tool_registry.tool_names().len(),
+        "ghost": ghost_metrics,
     }))
 }

@@ -225,6 +225,60 @@ impl Default for AgentDefaults {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GhostLearningConfig {
+    #[serde(default = "default_ghost_learning_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_ghost_learning_shadow_mode")]
+    pub shadow_mode: bool,
+    #[serde(default = "default_ghost_turn_review_interval")]
+    pub turn_review_interval: u32,
+    #[serde(default = "default_ghost_method_tool_threshold")]
+    pub method_tool_threshold: u32,
+    #[serde(default = "default_ghost_recall_max_items")]
+    pub recall_max_items: u32,
+    #[serde(default = "default_ghost_recall_token_budget")]
+    pub recall_token_budget: u32,
+}
+
+fn default_ghost_learning_enabled() -> bool {
+    true
+}
+
+fn default_ghost_learning_shadow_mode() -> bool {
+    true
+}
+
+fn default_ghost_turn_review_interval() -> u32 {
+    6
+}
+
+fn default_ghost_method_tool_threshold() -> u32 {
+    3
+}
+
+fn default_ghost_recall_max_items() -> u32 {
+    4
+}
+
+fn default_ghost_recall_token_budget() -> u32 {
+    1200
+}
+
+impl Default for GhostLearningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_ghost_learning_enabled(),
+            shadow_mode: default_ghost_learning_shadow_mode(),
+            turn_review_interval: default_ghost_turn_review_interval(),
+            method_tool_threshold: default_ghost_method_tool_threshold(),
+            recall_max_items: default_ghost_recall_max_items(),
+            recall_token_budget: default_ghost_recall_token_budget(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GhostConfig {
     #[serde(default = "default_ghost_enabled")]
     pub enabled: bool,
@@ -237,6 +291,8 @@ pub struct GhostConfig {
     pub max_syncs_per_day: u32,
     #[serde(default = "default_auto_social")]
     pub auto_social: bool,
+    #[serde(default)]
+    pub learning: GhostLearningConfig,
 }
 
 fn default_ghost_enabled() -> bool {
@@ -263,6 +319,7 @@ impl Default for GhostConfig {
             schedule: default_ghost_schedule(),
             max_syncs_per_day: default_max_syncs(),
             auto_social: default_auto_social(),
+            learning: GhostLearningConfig::default(),
         }
     }
 }
@@ -2564,6 +2621,14 @@ mod tests {
             cfg.providers.get("openai").map(|p| p.api_key.as_str()),
             Some("sk-test")
         );
+    }
+
+    #[test]
+    fn test_embedded_ghost_learning_defaults_are_safe() {
+        let cfg = GhostConfig::default();
+        assert!(cfg.learning.enabled);
+        assert!(cfg.learning.shadow_mode);
+        assert_eq!(cfg.learning.recall_max_items, 4);
     }
 
     #[test]

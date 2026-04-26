@@ -6,13 +6,16 @@ use blockcell_core::types::{
 use blockcell_core::{Config, InboundMessage, OutboundMessage, Paths, Result};
 use blockcell_providers::{CallResult, Provider, ProviderPool};
 use blockcell_skills::SkillCard;
-use blockcell_storage::{AuditLogger, SessionStore};
+use blockcell_storage::ghost_ledger::{GhostEpisodeSource, NewGhostEpisode};
+use blockcell_storage::{AuditLogger, GhostLedger, SessionStore};
 use blockcell_tools::{
     CapabilityRegistryHandle, CoreEvolutionHandle, EventEmitterHandle, MemoryStoreHandle,
-    SpawnHandle, SystemEventEmitter, TaskManagerHandle, ToolRegistry,
+    SessionSearchOps, SpawnHandle, SystemEventEmitter, TaskManagerHandle, ToolContext,
+    ToolRegistry,
 };
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
@@ -23,10 +26,20 @@ use crate::error::{
     classify_tool_failure, dangerous_exec_denied, dangerous_file_ops_denied, disabled_skill_result,
     disabled_tool_result, llm_exhausted_error, scoped_tool_denied_result, ToolFailureKind,
 };
+use crate::ghost_background_review::{
+    spawn_background_review_for_episode, spawn_pending_background_reviews,
+};
+use crate::ghost_learning::{
+    estimate_turn_complexity_score, GhostEpisodeSnapshot, GhostLearningBoundary,
+    GhostLearningBoundaryKind, GhostLearningPolicy, LearningDecision,
+};
+use crate::ghost_recall::should_inject_ghost_recall;
 use crate::history_projector::{HistoryProjector, TimeBasedMCConfig};
 use crate::intent::{IntentCategory, IntentToolResolver};
+use crate::memory_file_store::MemoryFileStore;
 use crate::session_metrics::{ProcessingMetrics, ScopedTimer};
 use crate::skill_executor::{determine_manual_load_mode, SkillExecutionResult};
+use crate::skill_file_store::SkillFileStore;
 use crate::skill_kernel::SkillRunMode;
 use crate::summary_queue::MainSessionSummaryQueue;
 use crate::system_event_orchestrator::{
@@ -258,6 +271,9 @@ fn inject_skill_cards_into_system_prompt(
 
     let mut section = String::from(
         "\n\n## Installed Skills\nUse `activate_skill` when one installed skill is a better fit than general tools.\nIf you call `activate_skill`, do not call any other tools in the same assistant turn.\n",
+    );
+    section.push_str(
+        "If a skill is relevant but you need to inspect the learned procedure before using or patching it, inspect it with `skill_view`. If a loaded skill is stale, incomplete, or wrong, patch it with `skill_manage(action=\"patch\")` before finishing.\n",
     );
     section.push_str(
         "If a skill card shows local execution entries, you may use `exec_local` only for those relative paths and only inside the active skill scope. Do not auto-run local scripts unless the skill is active.\n",
@@ -522,6 +538,8 @@ fn find_recent_skill_name_from_history(history: &[ChatMessage]) -> Option<String
 }
 
 const SESSION_ACTIVE_SKILL_NAME_KEY: &str = "active_skill_name";
+const SESSION_ACTIVE_SKILL_CORRECTIONS_KEY: &str = "active_skill_correction_count";
+const LEARNED_SKILL_DISABLE_THRESHOLD: u32 = 2;
 
 fn active_skill_name_from_metadata(metadata: &serde_json::Value) -> Option<String> {
     metadata
@@ -552,7 +570,35 @@ fn record_active_skill_name(metadata: &mut serde_json::Value, skill_name: &str) 
             SESSION_ACTIVE_SKILL_NAME_KEY.to_string(),
             serde_json::Value::String(trimmed.to_string()),
         );
+        map.insert(
+            SESSION_ACTIVE_SKILL_CORRECTIONS_KEY.to_string(),
+            serde_json::Value::Number(0.into()),
+        );
     }
+}
+
+fn disable_skill_toggle(paths: &Paths, skill_name: &str) -> Result<()> {
+    let path = paths.toggles_file();
+    let mut store = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .unwrap_or_else(|| serde_json::json!({"skills": {}, "tools": {}}));
+    if !store.is_object() {
+        store = serde_json::json!({"skills": {}, "tools": {}});
+    }
+    if store
+        .get("skills")
+        .and_then(|value| value.as_object())
+        .is_none()
+    {
+        store["skills"] = serde_json::json!({});
+    }
+    store["skills"][skill_name] = serde_json::json!(false);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&store)?)?;
+    Ok(())
 }
 
 fn suppress_prompt_reinjection_for_continued_skill(
@@ -931,6 +977,66 @@ fn global_core_tool_names() -> Vec<String> {
         .collect()
 }
 
+fn normalize_ghost_memory_provider_tool_schema(
+    schema: serde_json::Value,
+) -> Option<serde_json::Value> {
+    if schema.get("type").and_then(|value| value.as_str()) == Some("function") {
+        let name = schema
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(|value| value.as_str())?;
+        if !name.trim().is_empty() {
+            return Some(schema);
+        }
+        return None;
+    }
+
+    let name = schema.get("name").and_then(|value| value.as_str())?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let description = schema
+        .get("description")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Ghost memory provider tool.");
+    let parameters = schema
+        .get("parameters")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
+
+    Some(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        }
+    }))
+}
+
+fn ghost_memory_provider_tool_schemas(
+    manager: Option<&crate::ghost_memory_provider::GhostMemoryProviderManager>,
+    disabled_tools: &HashSet<String>,
+) -> Vec<serde_json::Value> {
+    manager
+        .map(|manager| {
+            manager
+                .get_all_tool_schemas()
+                .into_iter()
+                .filter_map(normalize_ghost_memory_provider_tool_schema)
+                .filter(|schema| {
+                    let name = schema
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default();
+                    !disabled_tools.contains(name)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn resolve_effective_tool_names(
     config: &Config,
     mode: InteractionMode,
@@ -1148,6 +1254,130 @@ fn chat_message_text(msg: &ChatMessage) -> String {
             .collect::<Vec<_>>()
             .join(" "),
         _ => String::new(),
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeSessionSearch {
+    paths: Paths,
+    current_session_key: Option<String>,
+}
+
+impl RuntimeSessionSearch {
+    fn new(paths: Paths, current_session_key: Option<String>) -> Self {
+        Self {
+            paths,
+            current_session_key,
+        }
+    }
+}
+
+impl SessionSearchOps for RuntimeSessionSearch {
+    fn search_session_json(&self, query: &str, limit: usize) -> Result<serde_json::Value> {
+        let tokens = normalize_runtime_session_search_tokens(query);
+        if tokens.is_empty() {
+            return Ok(serde_json::json!({
+                "query": query,
+                "count": 0,
+                "results": []
+            }));
+        }
+
+        let mut results = Vec::new();
+        let Ok(entries) = std::fs::read_dir(self.paths.sessions_dir()) else {
+            return Ok(serde_json::json!({
+                "query": query,
+                "count": 0,
+                "results": []
+            }));
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let session_key = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .map(|stem| stem.replace('_', ":"))
+                .unwrap_or_else(|| "unknown".to_string());
+            let Ok(file) = std::fs::File::open(&path) else {
+                continue;
+            };
+            for line in BufReader::new(file).lines().map_while(|line| line.ok()) {
+                let Ok(message) = serde_json::from_str::<ChatMessage>(&line) else {
+                    continue;
+                };
+                if !matches!(message.role.as_str(), "user" | "assistant") {
+                    continue;
+                }
+                let text = chat_message_text(&message);
+                let score = runtime_session_search_score(&text, &tokens);
+                if score == 0 {
+                    continue;
+                }
+                let current_boost = self
+                    .current_session_key
+                    .as_ref()
+                    .is_some_and(|current| current == &session_key)
+                    as usize;
+                results.push((
+                    score,
+                    current_boost,
+                    session_key.clone(),
+                    message.role,
+                    truncate_runtime_session_search_text(&text, 500),
+                ));
+            }
+        }
+
+        results.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.cmp(&left.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        results.truncate(limit.clamp(1, 20));
+        Ok(serde_json::json!({
+            "query": query,
+            "count": results.len(),
+            "results": results
+                .into_iter()
+                .map(|(score, _current_boost, session_key, role, text)| serde_json::json!({
+                    "score": score,
+                    "sessionKey": session_key,
+                    "role": role,
+                    "text": text,
+                }))
+                .collect::<Vec<_>>()
+        }))
+    }
+}
+
+fn normalize_runtime_session_search_tokens(query: &str) -> Vec<String> {
+    query
+        .split(|ch: char| !ch.is_alphanumeric())
+        .map(|token| token.trim().to_lowercase())
+        .filter(|token| token.len() >= 2)
+        .collect()
+}
+
+fn runtime_session_search_score(text: &str, tokens: &[String]) -> usize {
+    let lower = text.to_lowercase();
+    tokens
+        .iter()
+        .map(|token| lower.contains(token).then_some(token.len()).unwrap_or(0))
+        .sum()
+}
+
+fn truncate_runtime_session_search_text(text: &str, max_chars: usize) -> String {
+    let truncated = text.chars().take(max_chars).collect::<String>();
+    if text.chars().count() > max_chars {
+        format!("{truncated}...")
+    } else {
+        truncated
     }
 }
 
@@ -1467,6 +1697,9 @@ pub struct AgentRuntime {
     agent_id: Option<String>,
     /// Shared memory store handle for tools.
     memory_store: Option<MemoryStoreHandle>,
+    memory_file_store: Option<blockcell_tools::MemoryFileStoreHandle>,
+    ghost_memory_lifecycle: Option<Arc<crate::ghost_memory_provider::GhostMemoryProviderManager>>,
+    skill_file_store: Option<blockcell_tools::SkillFileStoreHandle>,
     /// Capability registry handle for tools.
     capability_registry: Option<CapabilityRegistryHandle>,
     /// Core evolution engine handle for tools.
@@ -1530,6 +1763,12 @@ impl AgentRuntime {
         let system_event_emitter: EventEmitterHandle = Arc::new(RuntimeSystemEventEmitter {
             store: system_event_store.clone(),
         });
+        let ghost_memory_lifecycle = Arc::new(
+            crate::ghost_memory_provider::GhostMemoryProviderManager::with_local_file(
+                paths.clone(),
+            ),
+        );
+        ghost_memory_lifecycle.initialize_all("runtime", "primary");
 
         Ok(Self {
             config,
@@ -1546,6 +1785,9 @@ impl AgentRuntime {
             task_manager: TaskManager::new(),
             agent_id: None,
             memory_store: None,
+            memory_file_store: None,
+            ghost_memory_lifecycle: Some(ghost_memory_lifecycle),
+            skill_file_store: None,
             capability_registry: None,
             core_evolution: None,
             event_tx: None,
@@ -1795,16 +2037,35 @@ impl AgentRuntime {
             .register_event_emitter(self.agent_id.as_deref(), self.system_event_emitter.clone());
     }
 
-    fn update_main_session_target(&mut self, msg: &InboundMessage) {
+    async fn update_main_session_target(&mut self, msg: &InboundMessage) {
         if !is_main_session_candidate(msg) {
             return;
+        }
+
+        let next_session_key = msg.session_key();
+        if self.ghost_learning_enabled() {
+            if let Some(previous) = self.main_session_target.as_ref() {
+                if previous.session_key != next_session_key {
+                    if let Err(err) = self
+                        .capture_session_rotate_learning_boundary(previous, msg)
+                        .await
+                    {
+                        warn!(
+                            error = %err,
+                            from_session = %previous.session_key,
+                            to_session = %next_session_key,
+                            "Ghost learning session-rotate capture failed"
+                        );
+                    }
+                }
+            }
         }
 
         self.main_session_target = Some(MainSessionTarget {
             channel: msg.channel.clone(),
             account_id: msg.account_id.clone(),
             chat_id: msg.chat_id.clone(),
-            session_key: msg.session_key(),
+            session_key: next_session_key,
         });
     }
 
@@ -1912,6 +2173,8 @@ impl AgentRuntime {
 
         let _ = self.system_event_store.cleanup_expired(7 * 24 * 60 * 60);
 
+        self.spawn_pending_ghost_background_reviews();
+
         decision
     }
 
@@ -1934,6 +2197,18 @@ impl AgentRuntime {
     pub fn set_memory_store(&mut self, store: MemoryStoreHandle) {
         self.memory_store = Some(store.clone());
         self.context_builder.set_memory_store(store);
+    }
+
+    pub fn init_memory_file_store(&mut self) -> Result<()> {
+        let store = MemoryFileStore::open(&self.paths)?;
+        self.memory_file_store = Some(Arc::new(store));
+        Ok(())
+    }
+
+    pub fn init_skill_file_store(&mut self) -> Result<()> {
+        let store = SkillFileStore::open(&self.paths)?;
+        self.skill_file_store = Some(Arc::new(store));
+        Ok(())
     }
 
     /// Initialize and load Layer 5 memory injector (7-layer memory system).
@@ -2035,6 +2310,525 @@ impl AgentRuntime {
     /// Deprecated: MCP tools are now injected before runtime construction via the shared MCP manager.
     pub async fn mount_mcp_servers(&mut self) {}
 
+    fn ghost_learning_enabled(&self) -> bool {
+        self.config.agents.ghost.learning.enabled
+    }
+
+    fn spawn_pending_ghost_background_reviews(&self) {
+        if self.config.agents.ghost.learning.enabled {
+            spawn_pending_background_reviews(
+                self.paths.clone(),
+                Arc::clone(&self.provider_pool),
+                8,
+            );
+        }
+    }
+
+    fn persist_ghost_learning_boundary(
+        &self,
+        boundary: GhostLearningBoundary,
+        sources: Vec<GhostEpisodeSource>,
+    ) -> Result<Option<String>> {
+        persist_ghost_learning_boundary_with_config(&self.config, &self.paths, boundary, sources)
+    }
+
+    fn detect_correction_signal_count(user_text: &str) -> u32 {
+        let lower = user_text.to_lowercase();
+        let cues = [
+            "correct", "fix", "instead", "prefer", "wrong", "更正", "改成", "修正", "不要", "优先",
+            "正确",
+        ];
+        if cues.iter().any(|cue| lower.contains(cue)) {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn detect_preference_correction_count(user_text: &str) -> u32 {
+        let lower = user_text.to_lowercase();
+        let cues = ["prefer", "use ", "instead", "优先", "改成", "不要", "以后"];
+        if cues.iter().any(|cue| lower.contains(cue)) {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn apply_learned_skill_negative_feedback(
+        &self,
+        session_metadata: &mut serde_json::Value,
+        msg: &InboundMessage,
+    ) -> Result<()> {
+        let correction_count = u32::from(
+            Self::detect_correction_signal_count(&msg.content)
+                + Self::detect_preference_correction_count(&msg.content)
+                > 0,
+        );
+        if correction_count == 0 {
+            return Ok(());
+        }
+        let Some(skill_name) = active_skill_name_from_metadata(session_metadata) else {
+            return Ok(());
+        };
+        let current = session_metadata
+            .get(SESSION_ACTIVE_SKILL_CORRECTIONS_KEY)
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as u32;
+        let next = current.saturating_add(correction_count);
+        if !session_metadata.is_object() {
+            *session_metadata = serde_json::json!({});
+        }
+        if let Some(map) = session_metadata.as_object_mut() {
+            map.insert(
+                SESSION_ACTIVE_SKILL_CORRECTIONS_KEY.to_string(),
+                serde_json::Value::Number(next.into()),
+            );
+        }
+        if next >= LEARNED_SKILL_DISABLE_THRESHOLD {
+            disable_skill_toggle(&self.paths, &skill_name)?;
+            if let Some(map) = session_metadata.as_object_mut() {
+                map.remove(SESSION_ACTIVE_SKILL_NAME_KEY);
+                map.insert(
+                    "auto_disabled_skill".to_string(),
+                    serde_json::Value::String(skill_name.clone()),
+                );
+            }
+            warn!(
+                skill = %skill_name,
+                corrections = next,
+                "Auto-disabled learned skill after repeated correction"
+            );
+        }
+        Ok(())
+    }
+
+    fn latest_role_text(messages: &[ChatMessage], role: &str) -> Option<String> {
+        messages
+            .iter()
+            .rev()
+            .find(|msg| msg.role == role)
+            .map(chat_message_text)
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+    }
+
+    fn capture_turn_end_learning_boundary(
+        &self,
+        msg: &InboundMessage,
+        history: &[ChatMessage],
+        final_response: &str,
+        tool_call_counts: &HashMap<String, u32>,
+    ) -> Result<Option<String>> {
+        if !self.ghost_learning_enabled()
+            || matches!(
+                msg.channel.as_str(),
+                "ghost" | "cron" | "system" | "subagent"
+            )
+        {
+            return Ok(None);
+        }
+
+        let final_text = final_response.trim();
+        if final_text.is_empty() {
+            return Ok(None);
+        }
+
+        let boundary = GhostLearningBoundary {
+            kind: GhostLearningBoundaryKind::TurnEnd,
+            session_key: Some(msg.session_key()),
+            subject_key: Some(format!("chat:{}:sender:{}", msg.chat_id, msg.sender_id)),
+            user_intent_summary: msg.content.clone(),
+            assistant_outcome_summary: final_text.to_string(),
+            tool_call_count: tool_call_counts.values().copied().sum(),
+            memory_write_count: 0,
+            correction_count: Self::detect_correction_signal_count(&msg.content),
+            preference_correction_count: Self::detect_preference_correction_count(&msg.content),
+            success: true,
+            complexity_score: estimate_turn_complexity_score(&msg.content),
+            reusable_lesson: None,
+        };
+
+        let turn_count = history
+            .iter()
+            .filter(|message| message.role == "user")
+            .count() as u32;
+        let decision = GhostLearningPolicy::from_config(&self.config.agents.ghost.learning)
+            .decide_with_turn_count(&boundary, Some(turn_count));
+
+        persist_ghost_learning_boundary_with_decision(
+            &self.config,
+            &self.paths,
+            boundary,
+            vec![
+                GhostEpisodeSource {
+                    source_type: "session".to_string(),
+                    source_key: msg.session_key(),
+                    role: "primary".to_string(),
+                },
+                GhostEpisodeSource {
+                    source_type: "chat".to_string(),
+                    source_key: msg.chat_id.clone(),
+                    role: "context".to_string(),
+                },
+                GhostEpisodeSource {
+                    source_type: "history".to_string(),
+                    source_key: history.len().to_string(),
+                    role: "summary".to_string(),
+                },
+            ],
+            decision,
+        )
+    }
+
+    async fn capture_pre_compress_learning_boundary(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+    ) -> Result<Option<String>> {
+        if !self.ghost_learning_enabled() {
+            return Ok(None);
+        }
+        let memory_write_count = self
+            .flush_memories(session_key, messages, "pre_compress")
+            .await?;
+        let provider_pre_compress_context = if let Some(manager) =
+            self.ghost_memory_lifecycle.as_ref()
+        {
+            let message_texts = messages.iter().map(chat_message_text).collect::<Vec<_>>();
+            let provider_block = manager.on_pre_compress(&message_texts, session_key);
+            if !provider_block.trim().is_empty() {
+                debug!(session_key = %session_key, "Ghost memory provider contributed pre-compress context");
+                Some(truncate_str(&provider_block, 1200))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let boundary = GhostLearningBoundary {
+            kind: GhostLearningBoundaryKind::PreCompress,
+            session_key: Some(session_key.to_string()),
+            subject_key: Some(format!("session:{}", session_key)),
+            user_intent_summary: Self::latest_role_text(messages, "user")
+                .unwrap_or_else(|| "pre-compress boundary".to_string()),
+            assistant_outcome_summary: Self::latest_role_text(messages, "assistant")
+                .unwrap_or_else(|| "conversation is about to compact".to_string()),
+            tool_call_count: messages
+                .iter()
+                .filter_map(|msg| msg.tool_calls.as_ref().map(|calls| calls.len() as u32))
+                .sum(),
+            memory_write_count,
+            correction_count: 0,
+            preference_correction_count: 0,
+            success: true,
+            complexity_score: 0,
+            reusable_lesson: provider_pre_compress_context,
+        };
+
+        self.persist_ghost_learning_boundary(
+            boundary,
+            vec![GhostEpisodeSource {
+                source_type: "session".to_string(),
+                source_key: session_key.to_string(),
+                role: "primary".to_string(),
+            }],
+        )
+    }
+
+    async fn capture_main_session_end_learning_boundary(&self) -> Result<Option<String>> {
+        if !self.ghost_learning_enabled() {
+            return Ok(None);
+        }
+
+        let Some(target) = self.main_session_target.as_ref() else {
+            return Ok(None);
+        };
+        let history = self.session_store.load(&target.session_key)?;
+        if history.is_empty() {
+            return Ok(None);
+        }
+        let memory_write_count = self
+            .flush_memories(&target.session_key, &history, "session_end")
+            .await?;
+        let provider_session_end_context =
+            if let Some(manager) = self.ghost_memory_lifecycle.as_ref() {
+                let message_texts = history.iter().map(chat_message_text).collect::<Vec<_>>();
+                manager.on_session_end(&message_texts, &target.session_key);
+                let provider_block =
+                    manager.on_session_boundary_context(&message_texts, &target.session_key);
+                if !provider_block.trim().is_empty() {
+                    Some(truncate_str(&provider_block, 1200))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        let boundary = GhostLearningBoundary {
+            kind: GhostLearningBoundaryKind::SessionEnd,
+            session_key: Some(target.session_key.clone()),
+            subject_key: Some(format!("chat:{}", target.chat_id)),
+            user_intent_summary: Self::latest_role_text(&history, "user")
+                .unwrap_or_else(|| "session end".to_string()),
+            assistant_outcome_summary: Self::latest_role_text(&history, "assistant")
+                .unwrap_or_else(|| "session end boundary".to_string()),
+            tool_call_count: history
+                .iter()
+                .filter_map(|msg| msg.tool_calls.as_ref().map(|calls| calls.len() as u32))
+                .sum(),
+            memory_write_count,
+            correction_count: 0,
+            preference_correction_count: 0,
+            success: true,
+            complexity_score: 0,
+            reusable_lesson: provider_session_end_context,
+        };
+
+        self.persist_ghost_learning_boundary(
+            boundary,
+            vec![GhostEpisodeSource {
+                source_type: "session".to_string(),
+                source_key: target.session_key.clone(),
+                role: "primary".to_string(),
+            }],
+        )
+    }
+
+    async fn capture_session_rotate_learning_boundary(
+        &self,
+        previous: &MainSessionTarget,
+        next_msg: &InboundMessage,
+    ) -> Result<Option<String>> {
+        if !self.ghost_learning_enabled() {
+            return Ok(None);
+        }
+
+        let history = self.session_store.load(&previous.session_key)?;
+        if history.is_empty() {
+            return Ok(None);
+        }
+        let memory_write_count = self
+            .flush_memories(&previous.session_key, &history, "session_rotate")
+            .await?;
+        let provider_session_end_context =
+            if let Some(manager) = self.ghost_memory_lifecycle.as_ref() {
+                let message_texts = history.iter().map(chat_message_text).collect::<Vec<_>>();
+                manager.on_session_end(&message_texts, &previous.session_key);
+                let provider_block =
+                    manager.on_session_boundary_context(&message_texts, &previous.session_key);
+                if !provider_block.trim().is_empty() {
+                    Some(truncate_str(&provider_block, 1200))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        let boundary = GhostLearningBoundary {
+            kind: GhostLearningBoundaryKind::SessionRotate,
+            session_key: Some(previous.session_key.clone()),
+            subject_key: Some(format!("chat:{}", previous.chat_id)),
+            user_intent_summary: Self::latest_role_text(&history, "user")
+                .unwrap_or_else(|| "session rotate".to_string()),
+            assistant_outcome_summary: Self::latest_role_text(&history, "assistant")
+                .unwrap_or_else(|| "session rotated to a new active chat".to_string()),
+            tool_call_count: history
+                .iter()
+                .filter_map(|msg| msg.tool_calls.as_ref().map(|calls| calls.len() as u32))
+                .sum(),
+            memory_write_count,
+            correction_count: 0,
+            preference_correction_count: 0,
+            success: true,
+            complexity_score: 0,
+            reusable_lesson: Some(match provider_session_end_context {
+                Some(context) => format!(
+                    "Switched active session from {} to {}\n\n{}",
+                    previous.chat_id, next_msg.chat_id, context
+                ),
+                None => format!(
+                    "Switched active session from {} to {}",
+                    previous.chat_id, next_msg.chat_id
+                ),
+            }),
+        };
+
+        self.persist_ghost_learning_boundary(
+            boundary,
+            vec![
+                GhostEpisodeSource {
+                    source_type: "session".to_string(),
+                    source_key: previous.session_key.clone(),
+                    role: "primary".to_string(),
+                },
+                GhostEpisodeSource {
+                    source_type: "chat".to_string(),
+                    source_key: previous.chat_id.clone(),
+                    role: "context".to_string(),
+                },
+                GhostEpisodeSource {
+                    source_type: "session".to_string(),
+                    source_key: next_msg.session_key(),
+                    role: "next".to_string(),
+                },
+            ],
+        )
+    }
+
+    async fn flush_memories(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        boundary: &str,
+    ) -> Result<u32> {
+        if messages.is_empty() {
+            return Ok(0);
+        }
+        let Some((_provider_idx, provider)) = self.provider_pool.acquire() else {
+            warn!(session_key = %session_key, boundary = %boundary, "Ghost memory flush skipped: no provider available");
+            return Ok(0);
+        };
+
+        let mut loop_messages = Self::build_memory_flush_messages(session_key, messages, boundary);
+        let registry = Self::restricted_memory_flush_tool_registry();
+        let tools = registry.get_filtered_schemas(&["memory_manage"]);
+        let mut writes = 0u32;
+
+        for _round in 0..2 {
+            let response = match provider.chat(&loop_messages, &tools).await {
+                Ok(response) => response,
+                Err(err) => {
+                    warn!(error = %err, session_key = %session_key, boundary = %boundary, "Ghost memory flush provider call failed");
+                    return Ok(writes);
+                }
+            };
+            if response.tool_calls.is_empty() {
+                return Ok(writes);
+            }
+
+            let mut assistant = ChatMessage::assistant(response.content.as_deref().unwrap_or(""));
+            assistant.tool_calls = Some(response.tool_calls.clone());
+            loop_messages.push(assistant);
+
+            for call in response.tool_calls {
+                if call.name != "memory_manage" {
+                    let result = serde_json::json!({
+                        "error": format!("tool '{}' is not allowed during memory flush", call.name),
+                    });
+                    loop_messages.push(Self::memory_flush_tool_result_message(&call, &result));
+                    continue;
+                }
+                let result = registry
+                    .execute(
+                        &call.name,
+                        self.memory_flush_tool_context(session_key)?,
+                        call.arguments.clone(),
+                    )
+                    .await;
+                match result {
+                    Ok(value) => {
+                        if value
+                            .get("success")
+                            .and_then(|success| success.as_bool())
+                            .unwrap_or(false)
+                        {
+                            writes += 1;
+                        }
+                        loop_messages.push(Self::memory_flush_tool_result_message(&call, &value));
+                    }
+                    Err(err) => {
+                        let result = serde_json::json!({"error": err.to_string()});
+                        loop_messages.push(Self::memory_flush_tool_result_message(&call, &result));
+                    }
+                }
+            }
+        }
+
+        Ok(writes)
+    }
+
+    fn memory_flush_tool_context(&self, session_key: &str) -> Result<ToolContext> {
+        Ok(ToolContext {
+            workspace: self.paths.workspace(),
+            builtin_skills_dir: Some(self.paths.builtin_skills_dir()),
+            active_skill_dir: None,
+            session_key: session_key.to_string(),
+            channel: "ghost".to_string(),
+            account_id: None,
+            sender_id: None,
+            chat_id: session_key.to_string(),
+            config: self.config.clone(),
+            permissions: blockcell_core::types::PermissionSet::new(),
+            task_manager: None,
+            memory_store: None,
+            memory_file_store: Some(Arc::new(MemoryFileStore::open(&self.paths)?)),
+            ghost_memory_lifecycle: self.ghost_memory_lifecycle.clone().map(|manager| {
+                manager as Arc<dyn blockcell_tools::GhostMemoryLifecycleOps + Send + Sync>
+            }),
+            skill_file_store: None,
+            session_search: None,
+            outbound_tx: None,
+            spawn_handle: None,
+            capability_registry: None,
+            core_evolution: None,
+            event_emitter: None,
+            channel_contacts_file: Some(self.paths.channel_contacts_file()),
+            response_cache: None,
+        })
+    }
+
+    fn restricted_memory_flush_tool_registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(blockcell_tools::memory::MemoryManageTool));
+        registry
+    }
+
+    fn build_memory_flush_messages(
+        session_key: &str,
+        messages: &[ChatMessage],
+        boundary: &str,
+    ) -> Vec<ChatMessage> {
+        let mut flush_messages = messages.iter().rev().take(24).cloned().collect::<Vec<_>>();
+        flush_messages.reverse();
+
+        let sentinel = format!(
+            "__ghost_memory_flush_sentinel:{}:{}",
+            session_key,
+            chrono::Utc::now().timestamp_millis()
+        );
+        flush_messages.push(ChatMessage::user(
+            &serde_json::json!({
+                "_flush_sentinel": sentinel,
+                "task": "The session is reaching a compression/session boundary. Save anything worth remembering before context is lost.",
+                "boundary": boundary,
+                "sessionKey": session_key,
+                "allowedTools": ["memory_manage"],
+                "rules": [
+                    "Use only memory_manage.",
+                    "Save durable user preferences, recurring corrections, stable project facts, reusable non-procedural lessons, and environment constraints.",
+                    "Do not save task progress, temporary TODOs, completed-work logs, one-off outcomes, or short-lived status.",
+                    "If nothing durable should be saved, make no tool calls."
+                ]
+            })
+            .to_string(),
+        ));
+
+        flush_messages
+    }
+
+    fn memory_flush_tool_result_message(
+        call: &ToolCallRequest,
+        result: &serde_json::Value,
+    ) -> ChatMessage {
+        let mut message = ChatMessage::tool_result(&call.id, &result.to_string());
+        message.name = Some(call.name.clone());
+        message
+    }
+
     /// Create a restricted tool registry for subagents (no spawn, no message, no cron).
     pub(crate) fn subagent_tool_registry() -> ToolRegistry {
         use blockcell_tools::alert_rule::AlertRuleTool;
@@ -2058,7 +2852,7 @@ impl AgentRuntime {
         use blockcell_tools::network_monitor::NetworkMonitorTool;
         use blockcell_tools::ocr::OcrTool;
         use blockcell_tools::office_write::OfficeWriteTool;
-        use blockcell_tools::skills::ListSkillsTool;
+        use blockcell_tools::skills::{ListSkillsTool, SkillManageTool, SkillViewTool};
         use blockcell_tools::stream_subscribe::StreamSubscribeTool;
         use blockcell_tools::system_info::{CapabilityEvolveTool, SystemInfoTool};
         use blockcell_tools::tasks::ListTasksTool;
@@ -2082,6 +2876,8 @@ impl AgentRuntime {
         registry.register(Arc::new(MemoryUpsertTool));
         registry.register(Arc::new(MemoryForgetTool));
         registry.register(Arc::new(ListSkillsTool));
+        registry.register(Arc::new(SkillViewTool));
+        registry.register(Arc::new(SkillManageTool));
         registry.register(Arc::new(SystemInfoTool));
         registry.register(Arc::new(CapabilityEvolveTool));
         registry.register(Arc::new(CameraCaptureTool));
@@ -2833,12 +3629,17 @@ impl AgentRuntime {
         current_messages: &[ChatMessage],
         tools: &[serde_json::Value],
         msg: &InboundMessage,
+        ghost_recall_context_block: Option<&str>,
         iteration: &HashMap<String, u32>,
         saw_rate_limit_this_turn: &mut bool,
     ) -> std::result::Result<LLMResponse, blockcell_core::Error> {
         let max_retries = self.config.agents.defaults.llm_max_retries;
         let base_delay_ms = self.config.agents.defaults.llm_retry_delay_ms;
         let mut last_error = None;
+        let api_messages = append_ephemeral_context_to_latest_user_message(
+            current_messages,
+            ghost_recall_context_block,
+        );
 
         for attempt in 0..=max_retries {
             if attempt > 0 {
@@ -2862,7 +3663,7 @@ impl AgentRuntime {
                 }
             };
 
-            match provider.chat_stream(current_messages, tools).await {
+            match provider.chat_stream(&api_messages, tools).await {
                 Ok(mut stream_rx) => {
                     if attempt > 0 {
                         info!(
@@ -3064,7 +3865,21 @@ impl AgentRuntime {
         };
         info!(session_key = %session_key, "Processing message");
         info!(target: "chat::user", content = %msg.content, "User input");
-        self.update_main_session_target(&msg);
+        self.update_main_session_target(&msg).await;
+        if let Some(manager) = self.ghost_memory_lifecycle.as_ref() {
+            let turn_number = self
+                .session_store
+                .load(&session_key)
+                .map(|history| {
+                    history
+                        .iter()
+                        .filter(|message| message.role == "user")
+                        .count() as u32
+                        + 1
+                })
+                .unwrap_or(1);
+            manager.on_turn_start(turn_number, &msg.content, &session_key);
+        }
 
         // ── Refresh memory injector cache if Layer 5 extraction completed ──
         if let Err(e) = self.reload_memory_injector_if_needed().await {
@@ -3194,6 +4009,12 @@ impl AgentRuntime {
 
             // Load session history for compact
             let history = self.session_store.load(&session_key)?;
+            if let Err(e) = self
+                .capture_pre_compress_learning_boundary(&session_key, &history)
+                .await
+            {
+                warn!(error = %e, session_key = %session_key, "Ghost learning pre-compress capture failed");
+            }
 
             // Execute compact directly (is_auto=false for manual trigger)
             let result = self
@@ -3292,6 +4113,13 @@ impl AgentRuntime {
         // Load session history
         let mut history = self.session_store.load(&session_key)?;
         let mut session_metadata = self.session_store.load_metadata(&persist_session_key)?;
+        if let Err(err) = self.apply_learned_skill_negative_feedback(&mut session_metadata, &msg) {
+            warn!(
+                error = %err,
+                session_key = %persist_session_key,
+                "Learned skill negative feedback handling failed"
+            );
+        }
 
         // Layer 2: 时间触发的轻量压缩
         // 检查会话最后更新时间，如果超过阈值则清理旧工具结果
@@ -3358,6 +4186,7 @@ impl AgentRuntime {
         let disabled_tools = load_disabled_toggles(&self.paths, "tools");
         let disabled_skills = load_disabled_toggles(&self.paths, "skills");
         let recent_skill_name = continued_skill_name(&session_metadata, &history);
+        let _ = self.context_builder.reload_skills();
         let skill_cards = self
             .context_builder
             .skill_manager()
@@ -3429,6 +4258,22 @@ impl AgentRuntime {
             tool_names.push(ACTIVATE_SKILL_TOOL_NAME.to_string());
         }
 
+        let provider_tool_schemas = ghost_memory_provider_tool_schemas(
+            self.ghost_memory_lifecycle.as_deref(),
+            &disabled_tools,
+        );
+        let provider_tool_names = provider_tool_schemas
+            .iter()
+            .filter_map(|schema| {
+                schema
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        tool_names.extend(provider_tool_names);
+
         tool_names.sort();
         tool_names.dedup();
 
@@ -3464,19 +4309,22 @@ impl AgentRuntime {
             .get("media_pending_intent")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let mut messages = self.context_builder.build_messages_for_mode_with_channel(
-            &history,
-            &msg.content,
-            &msg.media,
-            decision.mode,
-            decision.active_skill.as_ref(),
-            &disabled_skills,
-            &disabled_tools,
-            &msg.channel,
-            pending_intent,
-            &tool_names,
-            &tool_prompt_rules,
-        );
+        let mut messages = self
+            .context_builder
+            .build_messages_for_session_mode_with_channel(
+                &session_key,
+                &history,
+                &msg.content,
+                &msg.media,
+                decision.mode,
+                decision.active_skill.as_ref(),
+                &disabled_skills,
+                &disabled_tools,
+                &msg.channel,
+                pending_intent,
+                &tool_names,
+                &tool_prompt_rules,
+            );
         if decision.active_skill.is_none() {
             inject_skill_cards_into_system_prompt(
                 &mut messages,
@@ -3528,6 +4376,7 @@ impl AgentRuntime {
         if let Some(schema) = build_activate_skill_tool_schema(&skill_cards) {
             tools.push(schema);
         }
+        tools.extend(provider_tool_schemas);
         info!(
             mode = ?decision.mode,
             active_skill = decision.active_skill.as_ref().map(|s| s.name.as_str()),
@@ -3613,6 +4462,12 @@ impl AgentRuntime {
                         chat_id: &msg.chat_id,
                         account_id: msg.account_id.as_deref(),
                     };
+                    if let Err(e) = self
+                        .capture_pre_compress_learning_boundary(&session_key, &current_messages)
+                        .await
+                    {
+                        warn!(error = %e, session_key = %session_key, "Ghost learning pre-compress capture failed");
+                    }
                     let compact_result = self
                         .execute_layer4_compact(
                             &current_messages,
@@ -3647,6 +4502,22 @@ impl AgentRuntime {
                 }
             }
         }
+
+        let ghost_recall_context_block = if should_inject_ghost_recall(&self.config, &msg) {
+            if let Some(manager) = self.ghost_memory_lifecycle.as_ref() {
+                let learning = &self.config.agents.ghost.learning;
+                manager.prefetch_all_as_context_block(
+                    &msg.content,
+                    &session_key,
+                    learning.recall_max_items as usize,
+                    learning.recall_token_budget as usize,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let mut final_response = String::new();
         let mut message_tool_sent_media = false;
@@ -3689,6 +4560,7 @@ impl AgentRuntime {
                     &current_messages,
                     &tools,
                     &msg,
+                    ghost_recall_context_block.as_deref(),
                     &tool_call_counts,
                     &mut saw_rate_limit_this_turn,
                 )
@@ -4123,6 +4995,12 @@ impl AgentRuntime {
                             chat_id: &msg.chat_id,
                             account_id: msg.account_id.as_deref(),
                         };
+                        if let Err(e) = self
+                            .capture_pre_compress_learning_boundary(&session_key, &current_messages)
+                            .await
+                        {
+                            warn!(error = %e, session_key = %session_key, "Ghost learning pre-compress capture failed");
+                        }
                         let compact_result = self
                             .execute_layer4_compact(
                                 &current_messages,
@@ -4182,6 +5060,10 @@ impl AgentRuntime {
                     final_messages.push(ChatMessage::user(
                         "请基于以上工具调用的结果，直接给出最终答案。不要再调用任何工具，也不要输出类似[Called: ...]的过程信息。",
                     ));
+                    let final_messages = append_ephemeral_context_to_latest_user_message(
+                        &final_messages,
+                        ghost_recall_context_block.as_deref(),
+                    );
 
                     let chat_result = if let Some((pidx, p)) = self.provider_pool.acquire() {
                         let r = p.chat(&final_messages, &[]).await;
@@ -4242,6 +5124,19 @@ impl AgentRuntime {
                 overwrite_last_assistant_message(&mut history, "");
             }
         }
+
+        let ghost_learning_episode_id = match self.capture_turn_end_learning_boundary(
+            &msg,
+            &history,
+            &final_response,
+            &tool_call_counts,
+        ) {
+            Ok(episode_id) => episode_id,
+            Err(e) => {
+                warn!(error = %e, session_key = %session_key, "Ghost learning turn-end capture failed");
+                None
+            }
+        };
 
         // Post-Sampling Hooks: Layer 3 & Layer 5
         // 在主循环结束后执行 Session Memory 和 Auto Memory 提取
@@ -4424,6 +5319,12 @@ impl AgentRuntime {
                         chat_id: &msg.chat_id,
                         account_id: msg.account_id.as_deref(),
                     };
+                    if let Err(e) = self
+                        .capture_pre_compress_learning_boundary(&session_key, &history)
+                        .await
+                    {
+                        warn!(error = %e, session_key = %session_key, "Ghost learning pre-compress capture failed");
+                    }
                     let compact_result = self
                         .execute_layer4_compact(
                             &history,
@@ -4471,16 +5372,34 @@ impl AgentRuntime {
             }
         }
 
-        self.persist_and_deliver_final_response(FinalResponseContext {
-            msg: &msg,
-            persist_session_key: &persist_session_key,
-            history: &mut history,
-            session_metadata: &session_metadata,
-            final_response: &final_response,
-            collected_media,
-            cron_deliver_target,
-        })
-        .await
+        let delivered_response = self
+            .persist_and_deliver_final_response(FinalResponseContext {
+                msg: &msg,
+                persist_session_key: &persist_session_key,
+                history: &mut history,
+                session_metadata: &session_metadata,
+                final_response: &final_response,
+                collected_media,
+                cron_deliver_target,
+            })
+            .await?;
+
+        if let Some(manager) = self.ghost_memory_lifecycle.as_ref() {
+            manager.sync_all(&msg.content, &delivered_response, &session_key);
+            manager.queue_prefetch_all(&msg.content, &session_key);
+        }
+
+        if let Some(episode_id) = ghost_learning_episode_id {
+            spawn_background_review_for_episode(
+                self.paths.clone(),
+                Arc::clone(&self.provider_pool),
+                episode_id,
+            );
+        } else {
+            self.spawn_pending_ghost_background_reviews();
+        }
+
+        Ok(delivered_response)
     }
 
     /// Extract filesystem paths from tool call parameters.
@@ -4756,6 +5675,20 @@ impl AgentRuntime {
         }
     }
 
+    async fn execute_runtime_tool_call(
+        &self,
+        tool_name: &str,
+        ctx: blockcell_tools::ToolContext,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        if let Some(manager) = self.ghost_memory_lifecycle.as_ref() {
+            if manager.has_tool(tool_name) {
+                return manager.handle_tool_call(tool_name, arguments);
+            }
+        }
+        self.tool_registry.execute(tool_name, ctx, arguments).await
+    }
+
     async fn execute_tool_call(
         &mut self,
         tool_call: &ToolCallRequest,
@@ -4881,6 +5814,15 @@ impl AgentRuntime {
             ),
             task_manager: Some(tm_handle),
             memory_store: self.memory_store.clone(),
+            memory_file_store: self.memory_file_store.clone(),
+            ghost_memory_lifecycle: self.ghost_memory_lifecycle.clone().map(|manager| {
+                manager as Arc<dyn blockcell_tools::GhostMemoryLifecycleOps + Send + Sync>
+            }),
+            skill_file_store: self.skill_file_store.clone(),
+            session_search: Some(Arc::new(RuntimeSessionSearch::new(
+                self.paths.clone(),
+                Some(msg.session_key()),
+            ))),
             outbound_tx: self.outbound_tx.clone(),
             spawn_handle: Some(spawn_handle),
             capability_registry: self.capability_registry.clone(),
@@ -4908,8 +5850,7 @@ impl AgentRuntime {
 
         let start = std::time::Instant::now();
         let result = self
-            .tool_registry
-            .execute(&tool_call.name, ctx, tool_call.arguments.clone())
+            .execute_runtime_tool_call(&tool_call.name, ctx, tool_call.arguments.clone())
             .await;
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -4923,7 +5864,12 @@ impl AgentRuntime {
         };
 
         // Detect writes to the skills directory and trigger hot-reload + Dashboard refresh
-        if !is_error && (tool_call.name == "write_file" || tool_call.name == "edit_file") {
+        if !is_error
+            && matches!(
+                tool_call.name.as_str(),
+                "write_file" | "edit_file" | "skill_manage"
+            )
+        {
             if let Some(path_str) = tool_call.arguments.get("path").and_then(|v| v.as_str()) {
                 let resolved = self.resolve_path(path_str);
                 let skills_dir = self.paths.skills_dir();
@@ -5384,6 +6330,10 @@ impl AgentRuntime {
                     permissions: blockcell_core::types::PermissionSet::new(),
                     task_manager: Some(Arc::new(task_manager.clone())),
                     memory_store: memory_store.clone(),
+                    memory_file_store: None,
+                    ghost_memory_lifecycle: None,
+                    skill_file_store: None,
+                    session_search: None,
                     outbound_tx: outbound_tx.clone(),
                     spawn_handle: None, // No spawning from cron skill scripts
                     capability_registry: capability_registry.clone(),
@@ -5517,6 +6467,9 @@ impl AgentRuntime {
                         std::future::pending::<()>().await;
                     }
                 } => {
+                    if let Err(e) = self.capture_main_session_end_learning_boundary().await {
+                        warn!(error = %e, "Ghost learning session-end capture failed during shutdown");
+                    }
                     abort_active_message_tasks(
                         &self.task_manager,
                         &mut active_chat_tasks,
@@ -5564,7 +6517,7 @@ impl AgentRuntime {
                                 continue;
                             }
 
-                            self.update_main_session_target(&msg);
+                            self.update_main_session_target(&msg).await;
 
                             // Spawn each message as a background task so the loop
                             // stays responsive for new user input.
@@ -5640,7 +6593,12 @@ impl AgentRuntime {
                             });
                             active_message_tasks.insert(task_id, handle);
                         }
-                        None => break, // channel closed
+                        None => {
+                            if let Err(e) = self.capture_main_session_end_learning_boundary().await {
+                                warn!(error = %e, "Ghost learning session-end capture failed on inbound close");
+                            }
+                            break
+                        }, // channel closed
                     }
                 }
                 _ = tick_interval.tick() => {
@@ -5757,13 +6715,160 @@ impl AgentRuntime {
             &mut active_message_tasks,
         )
         .await;
+        if let Some(manager) = self.ghost_memory_lifecycle.as_ref() {
+            manager.shutdown_all();
+        }
         info!("AgentRuntime stopped");
+    }
+}
+
+fn persist_ghost_learning_boundary_with_config(
+    config: &Config,
+    paths: &Paths,
+    boundary: GhostLearningBoundary,
+    sources: Vec<GhostEpisodeSource>,
+) -> Result<Option<String>> {
+    if !config.agents.ghost.learning.enabled {
+        return Ok(None);
+    }
+
+    let decision =
+        GhostLearningPolicy::from_config(&config.agents.ghost.learning).decide(&boundary);
+    persist_ghost_learning_boundary_with_decision(config, paths, boundary, sources, decision)
+}
+
+fn persist_ghost_learning_boundary_with_decision(
+    config: &Config,
+    paths: &Paths,
+    boundary: GhostLearningBoundary,
+    sources: Vec<GhostEpisodeSource>,
+    decision: LearningDecision,
+) -> Result<Option<String>> {
+    if !config.agents.ghost.learning.enabled {
+        return Ok(None);
+    }
+
+    let Some(status) = decision.episode_status() else {
+        return Ok(None);
+    };
+
+    let snapshot = GhostEpisodeSnapshot::from((boundary.clone(), decision));
+    let episode = NewGhostEpisode {
+        boundary_kind: boundary.kind.as_str().to_string(),
+        subject_key: snapshot.subject_key.clone(),
+        status: status.to_string(),
+        summary: snapshot.summary(),
+        metadata: serde_json::to_value(&snapshot)?,
+        sources,
+    };
+
+    let ledger = GhostLedger::open(&paths.ghost_ledger_db())?;
+    let episode_id = ledger.insert_episode(episode)?;
+    crate::ghost_metrics::get_ghost_metrics(paths).record_episode_captured();
+    Ok(Some(episode_id))
+}
+
+fn capture_delegation_end_learning_boundary_with_config(
+    config: &Config,
+    paths: &Paths,
+    origin_channel: &str,
+    origin_chat_id: &str,
+    task_id: Option<&str>,
+    task_goal: &str,
+    child_summary: &str,
+) -> Result<Option<String>> {
+    let task_goal = task_goal.trim();
+    let child_summary = child_summary.trim();
+    if task_goal.is_empty() || child_summary.is_empty() {
+        return Ok(None);
+    }
+
+    let session_key = blockcell_core::build_session_key(origin_channel, origin_chat_id);
+    let mut sources = vec![
+        GhostEpisodeSource {
+            source_type: "session".to_string(),
+            source_key: session_key.clone(),
+            role: "primary".to_string(),
+        },
+        GhostEpisodeSource {
+            source_type: "chat".to_string(),
+            source_key: origin_chat_id.to_string(),
+            role: "context".to_string(),
+        },
+    ];
+    if let Some(task_id) = task_id {
+        sources.push(GhostEpisodeSource {
+            source_type: "task".to_string(),
+            source_key: task_id.to_string(),
+            role: "delegation".to_string(),
+        });
+    }
+
+    let boundary = GhostLearningBoundary {
+        kind: GhostLearningBoundaryKind::DelegationEnd,
+        session_key: Some(session_key),
+        subject_key: Some(format!("chat:{}", origin_chat_id)),
+        user_intent_summary: task_goal.to_string(),
+        assistant_outcome_summary: child_summary.to_string(),
+        tool_call_count: 0,
+        memory_write_count: 0,
+        correction_count: 0,
+        preference_correction_count: 0,
+        success: true,
+        complexity_score: estimate_turn_complexity_score(task_goal),
+        reusable_lesson: Some(truncate_str(child_summary, 240)),
+    };
+
+    persist_ghost_learning_boundary_with_config(config, paths, boundary, sources)
+}
+
+#[cfg(test)]
+impl AgentRuntime {
+    fn test_ghost_ledger(&self) -> GhostLedger {
+        GhostLedger::open(&self.paths.ghost_ledger_db()).expect("open ghost ledger")
+    }
+
+    fn test_ghost_metrics(&self) -> crate::GhostMetricsSnapshot {
+        crate::ghost_metrics_summary(&self.paths)
+    }
+
+    async fn test_trigger_pre_compress(&mut self) -> Result<()> {
+        let session_key = blockcell_core::build_session_key("cli", "ghost-pre-compress");
+        let history = vec![
+            ChatMessage::user("figure out the correct deploy sequence"),
+            ChatMessage::assistant("captured deploy analysis before compact"),
+        ];
+        self.capture_pre_compress_learning_boundary(&session_key, &history)
+            .await
+            .map(|_| ())
+    }
+
+    async fn test_trigger_session_end(&mut self) -> Result<()> {
+        self.capture_main_session_end_learning_boundary()
+            .await
+            .map(|_| ())
+    }
+
+    async fn test_complete_delegated_task(
+        &self,
+        task_goal: &str,
+        child_summary: &str,
+    ) -> Result<Option<String>> {
+        capture_delegation_end_learning_boundary_with_config(
+            &self.config,
+            &self.paths,
+            "cli",
+            "ghost-delegation",
+            None,
+            task_goal,
+            child_summary,
+        )
     }
 }
 
 /// Extract the first JSON object from potentially markdown-wrapped LLM output.
 /// Handles ```json...```, ```...```, `<tool_call>` XML with `<parameter=argv>`,
-/// bare `{...}` objects, and bare `[...]` arrays (wrapped as `{"argv":[...]}`).  
+/// bare `{...}` objects, and bare `[...]` arrays (wrapped as `{"argv":[...]}`).
 #[allow(dead_code)]
 fn extract_json_from_text(text: &str) -> String {
     // Try ```json ... ``` blocks first
@@ -5885,6 +6990,12 @@ async fn run_message_task(
     if let Some(store) = memory_store {
         runtime.set_memory_store(store);
     }
+    if let Err(e) = runtime.init_memory_file_store() {
+        tracing::warn!(error = %e, "Failed to initialize file memory store");
+    }
+    if let Err(e) = runtime.init_skill_file_store() {
+        tracing::warn!(error = %e, "Failed to initialize skill file store");
+    }
     if let Some(registry) = capability_registry {
         runtime.set_capability_registry(registry);
     }
@@ -5963,6 +7074,8 @@ async fn run_subagent_task(
 
     // Create isolated runtime with restricted tools
     let tool_registry = AgentRuntime::subagent_tool_registry();
+    let learning_config = config.clone();
+    let learning_paths = paths.clone();
     let mut sub_runtime = match AgentRuntime::new(config, paths, provider_pool, tool_registry) {
         Ok(r) => r,
         Err(e) => {
@@ -5973,6 +7086,12 @@ async fn run_subagent_task(
     sub_runtime.set_task_manager(task_manager.clone());
     sub_runtime.set_agent_id(agent_id.clone());
     sub_runtime.set_event_emitter(event_emitter);
+    if let Err(e) = sub_runtime.init_memory_file_store() {
+        tracing::warn!(error = %e, "Failed to initialize subagent file memory store");
+    }
+    if let Err(e) = sub_runtime.init_skill_file_store() {
+        tracing::warn!(error = %e, "Failed to initialize subagent skill file store");
+    }
 
     // Create a unique session key for this subagent
     let session_key = format!("subagent:{}", task_id);
@@ -6010,6 +7129,25 @@ async fn run_subagent_task(
         Ok(result) => {
             task_manager.set_completed(&task_id, &result).await;
             info!(task_id = %task_id, label = %label, "Subagent completed");
+
+            if let Err(err) = capture_delegation_end_learning_boundary_with_config(
+                &learning_config,
+                &learning_paths,
+                &origin_channel,
+                &origin_chat_id,
+                Some(&task_id),
+                &task_str,
+                &result,
+            ) {
+                warn!(
+                    task_id = %task_id,
+                    error = %err,
+                    "Failed to persist delegation-end ghost learning episode"
+                );
+            }
+            if let Some(manager) = sub_runtime.ghost_memory_lifecycle.as_ref() {
+                manager.on_delegation(&task_str, &result, &session_key);
+            }
 
             deliver_subagent_result_to_origin(
                 &origin_channel,
@@ -6075,6 +7213,28 @@ async fn deliver_subagent_result_to_origin(
         let notification = OutboundMessage::new(origin_channel, origin_chat_id, content);
         let _ = tx.send(notification).await;
     }
+}
+
+fn append_ephemeral_context_to_latest_user_message(
+    messages: &[ChatMessage],
+    context_block: Option<&str>,
+) -> Vec<ChatMessage> {
+    let Some(context_block) = context_block
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return messages.to_vec();
+    };
+    let mut api_messages = messages.to_vec();
+    if let Some(message) = api_messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.role == "user")
+    {
+        let base = chat_message_text(message);
+        *message = ChatMessage::user(&format!("{}\n\n{}", base, context_block));
+    }
+    api_messages
 }
 
 /// Build outbound metadata containing reply-to information from an inbound message.
@@ -6150,7 +7310,7 @@ mod tests {
     use blockcell_core::types::LLMResponse;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
 
     struct TestProvider;
@@ -6160,6 +7320,25 @@ mod tests {
     struct StreamingCloseProvider;
     struct UnifiedEntryProvider {
         calls: AtomicUsize,
+    }
+    struct RecallCaptureProvider {
+        calls: Mutex<Vec<Vec<ChatMessage>>>,
+    }
+    struct SequencedGhostProvider;
+    struct ReviewAndCaptureProvider {
+        calls: Mutex<Vec<Vec<ChatMessage>>>,
+        review_calls: AtomicUsize,
+    }
+    struct BoundaryFlushProvider {
+        calls: Mutex<Vec<Vec<ChatMessage>>>,
+        flush_calls: AtomicUsize,
+    }
+    struct BoundaryMemoryProvider;
+    struct ProviderToolCaptureProvider {
+        seen_tools: Mutex<Vec<Vec<serde_json::Value>>>,
+    }
+    struct RuntimeProviderTool {
+        calls: Mutex<Vec<serde_json::Value>>,
     }
 
     fn extract_active_skill_name(system_text: &str) -> Option<String> {
@@ -6366,6 +7545,78 @@ mod tests {
             };
 
             Ok(response)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl blockcell_providers::Provider for ProviderToolCaptureProvider {
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            tools: &[serde_json::Value],
+        ) -> blockcell_core::Result<LLMResponse> {
+            self.seen_tools.lock().unwrap().push(tools.to_vec());
+            let latest_tool_text = messages
+                .iter()
+                .rev()
+                .find(|msg| msg.role == "tool")
+                .map(chat_message_text);
+
+            if let Some(tool_text) = latest_tool_text {
+                return Ok(LLMResponse {
+                    content: Some(format!("provider result: {}", tool_text)),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop".to_string(),
+                    usage: serde_json::Value::Null,
+                });
+            }
+
+            Ok(LLMResponse {
+                content: Some("checking external memory".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![ToolCallRequest {
+                    id: "provider-tool-call".to_string(),
+                    name: "external_memory_lookup".to_string(),
+                    arguments: serde_json::json!({"query": "canary rollout"}),
+                    thought_signature: None,
+                }],
+                finish_reason: "tool_calls".to_string(),
+                usage: serde_json::Value::Null,
+            })
+        }
+    }
+
+    impl crate::ghost_memory_provider::GhostMemoryProvider for RuntimeProviderTool {
+        fn name(&self) -> &'static str {
+            "runtime_provider_tool"
+        }
+
+        fn get_tool_schemas(&self) -> Vec<serde_json::Value> {
+            vec![serde_json::json!({
+                "name": "external_memory_lookup",
+                "description": "Lookup provider-backed external memory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            })]
+        }
+
+        fn handle_tool_call(
+            &self,
+            tool_name: &str,
+            args: serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            assert_eq!(tool_name, "external_memory_lookup");
+            self.calls.lock().unwrap().push(args.clone());
+            Ok(serde_json::json!({
+                "success": true,
+                "provider": self.name(),
+                "query": args.get("query").cloned().unwrap_or(serde_json::Value::Null),
+                "memory": "Prefer canary rollout before broad release."
+            }))
         }
     }
 
@@ -6638,6 +7889,225 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl blockcell_providers::Provider for RecallCaptureProvider {
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            tools: &[serde_json::Value],
+        ) -> blockcell_core::Result<LLMResponse> {
+            self.calls.lock().unwrap().push(messages.to_vec());
+
+            let system_text = messages.first().map(chat_message_text).unwrap_or_default();
+            if system_text.contains("quiet Ghost learning reviewer") && !tools.is_empty() {
+                return Ok(LLMResponse {
+                    content: Some("no durable learning".to_string()),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop".to_string(),
+                    usage: serde_json::Value::Null,
+                });
+            }
+
+            Ok(LLMResponse {
+                content: Some("mock answer: recall applied".to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl blockcell_providers::Provider for SequencedGhostProvider {
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            tools: &[serde_json::Value],
+        ) -> blockcell_core::Result<LLMResponse> {
+            let system_text = messages.first().map(chat_message_text).unwrap_or_default();
+            let user_text = messages
+                .iter()
+                .rev()
+                .find(|msg| msg.role == "user")
+                .map(chat_message_text)
+                .unwrap_or_default();
+
+            if system_text.contains("quiet Ghost learning reviewer") && !tools.is_empty() {
+                return Ok(LLMResponse {
+                    content: Some("no durable learning".to_string()),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop".to_string(),
+                    usage: serde_json::Value::Null,
+                });
+            }
+
+            Ok(LLMResponse {
+                content: Some(format!("mock answer: {}", user_text)),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl blockcell_providers::Provider for ReviewAndCaptureProvider {
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            tools: &[serde_json::Value],
+        ) -> blockcell_core::Result<LLMResponse> {
+            let system_text = messages.first().map(chat_message_text).unwrap_or_default();
+            if system_text.contains("quiet Ghost learning reviewer") && !tools.is_empty() {
+                let review_index = self.review_calls.fetch_add(1, Ordering::SeqCst);
+                let tool_calls = if review_index == 0 {
+                    vec![
+                        ToolCallRequest {
+                            id: "review-user-memory".to_string(),
+                            name: "memory_manage".to_string(),
+                            arguments: serde_json::json!({
+                                "action": "add",
+                                "target": "user",
+                                "content": "User prefers canary-first rollout."
+                            }),
+                            thought_signature: None,
+                        },
+                        ToolCallRequest {
+                            id: "review-project-memory".to_string(),
+                            name: "memory_manage".to_string(),
+                            arguments: serde_json::json!({
+                                "action": "add",
+                                "target": "memory",
+                                "content": "Confirm rollback plan before release verification."
+                            }),
+                            thought_signature: None,
+                        },
+                        ToolCallRequest {
+                            id: "review-release-skill".to_string(),
+                            name: "skill_manage".to_string(),
+                            arguments: serde_json::json!({
+                                "action": "create",
+                                "name": "release_verification",
+                                "description": "Release verification workflow",
+                                "content": "Confirm rollback plan before release verification. Prefer canary-first rollout when applicable."
+                            }),
+                            thought_signature: None,
+                        },
+                    ]
+                } else {
+                    Vec::new()
+                };
+                return Ok(LLMResponse {
+                    content: None,
+                    reasoning_content: None,
+                    finish_reason: if tool_calls.is_empty() {
+                        "stop"
+                    } else {
+                        "tool_calls"
+                    }
+                    .to_string(),
+                    tool_calls,
+                    usage: serde_json::Value::Null,
+                });
+            }
+
+            self.calls.lock().unwrap().push(messages.to_vec());
+            let user_text = messages
+                .iter()
+                .rev()
+                .find(|msg| msg.role == "user")
+                .map(chat_message_text)
+                .unwrap_or_default();
+            Ok(LLMResponse {
+                content: Some(format!("mock answer: {}", user_text)),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl blockcell_providers::Provider for BoundaryFlushProvider {
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            tools: &[serde_json::Value],
+        ) -> blockcell_core::Result<LLMResponse> {
+            self.calls.lock().unwrap().push(messages.to_vec());
+            let latest_user_text = messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .map(chat_message_text)
+                .unwrap_or_default();
+            if latest_user_text.contains("__ghost_memory_flush_sentinel") && !tools.is_empty() {
+                let call_idx = self.flush_calls.fetch_add(1, Ordering::SeqCst);
+                let tool_calls = if call_idx == 0 {
+                    vec![ToolCallRequest {
+                        id: "flush-memory".to_string(),
+                        name: "memory_manage".to_string(),
+                        arguments: serde_json::json!({
+                            "action": "add",
+                            "target": "user",
+                            "content": "User prefers checking rollback order before deploy compression."
+                        }),
+                        thought_signature: None,
+                    }]
+                } else {
+                    Vec::new()
+                };
+                return Ok(LLMResponse {
+                    content: None,
+                    reasoning_content: None,
+                    finish_reason: if tool_calls.is_empty() {
+                        "stop"
+                    } else {
+                        "tool_calls"
+                    }
+                    .to_string(),
+                    tool_calls,
+                    usage: serde_json::Value::Null,
+                });
+            }
+
+            Ok(LLMResponse {
+                content: Some("mock answer".to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            })
+        }
+    }
+
+    impl crate::ghost_memory_provider::GhostMemoryProvider for BoundaryMemoryProvider {
+        fn name(&self) -> &'static str {
+            "boundary_test"
+        }
+
+        fn on_pre_compress(&self, _messages: &[String], _session_id: &str) -> Result<String> {
+            Ok("preserve provider-derived rollback preference before compression".to_string())
+        }
+
+        fn on_session_end(&self, _messages: &[String], _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_session_boundary_context(
+            &self,
+            _messages: &[String],
+            _session_id: &str,
+        ) -> Result<String> {
+            Ok("preserve provider-derived session-end deploy preference".to_string())
+        }
+    }
+
     #[test]
     fn test_core_tools_contains_toggle_manage() {
         assert!(global_core_tool_names()
@@ -6855,6 +8325,10 @@ mod tests {
             permissions: blockcell_core::types::PermissionSet::new(),
             task_manager: None,
             memory_store: None,
+            memory_file_store: None,
+            ghost_memory_lifecycle: None,
+            skill_file_store: None,
+            session_search: None,
             outbound_tx: None,
             spawn_handle: None,
             capability_registry: None,
@@ -6992,6 +8466,8 @@ mod tests {
         assert!(prompt.contains(
             "Use `activate_skill` when one installed skill is a better fit than general tools."
         ));
+        assert!(prompt.contains("inspect it with `skill_view`"));
+        assert!(prompt.contains("patch it with `skill_manage(action=\"patch\")`"));
         assert!(prompt.contains("If a skill card shows local execution entries, you may use `exec_local` only for those relative paths and only inside the active skill scope."));
         assert!(prompt.contains("Recent active skill: `local_demo`"));
         assert!(prompt.contains("布局: PromptTool + LocalScript"));
@@ -7724,6 +9200,54 @@ description: local demo
             active_skill_name_from_metadata(&metadata).as_deref(),
             Some("ppt-generator")
         );
+        assert_eq!(
+            metadata
+                .get(SESSION_ACTIVE_SKILL_CORRECTIONS_KEY)
+                .and_then(|value| value.as_u64()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn repeated_learned_skill_corrections_disable_skill_toggle() {
+        let paths = Paths::with_base(
+            std::env::temp_dir().join(format!("blockcell-disable-skill-{}", uuid::Uuid::new_v4())),
+        );
+        let provider_pool = blockcell_providers::ProviderPool::from_single_provider(
+            "test/mock",
+            "test",
+            Arc::new(TestProvider),
+        );
+        let runtime = AgentRuntime::new(
+            Config::default(),
+            paths.clone(),
+            provider_pool,
+            blockcell_tools::ToolRegistry::new(),
+        )
+        .expect("create runtime");
+        let mut metadata = serde_json::Value::Null;
+        record_active_skill_name(&mut metadata, "release_checklist");
+        let msg = InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "disable-skill".to_string(),
+            content: "不要这样做，以后先检查 rollback plan".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+
+        runtime
+            .apply_learned_skill_negative_feedback(&mut metadata, &msg)
+            .unwrap();
+        assert!(load_disabled_toggles(&paths, "skills").is_empty());
+        runtime
+            .apply_learned_skill_negative_feedback(&mut metadata, &msg)
+            .unwrap();
+
+        assert!(load_disabled_toggles(&paths, "skills").contains("release_checklist"));
+        assert!(active_skill_name_from_metadata(&metadata).is_none());
     }
 
     #[test]
@@ -7885,6 +9409,91 @@ description: local demo
         test_runtime_with_provider_and_paths(paths, provider, config)
     }
 
+    fn test_runtime_with_embedded_ghost_learning() -> AgentRuntime {
+        let mut config = Config::default();
+        config.agents.defaults.model = "test/mock".to_string();
+        config.agents.defaults.provider = Some("test".to_string());
+        config.agents.ghost.learning.enabled = true;
+        config.agents.ghost.learning.shadow_mode = true;
+
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-ghost-learning-runtime-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp ghost runtime dir");
+        let paths = Paths::with_base(base);
+        test_runtime_with_provider_and_paths(paths, Arc::new(TestProvider), config)
+    }
+
+    fn test_runtime_with_boundary_flush_provider(
+        provider: Arc<BoundaryFlushProvider>,
+    ) -> AgentRuntime {
+        let mut config = Config::default();
+        config.agents.defaults.model = "test/mock".to_string();
+        config.agents.defaults.provider = Some("test".to_string());
+        config.agents.ghost.learning.enabled = true;
+        config.agents.ghost.learning.shadow_mode = true;
+
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-boundary-flush-runtime-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp boundary flush runtime dir");
+        let paths = Paths::with_base(base);
+        test_runtime_with_provider_and_paths(paths, provider, config)
+    }
+
+    fn test_runtime_with_ghost_review_provider(
+        provider: Arc<dyn Provider>,
+        shadow_mode: bool,
+    ) -> (AgentRuntime, Paths) {
+        let mut config = Config::default();
+        config.agents.defaults.model = "test/mock".to_string();
+        config.agents.defaults.provider = Some("test".to_string());
+        config.agents.ghost.learning.enabled = true;
+        config.agents.ghost.learning.shadow_mode = shadow_mode;
+
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-ghost-review-runtime-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp ghost review runtime dir");
+        let paths = Paths::with_base(base);
+
+        (
+            test_runtime_with_provider_and_paths(paths.clone(), provider, config),
+            paths,
+        )
+    }
+
+    fn test_runtime_with_file_memory_recall(provider: Arc<dyn Provider>) -> (AgentRuntime, Paths) {
+        let mut config = Config::default();
+        config.agents.defaults.model = "test/mock".to_string();
+        config.agents.defaults.provider = Some("test".to_string());
+        config.agents.ghost.learning.enabled = true;
+        config.agents.ghost.learning.shadow_mode = false;
+        config.agents.ghost.learning.recall_max_items = 4;
+        config.agents.ghost.learning.recall_token_budget = 240;
+
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-file-memory-recall-runtime-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp file memory recall runtime dir");
+        let paths = Paths::with_base(base);
+        paths.ensure_dirs().expect("ensure dirs");
+        std::fs::write(
+            paths.memory_md(),
+            "Project fact: write deploy docs as concise step-by-step instructions with a rollback checklist.",
+        )
+        .expect("write memory md");
+
+        (
+            test_runtime_with_provider_and_paths(paths.clone(), provider, config),
+            paths,
+        )
+    }
+
     fn test_runtime_with_provider_and_paths(
         paths: Paths,
         provider: Arc<dyn Provider>,
@@ -7917,12 +9526,583 @@ description: local demo
         }
     }
 
+    async fn wait_for_runtime_review_runs(paths: &Paths, expected: usize) {
+        for _ in 0..50 {
+            let ledger = GhostLedger::open(&paths.ghost_ledger_db()).expect("open ghost ledger");
+            if ledger.review_run_count().expect("count review runs") >= expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting for ghost review runs");
+    }
+
+    #[tokio::test]
+    async fn non_trivial_turn_creates_learning_episode() {
+        let mut runtime = test_runtime_with_embedded_ghost_learning();
+        let msg = InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "ghost-turn".to_string(),
+            content: "figure out the correct deploy sequence".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+
+        runtime.process_message(msg).await.unwrap();
+
+        assert_eq!(runtime.test_ghost_ledger().episode_count().unwrap(), 1);
+        assert_eq!(
+            runtime
+                .test_ghost_ledger()
+                .latest_boundary_kind()
+                .unwrap()
+                .as_deref(),
+            Some("turn_end")
+        );
+        let episode = runtime
+            .test_ghost_ledger()
+            .latest_episode_by_boundary_kind("turn_end")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            episode.subject_key.as_deref(),
+            Some("chat:ghost-turn:sender:user")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_exposes_and_dispatches_ghost_memory_provider_tools() {
+        let llm_provider = Arc::new(ProviderToolCaptureProvider {
+            seen_tools: Mutex::new(Vec::new()),
+        });
+        let provider_tool = Arc::new(RuntimeProviderTool {
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut runtime = test_runtime_with_provider(llm_provider.clone());
+        runtime.ghost_memory_lifecycle = Some(Arc::new(
+            crate::ghost_memory_provider::GhostMemoryProviderManager::new()
+                .with_provider(provider_tool.clone()),
+        ));
+
+        let response = runtime
+            .process_message(InboundMessage {
+                channel: "cli".to_string(),
+                account_id: None,
+                sender_id: "user".to_string(),
+                chat_id: "provider-tool-chat".to_string(),
+                content: "look up my release preference".to_string(),
+                media: vec![],
+                metadata: serde_json::Value::Null,
+                timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            })
+            .await
+            .expect("process provider tool message");
+
+        assert!(response.contains("runtime_provider_tool"));
+        let seen_tools = llm_provider.seen_tools.lock().unwrap().clone();
+        assert!(seen_tools.iter().any(|tools| {
+            tools.iter().any(|schema| {
+                schema
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(|value| value.as_str())
+                    == Some("external_memory_lookup")
+            })
+        }));
+
+        let calls = provider_tool.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["query"], serde_json::json!("canary rollout"));
+    }
+
+    #[tokio::test]
+    async fn pre_compress_boundary_creates_force_review_episode() {
+        let mut runtime = test_runtime_with_embedded_ghost_learning();
+
+        runtime.test_trigger_pre_compress().await.unwrap();
+
+        assert_eq!(
+            runtime
+                .test_ghost_ledger()
+                .latest_episode_status()
+                .unwrap()
+                .as_deref(),
+            Some("pending_review")
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_compress_boundary_flushes_user_preference_to_file_memory() {
+        let provider = Arc::new(BoundaryFlushProvider {
+            calls: Mutex::new(Vec::new()),
+            flush_calls: AtomicUsize::new(0),
+        });
+        let mut runtime = test_runtime_with_boundary_flush_provider(provider.clone());
+
+        runtime.test_trigger_pre_compress().await.unwrap();
+
+        let user_memory = std::fs::read_to_string(runtime.paths.user_md()).expect("read USER.md");
+        assert!(user_memory.contains("rollback order before deploy compression"));
+        let calls = provider.calls.lock().unwrap().clone();
+        let flush_call = calls
+            .iter()
+            .find(|messages| {
+                messages
+                    .last()
+                    .map(chat_message_text)
+                    .unwrap_or_default()
+                    .contains("__ghost_memory_flush_sentinel")
+            })
+            .expect("boundary flush model call");
+        assert!(flush_call
+            .iter()
+            .any(|message| chat_message_text(message).contains("allowedTools")));
+        assert!(flush_call
+            .iter()
+            .any(|message| chat_message_text(message)
+                .contains("figure out the correct deploy sequence")));
+        assert!(flush_call.iter().all(|message| {
+            message.role != "tool"
+                || !chat_message_text(message).contains("__ghost_memory_flush_sentinel")
+        }));
+    }
+
+    #[test]
+    fn runtime_session_search_finds_persisted_history() {
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-session-search-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = Paths::with_base(base);
+        paths.ensure_dirs().expect("create runtime dirs");
+        let store = SessionStore::new(paths.clone());
+        store
+            .save(
+                "cli:chat-1",
+                &[
+                    ChatMessage::user("How should we deploy this service?"),
+                    ChatMessage::assistant("Use canary-first deploys and verify rollback order."),
+                ],
+            )
+            .expect("save session");
+
+        let search = RuntimeSessionSearch::new(paths, Some("cli:chat-1".to_string()));
+        let result = search
+            .search_session_json("canary rollback", 5)
+            .expect("search session history");
+        assert_eq!(
+            result.get("count").and_then(|value| value.as_u64()),
+            Some(1)
+        );
+        assert!(result.to_string().contains("canary-first deploys"));
+        assert!(result.to_string().contains("cli:chat-1"));
+    }
+
+    #[tokio::test]
+    async fn pre_compress_boundary_includes_provider_context_in_episode_snapshot() {
+        let mut runtime = test_runtime_with_embedded_ghost_learning();
+        runtime.ghost_memory_lifecycle = Some(Arc::new(
+            crate::ghost_memory_provider::GhostMemoryProviderManager::new()
+                .with_provider(Arc::new(BoundaryMemoryProvider)),
+        ));
+
+        runtime.test_trigger_pre_compress().await.unwrap();
+
+        let mut claimed = runtime
+            .test_ghost_ledger()
+            .claim_reviewable_episodes(1)
+            .expect("claim pre-compress episode");
+        let episode = claimed.pop().expect("pre-compress episode");
+        assert_eq!(episode.boundary_kind, "pre_compress");
+        assert!(episode
+            .metadata
+            .get("reusableLesson")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("preserve provider-derived rollback preference"));
+    }
+
+    #[tokio::test]
+    async fn session_end_boundary_includes_provider_context_in_episode_snapshot() {
+        let mut runtime = test_runtime_with_embedded_ghost_learning();
+        runtime.ghost_memory_lifecycle = Some(Arc::new(
+            crate::ghost_memory_provider::GhostMemoryProviderManager::new()
+                .with_provider(Arc::new(BoundaryMemoryProvider)),
+        ));
+        let msg = InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "ghost-session-end-provider".to_string(),
+            content: "figure out the correct deploy order".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        runtime.process_message(msg).await.unwrap();
+
+        runtime.test_trigger_session_end().await.unwrap();
+
+        let mut claimed = runtime
+            .test_ghost_ledger()
+            .claim_reviewable_episodes(4)
+            .expect("claim session-end episodes");
+        let episode = claimed
+            .drain(..)
+            .find(|episode| episode.boundary_kind == "session_end")
+            .expect("session-end episode");
+        assert!(episode
+            .metadata
+            .get("reusableLesson")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("preserve provider-derived session-end deploy preference"));
+    }
+
+    #[tokio::test]
+    async fn session_end_boundary_creates_force_review_episode() {
+        let mut runtime = test_runtime_with_embedded_ghost_learning();
+        let msg = InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "ghost-session-end".to_string(),
+            content: "figure out the correct deploy order".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        runtime.process_message(msg).await.unwrap();
+
+        runtime.test_trigger_session_end().await.unwrap();
+
+        assert_eq!(
+            runtime
+                .test_ghost_ledger()
+                .latest_episode_status()
+                .unwrap()
+                .as_deref(),
+            Some("pending_review")
+        );
+        assert_eq!(runtime.test_ghost_ledger().episode_count().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn session_rotate_boundary_creates_force_review_episode() {
+        let provider = Arc::new(SequencedGhostProvider);
+        let (mut runtime, paths) = test_runtime_with_ghost_review_provider(provider, true);
+
+        runtime
+            .process_message(InboundMessage {
+                channel: "cli".to_string(),
+                account_id: None,
+                sender_id: "user".to_string(),
+                chat_id: "ghost-rotate-a".to_string(),
+                content: "figure out the correct deploy order".to_string(),
+                media: vec![],
+                metadata: serde_json::Value::Null,
+                timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            })
+            .await
+            .unwrap();
+
+        runtime
+            .process_message(InboundMessage {
+                channel: "cli".to_string(),
+                account_id: None,
+                sender_id: "user".to_string(),
+                chat_id: "ghost-rotate-b".to_string(),
+                content: "analyze the safer rollback sequence".to_string(),
+                media: vec![],
+                metadata: serde_json::Value::Null,
+                timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            })
+            .await
+            .unwrap();
+
+        wait_for_runtime_review_runs(&paths, 3).await;
+
+        assert_eq!(
+            runtime
+                .test_ghost_ledger()
+                .episode_count_by_boundary_kind("session_rotate")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            runtime
+                .test_ghost_ledger()
+                .latest_episode_status_by_boundary_kind("session_rotate")
+                .unwrap()
+                .as_deref(),
+            Some("reviewed")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_rotate_boundary_includes_provider_context_in_episode_snapshot() {
+        let provider = Arc::new(SequencedGhostProvider);
+        let (mut runtime, _paths) = test_runtime_with_ghost_review_provider(provider, true);
+        runtime.ghost_memory_lifecycle = Some(Arc::new(
+            crate::ghost_memory_provider::GhostMemoryProviderManager::new()
+                .with_provider(Arc::new(BoundaryMemoryProvider)),
+        ));
+
+        for chat_id in ["ghost-rotate-provider-a", "ghost-rotate-provider-b"] {
+            runtime
+                .process_message(InboundMessage {
+                    channel: "cli".to_string(),
+                    account_id: None,
+                    sender_id: "user".to_string(),
+                    chat_id: chat_id.to_string(),
+                    content: "figure out the correct deploy order".to_string(),
+                    media: vec![],
+                    metadata: serde_json::Value::Null,
+                    timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let episode = runtime
+            .test_ghost_ledger()
+            .latest_episode_by_boundary_kind("session_rotate")
+            .expect("load session-rotate episode")
+            .expect("session-rotate episode");
+        let lesson = episode
+            .metadata
+            .get("reusableLesson")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(lesson.contains("Switched active session"));
+        assert!(lesson.contains("preserve provider-derived session-end deploy preference"));
+    }
+
+    #[tokio::test]
+    async fn delegation_completion_creates_parent_learning_episode() {
+        let runtime = test_runtime_with_embedded_ghost_learning();
+
+        runtime
+            .test_complete_delegated_task(
+                "research the release failure",
+                "identified the root cause and the safer rollback order",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.test_ghost_ledger().episode_count().unwrap(), 1);
+        assert_eq!(
+            runtime
+                .test_ghost_ledger()
+                .latest_boundary_kind()
+                .unwrap()
+                .as_deref(),
+            Some("delegation_end")
+        );
+    }
+
+    #[tokio::test]
+    async fn file_memory_recall_is_fenced_and_not_persisted() {
+        let provider = Arc::new(RecallCaptureProvider {
+            calls: Mutex::new(Vec::new()),
+        });
+        let (mut runtime, paths) = test_runtime_with_file_memory_recall(provider.clone());
+        let msg = InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "ghost-recall".to_string(),
+            content: "how do I usually like deploy docs written?".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+
+        runtime.process_message(msg.clone()).await.unwrap();
+
+        let calls = provider.calls.lock().unwrap().clone();
+        let first_call = calls.first().expect("first llm call");
+        assert!(
+            first_call.iter().any(|message| {
+                message.role == "user"
+                    && chat_message_text(message).contains("<memory-context>")
+                    && chat_message_text(message).contains("rollback checklist")
+            }),
+            "expected fenced file memory recall in provider payload"
+        );
+
+        let session = SessionStore::new(paths).load(&msg.session_key()).unwrap();
+        assert!(session
+            .iter()
+            .all(|message| { !chat_message_text(message).contains("<memory-context>") }));
+    }
+
+    #[tokio::test]
+    async fn ghost_learning_closes_loop_from_experience_to_file_memory() {
+        let provider = Arc::new(ReviewAndCaptureProvider {
+            calls: Mutex::new(Vec::new()),
+            review_calls: AtomicUsize::new(0),
+        });
+        let (mut runtime, paths) = test_runtime_with_ghost_review_provider(provider.clone(), false);
+
+        runtime
+            .process_message(InboundMessage {
+                channel: "cli".to_string(),
+                account_id: None,
+                sender_id: "user".to_string(),
+                chat_id: "ghost-closure".to_string(),
+                content: "figure out the correct release verification sequence with rollback plan"
+                    .to_string(),
+                media: vec![],
+                metadata: serde_json::Value::Null,
+                timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            })
+            .await
+            .unwrap();
+
+        wait_for_runtime_review_runs(&paths, 1).await;
+
+        let user_memory = std::fs::read_to_string(paths.user_md()).expect("read USER.md");
+        let durable_memory = std::fs::read_to_string(paths.memory_md()).expect("read MEMORY.md");
+        assert!(user_memory.contains("canary-first rollout"));
+        assert!(durable_memory.contains("Confirm rollback plan before release verification"));
+        let learned_skill = std::fs::read_to_string(
+            paths
+                .skills_dir()
+                .join("release_verification")
+                .join("SKILL.md"),
+        )
+        .expect("read learned skill");
+        assert!(learned_skill.contains("Prefer canary-first rollout"));
+
+        let ledger = GhostLedger::open(&paths.ghost_ledger_db()).expect("open ghost ledger");
+        assert_eq!(ledger.review_run_count().unwrap(), 1);
+
+        runtime
+            .process_message(InboundMessage {
+                channel: "cli".to_string(),
+                account_id: None,
+                sender_id: "user".to_string(),
+                chat_id: "ghost-closure".to_string(),
+                content: "run release verification again".to_string(),
+                media: vec![],
+                metadata: serde_json::Value::Null,
+                timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            })
+            .await
+            .unwrap();
+
+        let calls = provider.calls.lock().unwrap().clone();
+        let next_turn = calls.last().expect("next turn LLM call");
+        let system_prompt = next_turn.first().map(chat_message_text).unwrap_or_default();
+        assert!(system_prompt.contains("## Installed Skills"));
+        assert!(system_prompt.contains("release_verification"));
+        assert!(system_prompt.contains("skill_view"));
+    }
+
+    #[tokio::test]
+    async fn shadow_mode_captures_and_reviews_without_runtime_recall() {
+        let provider = Arc::new(SequencedGhostProvider);
+        let (mut runtime, paths) = test_runtime_with_ghost_review_provider(provider, true);
+        crate::reset_ghost_metrics_for_paths(&paths);
+
+        runtime
+            .process_message(InboundMessage {
+                channel: "cli".to_string(),
+                account_id: None,
+                sender_id: "user".to_string(),
+                chat_id: "ghost-shadow-review".to_string(),
+                content: "learn my preferred deploy style".to_string(),
+                media: vec![],
+                metadata: serde_json::Value::Null,
+                timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            })
+            .await
+            .unwrap();
+
+        wait_for_runtime_review_runs(&paths, 1).await;
+
+        let metrics = runtime.test_ghost_metrics();
+        assert_eq!(metrics.episodes_captured, 1);
+        assert_eq!(metrics.reviews_started, 1);
+        assert_eq!(metrics.reviews_failed, 0);
+        assert_eq!(runtime.test_ghost_ledger().review_run_count().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn turn_review_interval_captures_periodic_trivial_turn() {
+        let provider = Arc::new(SequencedGhostProvider);
+        let (mut runtime, _paths) = test_runtime_with_ghost_review_provider(provider, true);
+        runtime.config.agents.ghost.learning.turn_review_interval = 2;
+
+        for content in ["hello", "thanks"] {
+            runtime
+                .process_message(InboundMessage {
+                    channel: "cli".to_string(),
+                    account_id: None,
+                    sender_id: "user".to_string(),
+                    chat_id: "ghost-interval".to_string(),
+                    content: content.to_string(),
+                    media: vec![],
+                    metadata: serde_json::Value::Null,
+                    timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                })
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(runtime.test_ghost_ledger().episode_count().unwrap(), 1);
+        assert_eq!(
+            runtime
+                .test_ghost_ledger()
+                .latest_boundary_kind()
+                .unwrap()
+                .as_deref(),
+            Some("turn_end")
+        );
+    }
+
+    #[tokio::test]
+    async fn system_tick_processes_pending_ghost_reviews() {
+        let provider = Arc::new(SequencedGhostProvider);
+        let (mut runtime, paths) = test_runtime_with_ghost_review_provider(provider, true);
+
+        runtime.test_trigger_pre_compress().await.unwrap();
+        assert_eq!(
+            runtime
+                .test_ghost_ledger()
+                .latest_episode_status()
+                .unwrap()
+                .as_deref(),
+            Some("pending_review")
+        );
+
+        runtime
+            .process_system_event_tick(chrono::Utc::now().timestamp_millis())
+            .await;
+
+        wait_for_runtime_review_runs(&paths, 1).await;
+        assert_eq!(
+            runtime
+                .test_ghost_ledger()
+                .latest_episode_status()
+                .unwrap()
+                .as_deref(),
+            Some("reviewed")
+        );
+    }
+
     #[tokio::test]
     async fn test_orchestrator_tick_emits_event_tx_for_immediate_notifications() {
         let mut runtime = test_runtime();
         let (event_tx, mut event_rx) = broadcast::channel(8);
         runtime.set_event_tx(event_tx);
-        runtime.update_main_session_target(&test_main_session_inbound("cli", "chat-1"));
+        runtime
+            .update_main_session_target(&test_main_session_inbound("cli", "chat-1"))
+            .await;
 
         let mut event = SystemEvent::new_main_session(
             "task.failed",
@@ -7951,7 +10131,9 @@ description: local demo
         let mut runtime = test_runtime();
         let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
         runtime.set_outbound(outbound_tx);
-        runtime.update_main_session_target(&test_main_session_inbound("cli", "chat-1"));
+        runtime
+            .update_main_session_target(&test_main_session_inbound("cli", "chat-1"))
+            .await;
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut event = SystemEvent::new_main_session(

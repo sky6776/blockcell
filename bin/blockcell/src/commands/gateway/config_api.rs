@@ -191,7 +191,11 @@ pub(super) async fn handle_config_test_provider(
     }
 }
 
-/// GET /v1/ghost/config — get ghost agent configuration
+/// GET /v1/ghost/config — get scheduled Ghost maintenance configuration.
+///
+/// This endpoint is kept for compatibility. Embedded Ghost learning runs inside
+/// AgentRuntime during normal assistant turns and is not controlled by
+/// `agents.ghost.enabled`.
 pub(super) async fn handle_ghost_config_get(
     State(state): State<GatewayState>,
 ) -> impl IntoResponse {
@@ -199,7 +203,9 @@ pub(super) async fn handle_ghost_config_get(
     Json(ghost)
 }
 
-/// PUT /v1/ghost/config — update ghost agent configuration
+/// PUT /v1/ghost/config — update scheduled Ghost maintenance configuration.
+///
+/// This does not enable or disable embedded Ghost learning.
 pub(super) async fn handle_ghost_config_update(
     State(state): State<GatewayState>,
     Json(req): Json<serde_json::Value>,
@@ -344,6 +350,12 @@ pub(super) async fn handle_ghost_activity(
     Json(serde_json::json!({
         "activities": activities,
         "count": count,
+    }))
+}
+
+pub(super) async fn handle_ghost_metrics(State(state): State<GatewayState>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "metrics": blockcell_agent::ghost_metrics_summary(&state.paths),
     }))
 }
 

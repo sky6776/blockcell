@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use blockcell_core::Result;
+use blockcell_core::{Error, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -56,23 +56,156 @@ fn collect_script_assets(root: &Path, dir: &Path, assets: &mut Vec<PathBuf>) {
     }
 }
 
-/// Tool for querying skill evolution status — what skills are being learned,
-/// what skills have been learned, and the overall evolution state.
+/// Tool for querying installed learned skills.
 pub struct ListSkillsTool;
+pub struct SkillViewTool;
+pub struct SkillManageTool;
+
+fn get_skill_file_store(ctx: &ToolContext) -> Result<&crate::SkillFileStoreHandle> {
+    ctx.skill_file_store
+        .as_ref()
+        .ok_or_else(|| Error::Tool("Skill file store not available".to_string()))
+}
+
+#[async_trait]
+impl Tool for SkillViewTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "skill_view",
+            description: "View a workspace skill's SKILL.md, meta.yaml, and supporting file list before patching it.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Workspace skill name."}
+                },
+                "required": ["name"]
+            }),
+        }
+    }
+
+    fn validate(&self, params: &Value) -> Result<()> {
+        require_string(params, "name")?;
+        Ok(())
+    }
+
+    fn prompt_rule(&self, _ctx: &crate::PromptContext) -> Option<String> {
+        Some("- Use `skill_view` before patching learned workspace skills so changes are precise and minimal.".to_string())
+    }
+
+    async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
+        let name = require_string(&params, "name")?;
+        get_skill_file_store(&ctx)?.view_skill_json(name)
+    }
+}
+
+#[async_trait]
+impl Tool for SkillManageTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "skill_manage",
+            description: "Create, patch, delete, or update supporting files for workspace skills. Use for reusable procedures learned from successful work.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["create", "edit", "patch", "delete", "write_file", "remove_file", "undo_latest"]},
+                    "name": {"type": "string", "description": "Workspace skill name using lowercase letters, digits, '-' or '_'."},
+                    "description": {"type": "string", "description": "Required for create."},
+                    "content": {"type": "string", "description": "Skill body, full SKILL.md rewrite, replacement text, or file content."},
+                    "old_text": {"type": "string", "description": "Unique text to replace for patch."},
+                    "path": {"type": "string", "description": "Supporting path under references/, templates/, scripts/, or assets/."}
+                },
+                "required": ["action", "name"]
+            }),
+        }
+    }
+
+    fn validate(&self, params: &Value) -> Result<()> {
+        let action = require_string(params, "action")?;
+        require_string(params, "name")?;
+        match action {
+            "create" => {
+                require_string(params, "description")?;
+                require_string(params, "content")?;
+            }
+            "edit" => {
+                require_string(params, "content")?;
+            }
+            "patch" => {
+                require_string(params, "old_text")?;
+                require_string(params, "content")?;
+            }
+            "delete" | "undo_latest" => {}
+            "write_file" => {
+                require_string(params, "path")?;
+                require_string(params, "content")?;
+            }
+            "remove_file" => {
+                require_string(params, "path")?;
+            }
+            _ => {
+                return Err(Error::Validation(
+                    "action must be create, edit, patch, delete, write_file, remove_file, or undo_latest"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn prompt_rule(&self, _ctx: &crate::PromptContext) -> Option<String> {
+        Some("- Use `skill_manage` only for durable reusable procedures. Prefer prompt-only skills unless the user explicitly needs executable assets.".to_string())
+    }
+
+    async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
+        let store = get_skill_file_store(&ctx)?;
+        let action = require_string(&params, "action")?;
+        let name = require_string(&params, "name")?;
+        match action {
+            "create" => store.create_skill_json(
+                name,
+                require_string(&params, "description")?,
+                require_string(&params, "content")?,
+            ),
+            "edit" => store.edit_skill_json(name, require_string(&params, "content")?),
+            "patch" => store.patch_skill_json(
+                name,
+                require_string(&params, "old_text")?,
+                require_string(&params, "content")?,
+            ),
+            "delete" => store.delete_skill_json(name),
+            "write_file" => store.write_skill_file_json(
+                name,
+                require_string(&params, "path")?,
+                require_string(&params, "content")?,
+            ),
+            "remove_file" => store.remove_skill_file_json(name, require_string(&params, "path")?),
+            "undo_latest" => store.restore_latest_skill_json(name),
+            _ => Err(Error::Validation("invalid skill_manage action".to_string())),
+        }
+    }
+}
+
+fn require_string<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
+    params
+        .get(key)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::Validation(format!("{} is required", key)))
+}
 
 #[async_trait]
 impl Tool for ListSkillsTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "list_skills",
-            description: "Query the skill evolution system. Shows which skills are currently being learned (evolving), which have been learned (completed evolutions), and available skills. Use when the user asks about learning progress, skill status, or capabilities.",
+            description: "List installed skills available to the assistant, including workspace learned skills and built-in skills. Use when the user asks what reusable skills or learned procedures are available.",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "enum": ["learning", "learned", "all", "available"],
-                        "description": "What to query: 'learning' = skills currently being evolved/learned, 'learned' = skills that completed evolution, 'all' = full status, 'available' = currently loaded skills"
+                        "enum": ["learned", "all", "available"],
+                        "description": "What to query: 'learned' or 'all' lists installed learned skills; 'available' is an alias. Legacy pipeline state is not exposed."
                     }
                 },
                 "required": []
@@ -90,21 +223,14 @@ impl Tool for ListSkillsTool {
             .and_then(|v| v.as_str())
             .unwrap_or("all");
 
-        // workspace = ~/.blockcell/workspace
-        // skills_dir = ~/.blockcell/workspace/skills
-        // evolution_records = ~/.blockcell/workspace/evolution_records
         let skills_dir = ctx.workspace.join("skills");
-        let evolution_records_dir = ctx.workspace.join("evolution_records");
         let builtin_dir = ctx.builtin_skills_dir.as_deref();
 
         match query {
-            "learning" => self.get_learning_skills(&evolution_records_dir).await,
-            "learned" => self.get_learned_skills(&evolution_records_dir).await,
-            "available" => self.get_available_skills(&skills_dir, builtin_dir).await,
-            _ => {
-                self.get_all_skills(&skills_dir, builtin_dir, &evolution_records_dir)
-                    .await
+            "learned" | "available" | "all" => {
+                self.get_available_skills(&skills_dir, builtin_dir).await
             }
+            _ => self.get_available_skills(&skills_dir, builtin_dir).await,
         }
     }
 }
@@ -131,98 +257,6 @@ impl ListSkillsTool {
         }
     }
 
-    /// Get skills currently being evolved (Triggered, Generating, Generated, Auditing, etc.)
-    async fn get_learning_skills(&self, records_dir: &std::path::Path) -> Result<Value> {
-        let records = self.load_evolution_records(records_dir)?;
-        let learning: Vec<Value> = records
-            .iter()
-            .filter(|r| {
-                let status = r.get("status").and_then(|s| s.as_str()).unwrap_or("");
-                matches!(
-                    status,
-                    "Triggered"
-                        | "Generating"
-                        | "Generated"
-                        | "Auditing"
-                        | "AuditPassed"
-                        | "CompilePassed"
-                        | "DryRunPassed"
-                        | "Testing"
-                        | "TestPassed"
-                        | "Observing"
-                        | "RollingOut"
-                )
-            })
-            .map(|r| {
-                let status = r
-                    .get("status")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("unknown");
-                let status_desc = match status {
-                    "Triggered" => "已触发，等待开始学习",
-                    "Generating" => "正在生成改进方案",
-                    "Generated" => "改进方案已生成，等待审计",
-                    "Auditing" => "正在审计改进方案",
-                    "AuditPassed" => "审计通过，准备编译检查",
-                    "CompilePassed" | "DryRunPassed" | "TestPassed" => "编译检查通过，准备部署",
-                    "Testing" => "正在编译检查",
-                    "Observing" | "RollingOut" => "已部署，观察窗口中",
-                    _ => status,
-                };
-                json!({
-                    "skill_name": r.get("skill_name").unwrap_or(&Value::Null),
-                    "evolution_id": r.get("id").unwrap_or(&Value::Null),
-                    "status": status,
-                    "status_description": status_desc,
-                    "trigger": r.get("context").and_then(|c| c.get("trigger")),
-                    "created_at": r.get("created_at"),
-                })
-            })
-            .collect();
-
-        Ok(json!({
-            "learning_skills": learning,
-            "count": learning.len(),
-            "note": if learning.is_empty() {
-                "目前没有正在学习的技能。当工具执行失败时，系统会自动触发学习。"
-            } else {
-                "以下技能正在学习改进中。"
-            }
-        }))
-    }
-
-    /// Get skills that completed evolution successfully
-    async fn get_learned_skills(&self, records_dir: &std::path::Path) -> Result<Value> {
-        let records = self.load_evolution_records(records_dir)?;
-        let learned: Vec<Value> = records
-            .iter()
-            .filter(|r| {
-                let status = r.get("status").and_then(|s| s.as_str()).unwrap_or("");
-                status == "Completed"
-            })
-            .map(|r| {
-                json!({
-                    "skill_name": r.get("skill_name").unwrap_or(&Value::Null),
-                    "evolution_id": r.get("id").unwrap_or(&Value::Null),
-                    "created_at": r.get("created_at"),
-                    "updated_at": r.get("updated_at"),
-                    "trigger": r.get("context").and_then(|c| c.get("trigger")),
-                    "patch_explanation": r.get("patch").and_then(|p| p.get("explanation")),
-                })
-            })
-            .collect();
-
-        Ok(json!({
-            "learned_skills": learned,
-            "count": learned.len(),
-            "note": if learned.is_empty() {
-                "目前还没有通过自进化学会的技能。系统会在工具执行失败时自动触发学习。"
-            } else {
-                "以下技能已通过自进化学会。"
-            }
-        }))
-    }
-
     /// Get available loaded skills
     async fn get_available_skills(
         &self,
@@ -241,8 +275,13 @@ impl ListSkillsTool {
         }
 
         Ok(json!({
-            "available_skills": skills,
+            "learned_skills": skills,
             "count": skills.len(),
+            "note": if skills.is_empty() {
+                "No installed learned skills are available yet."
+            } else {
+                "Installed learned skills available to this assistant."
+            }
         }))
     }
 
@@ -296,55 +335,6 @@ impl ListSkillsTool {
         }
     }
 
-    /// Get all skills info combined
-    async fn get_all_skills(
-        &self,
-        skills_dir: &std::path::Path,
-        builtin_dir: Option<&std::path::Path>,
-        records_dir: &std::path::Path,
-    ) -> Result<Value> {
-        let available = self.get_available_skills(skills_dir, builtin_dir).await?;
-        let learning = self.get_learning_skills(records_dir).await?;
-        let learned = self.get_learned_skills(records_dir).await?;
-
-        Ok(json!({
-            "available": available,
-            "learning": learning,
-            "learned": learned,
-        }))
-    }
-
-    /// Load all evolution records from the records directory
-    fn load_evolution_records(&self, records_dir: &std::path::Path) -> Result<Vec<Value>> {
-        let mut records = Vec::new();
-
-        if !records_dir.exists() {
-            return Ok(records);
-        }
-
-        if let Ok(entries) = std::fs::read_dir(records_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "json") {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        if let Ok(record) = serde_json::from_str::<Value>(&content) {
-                            records.push(record);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Sort by created_at descending
-        records.sort_by(|a, b| {
-            let a_ts = a.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0);
-            let b_ts = b.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0);
-            b_ts.cmp(&a_ts)
-        });
-
-        Ok(records)
-    }
-
     /// Read skill meta.yaml or meta.json
     fn read_skill_meta(&self, skill_dir: &std::path::Path) -> Value {
         // Try meta.json first (simpler to parse)
@@ -392,20 +382,330 @@ mod tests {
     use serde_json::json;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Default)]
+    struct CaptureSkillFileStore {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl crate::SkillFileStoreOps for CaptureSkillFileStore {
+        fn view_skill_json(&self, name: &str) -> Result<Value> {
+            self.calls.lock().unwrap().push(format!("view:{name}"));
+            Ok(json!({"success": true, "name": name, "content": "skill"}))
+        }
+
+        fn create_skill_json(&self, name: &str, description: &str, content: &str) -> Result<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("create:{name}:{description}:{content}"));
+            Ok(json!({"success": true, "skillName": name, "action": "create"}))
+        }
+
+        fn edit_skill_json(&self, name: &str, content: &str) -> Result<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("edit:{name}:{content}"));
+            Ok(json!({"success": true, "skillName": name, "action": "edit"}))
+        }
+
+        fn patch_skill_json(&self, name: &str, old_text: &str, content: &str) -> Result<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("patch:{name}:{old_text}:{content}"));
+            Ok(json!({"success": true, "skillName": name, "action": "patch"}))
+        }
+
+        fn delete_skill_json(&self, name: &str) -> Result<Value> {
+            self.calls.lock().unwrap().push(format!("delete:{name}"));
+            Ok(json!({"success": true, "skillName": name, "action": "delete"}))
+        }
+
+        fn write_skill_file_json(&self, name: &str, path: &str, content: &str) -> Result<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("write:{name}:{path}:{content}"));
+            Ok(json!({"success": true, "skillName": name, "action": "write_file"}))
+        }
+
+        fn remove_skill_file_json(&self, name: &str, path: &str) -> Result<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("remove:{name}:{path}"));
+            Ok(json!({"success": true, "skillName": name, "action": "remove_file"}))
+        }
+
+        fn restore_latest_skill_json(&self, name: &str) -> Result<Value> {
+            self.calls.lock().unwrap().push(format!("undo:{name}"));
+            Ok(json!({"success": true, "skillName": name, "action": "restore_latest"}))
+        }
+    }
+
+    fn tool_context(store: Arc<dyn crate::SkillFileStoreOps + Send + Sync>) -> ToolContext {
+        ToolContext {
+            workspace: PathBuf::from("/tmp/workspace"),
+            builtin_skills_dir: None,
+            active_skill_dir: None,
+            session_key: "cli:test".to_string(),
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: None,
+            chat_id: "chat-1".to_string(),
+            config: blockcell_core::Config::default(),
+            permissions: blockcell_core::types::PermissionSet::new(),
+            task_manager: None,
+            memory_store: None,
+            memory_file_store: None,
+            ghost_memory_lifecycle: None,
+            skill_file_store: Some(store),
+            session_search: None,
+            outbound_tx: None,
+            spawn_handle: None,
+            capability_registry: None,
+            core_evolution: None,
+            event_emitter: None,
+            channel_contacts_file: None,
+            response_cache: None,
+        }
+    }
+
+    fn tool_context_with_workspace(
+        workspace: PathBuf,
+        store: Option<Arc<dyn crate::SkillFileStoreOps + Send + Sync>>,
+    ) -> ToolContext {
+        ToolContext {
+            workspace,
+            builtin_skills_dir: None,
+            active_skill_dir: None,
+            session_key: "cli:test".to_string(),
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: None,
+            chat_id: "chat-1".to_string(),
+            config: blockcell_core::Config::default(),
+            permissions: blockcell_core::types::PermissionSet::new(),
+            task_manager: None,
+            memory_store: None,
+            memory_file_store: None,
+            ghost_memory_lifecycle: None,
+            skill_file_store: store,
+            session_search: None,
+            outbound_tx: None,
+            spawn_handle: None,
+            capability_registry: None,
+            core_evolution: None,
+            event_emitter: None,
+            channel_contacts_file: None,
+            response_cache: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_skill_view_routes_to_file_store() {
+        let store = Arc::new(CaptureSkillFileStore::default());
+        let result = SkillViewTool
+            .execute(
+                tool_context(store.clone()),
+                json!({"name": "release_checklist"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["name"], json!("release_checklist"));
+        assert_eq!(
+            store.calls.lock().unwrap().as_slice(),
+            ["view:release_checklist"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_skill_manage_create_routes_to_file_store() {
+        let store = Arc::new(CaptureSkillFileStore::default());
+        let result = SkillManageTool
+            .execute(
+                tool_context(store.clone()),
+                json!({
+                    "action": "create",
+                    "name": "release_checklist",
+                    "description": "Release checklist",
+                    "content": "Confirm rollback plan."
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["action"], json!("create"));
+        assert_eq!(
+            store.calls.lock().unwrap().as_slice(),
+            ["create:release_checklist:Release checklist:Confirm rollback plan."]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_skill_manage_edit_routes_to_file_store() {
+        let store = Arc::new(CaptureSkillFileStore::default());
+        let result = SkillManageTool
+            .execute(
+                tool_context(store.clone()),
+                json!({
+                    "action": "edit",
+                    "name": "release_checklist",
+                    "content": "# release_checklist\n\nUpdated full skill."
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["action"], json!("edit"));
+        assert_eq!(
+            store.calls.lock().unwrap().as_slice(),
+            ["edit:release_checklist:# release_checklist\n\nUpdated full skill."]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_skill_manage_file_lifecycle_routes_to_file_store() {
+        let store = Arc::new(CaptureSkillFileStore::default());
+        let write = SkillManageTool
+            .execute(
+                tool_context(store.clone()),
+                json!({
+                    "action": "write_file",
+                    "name": "release_checklist",
+                    "path": "references/checklist.md",
+                    "content": "# Checklist"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(write["action"], json!("write_file"));
+
+        let remove = SkillManageTool
+            .execute(
+                tool_context(store.clone()),
+                json!({
+                    "action": "remove_file",
+                    "name": "release_checklist",
+                    "path": "references/checklist.md"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(remove["action"], json!("remove_file"));
+
+        let delete = SkillManageTool
+            .execute(
+                tool_context(store.clone()),
+                json!({
+                    "action": "delete",
+                    "name": "release_checklist"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete["action"], json!("delete"));
+
+        assert_eq!(
+            store.calls.lock().unwrap().as_slice(),
+            [
+                "write:release_checklist:references/checklist.md:# Checklist",
+                "remove:release_checklist:references/checklist.md",
+                "delete:release_checklist"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_skill_manage_undo_latest_routes_to_file_store() {
+        let store = Arc::new(CaptureSkillFileStore::default());
+        let result = SkillManageTool
+            .execute(
+                tool_context(store.clone()),
+                json!({"action": "undo_latest", "name": "release_checklist"}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["action"], json!("restore_latest"));
+        assert_eq!(
+            store.calls.lock().unwrap().as_slice(),
+            ["undo:release_checklist"]
+        );
+    }
 
     #[test]
     fn test_list_skills_schema() {
         let tool = ListSkillsTool;
         let schema = tool.schema();
         assert_eq!(schema.name, "list_skills");
+        assert!(!schema.description.contains("evolution"));
+        assert!(!schema.description.contains("evolving"));
+        let query_enum = schema.parameters["properties"]["query"]["enum"]
+            .as_array()
+            .expect("query enum");
+        assert!(!query_enum.iter().any(|value| value == "learning"));
     }
 
     #[test]
     fn test_list_skills_validate() {
         let tool = ListSkillsTool;
         assert!(tool.validate(&json!({})).is_ok());
-        assert!(tool.validate(&json!({"query": "learning"})).is_ok());
+        assert!(tool.validate(&json!({"query": "learned"})).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_list_skills_ignores_legacy_evolution_records() {
+        let tool = ListSkillsTool;
+        let mut workspace = std::env::temp_dir();
+        workspace.push(format!(
+            "blockcell_list_skills_no_evolution_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let skills_dir = workspace.join("skills").join("release_checklist");
+        let records_dir = workspace.join("evolution_records");
+        std::fs::create_dir_all(&skills_dir).expect("create skill dir");
+        std::fs::create_dir_all(&records_dir).expect("create records dir");
+        std::fs::write(skills_dir.join("SKILL.md"), "# Release checklist\n").expect("write skill");
+        std::fs::write(
+            skills_dir.join("meta.yaml"),
+            "name: release_checklist\ndescription: Release checklist\nsource: blockcell\n",
+        )
+        .expect("write meta");
+        std::fs::write(
+            records_dir.join("legacy.json"),
+            serde_json::json!({
+                "id": "legacy-evolution",
+                "skill_name": "old_pipeline",
+                "status": "Generating"
+            })
+            .to_string(),
+        )
+        .expect("write legacy record");
+
+        let result = tool
+            .execute(
+                tool_context_with_workspace(workspace.clone(), None),
+                json!({"query": "all"}),
+            )
+            .await
+            .expect("list skills");
+
+        assert!(result.get("learning").is_none());
+        assert!(result.get("evolution_records").is_none());
+        assert_eq!(result["count"], json!(1));
+        assert_eq!(
+            result["learned_skills"][0]["name"],
+            json!("release_checklist")
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[test]
@@ -449,7 +749,7 @@ mod tests {
         assert_eq!(count, 1);
 
         let names: Vec<String> = result
-            .get("available_skills")
+            .get("learned_skills")
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
@@ -511,7 +811,7 @@ mod tests {
             .expect("get available skills");
 
         let skill = result
-            .get("available_skills")
+            .get("learned_skills")
             .and_then(|v| v.as_array())
             .and_then(|skills| {
                 skills.iter().find(|skill| {

@@ -941,11 +941,23 @@ mod tests {
     #[test]
     fn test_api_base_v1_auto_append() {
         // Custom api_base without /v1 should auto-append it
-        let provider = AnthropicProvider::new("test-key", Some("https://api.minimaxi.com/anthropic"), "test-model", 1024, 0.7);
+        let provider = AnthropicProvider::new(
+            "test-key",
+            Some("https://api.minimaxi.com/anthropic"),
+            "test-model",
+            1024,
+            0.7,
+        );
         assert_eq!(provider.api_base, "https://api.minimaxi.com/anthropic/v1");
 
         // Custom api_base already with /v1 should not double-append
-        let provider2 = AnthropicProvider::new("test-key", Some("https://api.minimaxi.com/anthropic/v1"), "test-model", 1024, 0.7);
+        let provider2 = AnthropicProvider::new(
+            "test-key",
+            Some("https://api.minimaxi.com/anthropic/v1"),
+            "test-model",
+            1024,
+            0.7,
+        );
         assert_eq!(provider2.api_base, "https://api.minimaxi.com/anthropic/v1");
 
         // Default (no api_base) uses the built-in constant which already has /v1

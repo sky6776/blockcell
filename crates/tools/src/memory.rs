@@ -14,10 +14,19 @@ pub struct MemoryUpsertTool;
 /// Tool for deleting/forgetting memory items (soft-delete, batch delete, restore).
 pub struct MemoryForgetTool;
 
+/// File memory tool for USER.md / MEMORY.md.
+pub struct MemoryManageTool;
+
 fn get_memory_store(ctx: &ToolContext) -> Result<&crate::MemoryStoreHandle> {
     ctx.memory_store
         .as_ref()
         .ok_or_else(|| Error::Tool("Memory store not available".to_string()))
+}
+
+fn get_memory_file_store(ctx: &ToolContext) -> Result<&crate::MemoryFileStoreHandle> {
+    ctx.memory_file_store
+        .as_ref()
+        .ok_or_else(|| Error::Tool("Memory file store not available".to_string()))
 }
 
 fn looks_like_ghost_maintenance_log(text: &str) -> bool {
@@ -32,6 +41,166 @@ fn looks_like_ghost_maintenance_log(text: &str) -> bool {
         || t.contains("heart")
         || t.contains("heartbeat")
         || t.contains("feed")
+}
+
+#[async_trait]
+impl Tool for MemoryManageTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "memory_manage",
+            description: "Save durable learning directly to USER.md or MEMORY.md. Use for stable user preferences, durable constraints, project facts, environment facts, and reusable non-procedural lessons. Do not save task logs or temporary state.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["add", "replace", "remove", "undo_latest"],
+                        "description": "Memory operation. Use replace/remove with old_text to update existing entries."
+                    },
+                    "target": {
+                        "type": "string",
+                        "enum": ["user", "memory"],
+                        "description": "user = durable user profile/preferences. memory = project/environment facts and stable lessons."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Entry content for add/replace. Keep compact and durable."
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "Short unique text identifying the entry to replace/remove."
+                    }
+                },
+                "required": ["action", "target"]
+            }),
+        }
+    }
+
+    fn prompt_rule(&self, _ctx: &crate::PromptContext) -> Option<String> {
+        Some("- Use `memory_manage` proactively for durable user preferences, corrections, stable project facts, and environment lessons. Do not save task progress or temporary TODOs.".to_string())
+    }
+
+    fn validate(&self, params: &Value) -> Result<()> {
+        let action = params
+            .get("action")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| Error::Validation("Missing required parameter: action".to_string()))?;
+        let target = params
+            .get("target")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| Error::Validation("Missing required parameter: target".to_string()))?;
+        if !matches!(target, "user" | "memory") {
+            return Err(Error::Validation(
+                "target must be 'user' or 'memory'".to_string(),
+            ));
+        }
+        match action {
+            "add" => {
+                if params
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .is_none()
+                {
+                    return Err(Error::Validation("content is required for add".to_string()));
+                }
+            }
+            "replace" => {
+                if params
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .is_none()
+                {
+                    return Err(Error::Validation(
+                        "content is required for replace".to_string(),
+                    ));
+                }
+                if params
+                    .get("old_text")
+                    .and_then(|value| value.as_str())
+                    .is_none()
+                {
+                    return Err(Error::Validation(
+                        "old_text is required for replace".to_string(),
+                    ));
+                }
+            }
+            "remove" => {
+                if params
+                    .get("old_text")
+                    .and_then(|value| value.as_str())
+                    .is_none()
+                {
+                    return Err(Error::Validation(
+                        "old_text is required for remove".to_string(),
+                    ));
+                }
+            }
+            "undo_latest" => {}
+            _ => {
+                return Err(Error::Validation(
+                    "action must be add, replace, remove, or undo_latest".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
+        let store = get_memory_file_store(&ctx)?;
+        let action = params
+            .get("action")
+            .and_then(|value| value.as_str())
+            .unwrap();
+        let target = params
+            .get("target")
+            .and_then(|value| value.as_str())
+            .unwrap();
+        let result = match action {
+            "add" => store.add_file_memory_json(
+                target,
+                params
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .unwrap(),
+            ),
+            "replace" => store.replace_file_memory_json(
+                target,
+                params
+                    .get("old_text")
+                    .and_then(|value| value.as_str())
+                    .unwrap(),
+                params
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .unwrap(),
+            ),
+            "remove" => store.remove_file_memory_json(
+                target,
+                params
+                    .get("old_text")
+                    .and_then(|value| value.as_str())
+                    .unwrap(),
+            ),
+            "undo_latest" => store.restore_latest_file_memory_json(target),
+            _ => unreachable!("validated action"),
+        }?;
+
+        if result
+            .get("success")
+            .and_then(|success| success.as_bool())
+            .unwrap_or(false)
+        {
+            if let Some(lifecycle) = ctx.ghost_memory_lifecycle.as_ref() {
+                let content = params
+                    .get("content")
+                    .or_else(|| params.get("old_text"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let _ = lifecycle.on_memory_write_json(target, action, content);
+            }
+        }
+        Ok(result)
+    }
 }
 
 #[async_trait]
@@ -461,6 +630,153 @@ mod tests {
             Ok((0, 0))
         }
     }
+    struct CaptureMemoryFileStore {
+        calls: Mutex<Vec<Value>>,
+    }
+
+    impl CaptureMemoryFileStore {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn last_call(&self) -> Value {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .last()
+                .cloned()
+                .expect("captured file memory call")
+        }
+    }
+
+    impl crate::MemoryFileStoreOps for CaptureMemoryFileStore {
+        fn add_file_memory_json(&self, target: &str, content: &str) -> Result<Value> {
+            self.calls.lock().expect("calls lock").push(json!({
+                "action": "add",
+                "target": target,
+                "content": content,
+            }));
+            Ok(json!({
+                "success": true,
+                "target": target,
+                "action": "add",
+                "snapshotRef": null,
+                "message": "memory updated",
+            }))
+        }
+
+        fn replace_file_memory_json(
+            &self,
+            target: &str,
+            old_text: &str,
+            content: &str,
+        ) -> Result<Value> {
+            self.calls.lock().expect("calls lock").push(json!({
+                "action": "replace",
+                "target": target,
+                "old_text": old_text,
+                "content": content,
+            }));
+            Ok(json!({
+                "success": true,
+                "target": target,
+                "action": "replace",
+                "snapshotRef": "snapshot.md",
+                "message": "memory updated",
+            }))
+        }
+
+        fn remove_file_memory_json(&self, target: &str, old_text: &str) -> Result<Value> {
+            self.calls.lock().expect("calls lock").push(json!({
+                "action": "remove",
+                "target": target,
+                "old_text": old_text,
+            }));
+            Ok(json!({
+                "success": true,
+                "target": target,
+                "action": "remove",
+                "snapshotRef": "snapshot.md",
+                "message": "memory updated",
+            }))
+        }
+
+        fn restore_latest_file_memory_json(&self, target: &str) -> Result<Value> {
+            self.calls.lock().expect("calls lock").push(json!({
+                "action": "undo_latest",
+                "target": target,
+            }));
+            Ok(json!({
+                "success": true,
+                "target": target,
+                "action": "restore_latest",
+                "snapshotRef": "snapshot.md",
+                "message": "memory restored",
+            }))
+        }
+    }
+
+    struct CaptureGhostMemoryLifecycle {
+        calls: Mutex<Vec<Value>>,
+    }
+
+    impl CaptureGhostMemoryLifecycle {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl crate::GhostMemoryLifecycleOps for CaptureGhostMemoryLifecycle {
+        fn on_memory_write_json(&self, target: &str, action: &str, content: &str) -> Result<Value> {
+            self.calls.lock().expect("calls lock").push(json!({
+                "target": target,
+                "action": action,
+                "content": content,
+            }));
+            Ok(json!({"success": true}))
+        }
+    }
+
+    fn test_context_with_file_store(
+        memory_file_store: Arc<dyn crate::MemoryFileStoreOps + Send + Sync>,
+    ) -> ToolContext {
+        test_context_with_file_store_and_lifecycle(memory_file_store, None)
+    }
+
+    fn test_context_with_file_store_and_lifecycle(
+        memory_file_store: Arc<dyn crate::MemoryFileStoreOps + Send + Sync>,
+        ghost_memory_lifecycle: Option<Arc<dyn crate::GhostMemoryLifecycleOps + Send + Sync>>,
+    ) -> ToolContext {
+        ToolContext {
+            workspace: PathBuf::from("/tmp/workspace"),
+            builtin_skills_dir: None,
+            active_skill_dir: None,
+            session_key: "cli:test".to_string(),
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: None,
+            chat_id: "chat-1".to_string(),
+            config: Config::default(),
+            permissions: blockcell_core::types::PermissionSet::new(),
+            task_manager: None,
+            memory_store: None,
+            memory_file_store: Some(memory_file_store),
+            ghost_memory_lifecycle,
+            skill_file_store: None,
+            session_search: None,
+            outbound_tx: None,
+            spawn_handle: None,
+            capability_registry: None,
+            core_evolution: None,
+            event_emitter: None,
+            channel_contacts_file: None,
+            response_cache: None,
+        }
+    }
 
     fn test_context(memory_store: Arc<dyn crate::MemoryStoreOps + Send + Sync>) -> ToolContext {
         ToolContext {
@@ -476,6 +792,10 @@ mod tests {
             permissions: blockcell_core::types::PermissionSet::new(),
             task_manager: None,
             memory_store: Some(memory_store),
+            memory_file_store: None,
+            ghost_memory_lifecycle: None,
+            skill_file_store: None,
+            session_search: None,
             outbound_tx: None,
             spawn_handle: None,
             capability_registry: None,
@@ -493,6 +813,134 @@ mod tests {
             .iter()
             .filter_map(|value| value.as_str().map(ToString::to_string))
             .collect()
+    }
+    #[test]
+    fn test_memory_manage_validate_requires_fields() {
+        let tool = MemoryManageTool;
+
+        assert!(tool.validate(&json!({})).is_err());
+        assert!(tool
+            .validate(
+                &json!({"action": "add", "target": "user", "content": "Prefer Chinese replies."})
+            )
+            .is_ok());
+        assert!(tool
+            .validate(&json!({"action": "replace", "target": "memory", "content": "New fact"}))
+            .is_err());
+        assert!(tool
+            .validate(&json!({"action": "remove", "target": "memory"}))
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_memory_manage_execute_add_routes_to_file_store() {
+        let store = Arc::new(CaptureMemoryFileStore::new());
+        let tool = MemoryManageTool;
+
+        let result = tool
+            .execute(
+                test_context_with_file_store(store.clone()),
+                json!({
+                    "action": "add",
+                    "target": "user",
+                    "content": "User prefers concise Chinese updates."
+                }),
+            )
+            .await
+            .expect("memory_manage add should succeed");
+
+        assert_eq!(result["success"], true);
+        assert_eq!(store.last_call()["action"], "add");
+        assert_eq!(store.last_call()["target"], "user");
+    }
+
+    #[tokio::test]
+    async fn test_memory_manage_execute_add_notifies_ghost_memory_lifecycle() {
+        let store = Arc::new(CaptureMemoryFileStore::new());
+        let lifecycle = Arc::new(CaptureGhostMemoryLifecycle::new());
+
+        MemoryManageTool
+            .execute(
+                test_context_with_file_store_and_lifecycle(store, Some(lifecycle.clone())),
+                json!({
+                    "action": "add",
+                    "target": "user",
+                    "content": "User prefers concise Chinese updates."
+                }),
+            )
+            .await
+            .expect("memory_manage add should succeed");
+
+        assert_eq!(
+            lifecycle.calls.lock().expect("calls lock").as_slice(),
+            &[json!({
+                "target": "user",
+                "action": "add",
+                "content": "User prefers concise Chinese updates."
+            })]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_manage_execute_replace_routes_old_text() {
+        let store = Arc::new(CaptureMemoryFileStore::new());
+        let tool = MemoryManageTool;
+
+        tool.execute(
+            test_context_with_file_store(store.clone()),
+            json!({
+                "action": "replace",
+                "target": "memory",
+                "old_text": "blue-green",
+                "content": "Project deploys use canary checks first."
+            }),
+        )
+        .await
+        .expect("memory_manage replace should succeed");
+
+        let call = store.last_call();
+        assert_eq!(call["action"], "replace");
+        assert_eq!(call["old_text"], "blue-green");
+    }
+
+    #[tokio::test]
+    async fn test_memory_manage_execute_undo_latest_routes_to_file_store() {
+        let store = Arc::new(CaptureMemoryFileStore::new());
+        let result = MemoryManageTool
+            .execute(
+                test_context_with_file_store(store.clone()),
+                json!({
+                    "action": "undo_latest",
+                    "target": "user"
+                }),
+            )
+            .await
+            .expect("memory_manage undo_latest should succeed");
+
+        assert_eq!(result["action"], json!("restore_latest"));
+        let call = store.last_call();
+        assert_eq!(call["action"], "undo_latest");
+        assert_eq!(call["target"], "user");
+    }
+
+    #[tokio::test]
+    async fn test_memory_manage_execute_requires_file_store() {
+        let tool = MemoryManageTool;
+        let store = Arc::new(CaptureMemoryStore::new());
+
+        let err = tool
+            .execute(
+                test_context(store),
+                json!({
+                    "action": "add",
+                    "target": "user",
+                    "content": "User prefers concise Chinese updates."
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Memory file store not available"));
     }
 
     #[test]

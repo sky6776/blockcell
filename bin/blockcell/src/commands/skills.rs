@@ -211,6 +211,8 @@ async fn build_skill_test_runtime(paths: &Paths) -> anyhow::Result<AgentRuntime>
         runtime.set_memory_store(handle);
     }
 
+    runtime.init_memory_file_store()?;
+
     Ok(runtime)
 }
 
@@ -693,6 +695,8 @@ pub async fn learn(description: &str) -> anyhow::Result<()> {
     if let Some(handle) = memory_store_handle {
         runtime.set_memory_store(handle);
     }
+
+    runtime.init_memory_file_store()?;
 
     println!("🔄 Learning skill: {}", description);
     println!();

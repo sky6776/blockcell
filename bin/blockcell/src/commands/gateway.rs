@@ -22,8 +22,9 @@ use blockcell_channels::whatsapp::WhatsAppChannel;
 use blockcell_channels::ChannelManager;
 use blockcell_core::{Config, InboundMessage, OutboundMessage, Paths};
 use blockcell_scheduler::{
-    CronJob, CronService, DreamService, DreamServiceConfig, GhostService, GhostServiceConfig,
-    HeartbeatService, JobPayload, JobSchedule, JobState, ScheduleKind,
+    CronJob, CronService, DreamService, DreamServiceConfig, GhostMaintenanceService,
+    GhostMaintenanceServiceConfig, HeartbeatService, JobPayload, JobSchedule, JobState,
+    ScheduleKind,
 };
 use blockcell_skills::{new_registry_handle, CoreEvolution};
 use blockcell_skills::{EvolutionService, EvolutionServiceConfig};
@@ -812,6 +813,10 @@ async fn spawn_agent_runtime(
     if let Some(ref store) = memory_store_handle {
         runtime.set_memory_store(store.clone());
     }
+    if let Err(e) = runtime.init_memory_file_store() {
+        warn!(agent_id = %agent_id, error = %e, "Failed to initialize file memory store");
+    }
+
     runtime.set_capability_registry(cap_registry_handle);
     runtime.set_core_evolution(core_evo_handle);
     runtime.set_event_tx(ws_broadcast_tx);
@@ -1321,9 +1326,12 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         });
     }
 
-    // ── Create Ghost Agent service ──
-    let ghost_config = GhostServiceConfig::from_config(&config);
-    let ghost_service = GhostService::new(ghost_config, paths.clone(), inbound_tx.clone());
+    // ── Create scheduled Ghost maintenance service ──
+    // Embedded Ghost learning runs inside AgentRuntime during normal turns and
+    // does not depend on this scheduled maintenance service being enabled.
+    let ghost_config = GhostMaintenanceServiceConfig::from_config(&config);
+    let ghost_service =
+        GhostMaintenanceService::new(ghost_config, paths.clone(), inbound_tx.clone());
 
     // ── Inbound interceptor: check for pending channel confirm replies ──
     // Sits between channel inbound_rx and the runtime, intercepting confirm
@@ -1761,12 +1769,13 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
             "/v1/config/test-provider",
             post(handle_config_test_provider),
         )
-        // Ghost Agent
+        // Scheduled Ghost maintenance
         .route(
             "/v1/ghost/config",
             get(handle_ghost_config_get).put(handle_ghost_config_update),
         )
         .route("/v1/ghost/activity", get(handle_ghost_activity))
+        .route("/v1/ghost/metrics", get(handle_ghost_metrics))
         .route(
             "/v1/ghost/model-options",
             get(handle_ghost_model_options_get),
