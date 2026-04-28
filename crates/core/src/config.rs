@@ -505,6 +505,7 @@ fn default_intent_router_profiles() -> HashMap<String, IntentToolProfileConfig> 
                 "toggle_manage".to_string(),
                 "message".to_string(),
                 "agent_status".to_string(),
+                "session_recall".to_string(),
             ],
             intent_tools: HashMap::from([
                 (

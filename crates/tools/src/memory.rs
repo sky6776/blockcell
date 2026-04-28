@@ -115,6 +115,16 @@ impl Tool for MemoryQueryTool {
 
         let results = store.query_json(query_params)?;
 
+        // 当查询返回空数组时，添加明确提示避免 LLM 幻觉编造结果
+        if results == json!([]) {
+            debug!("memory_query returned empty results");
+            return Ok(json!({
+                "results": [],
+                "total": 0,
+                "note": "No matching memories found. The query returned zero results."
+            }));
+        }
+
         debug!("memory_query executed");
         Ok(results)
     }

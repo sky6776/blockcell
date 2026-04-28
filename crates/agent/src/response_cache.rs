@@ -67,7 +67,23 @@ impl ResponseCache {
 
     /// If `content` qualifies as a cacheable list/table, stores it and returns a compact stub.
     /// Returns `None` if the content does not meet the caching threshold.
-    pub fn maybe_cache_and_stub(&self, session_key: &str, content: &str) -> Option<String> {
+    ///
+    /// ## `has_tool_results` guard
+    /// Only applies caching when the conversation contains actual tool results.
+    /// Without this guard, the LLM can hallucinate a numbered list from empty tool
+    /// results (e.g. `memory_query` returning `[]`) and the stub would replace the
+    /// hallucinated content with an unreadable cache reference.
+    pub fn maybe_cache_and_stub(
+        &self,
+        session_key: &str,
+        content: &str,
+        has_tool_results: bool,
+    ) -> Option<String> {
+        // Skip caching if there were no tool results in this turn —
+        // the LLM may have hallucinated a list from empty/missing data.
+        if !has_tool_results {
+            return None;
+        }
         if !Self::is_cacheable(content) {
             return None;
         }

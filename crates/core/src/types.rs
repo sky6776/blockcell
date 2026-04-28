@@ -203,6 +203,27 @@ impl ChatMessage {
         }
     }
 
+    /// 创建带推理内容的助手消息（用于 DeepSeek thinking mode 等）。
+    ///
+    /// DeepSeek 的 thinking mode 要求：每次请求中，所有之前包含
+    /// `reasoning_content` 的 assistant 消息必须携带原始的
+    /// `reasoning_content` 传回 API，否则会触发 400 永久错误。
+    /// 使用此构造器确保 `reasoning_content` 不会丢失。
+    pub fn assistant_with_reasoning(
+        content: &str,
+        reasoning_content: Option<String>,
+    ) -> Self {
+        Self {
+            id: Some(uuid::Uuid::new_v4().to_string()),
+            role: "assistant".to_string(),
+            content: serde_json::Value::String(content.to_string()),
+            reasoning_content,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
     pub fn tool_result(tool_call_id: &str, content: &str) -> Self {
         Self {
             id: Some(uuid::Uuid::new_v4().to_string()),

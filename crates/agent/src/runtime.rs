@@ -2708,9 +2708,12 @@ impl AgentRuntime {
         let final_response = strip_fake_tool_calls(final_response.trim());
         info!(target: "chat::output", content = %final_response, "Final response");
 
+        // Only cache if this turn had actual tool results — prevents caching
+        // LLM-hallucinated lists from empty tool results (e.g. memory_query returning [])
+        let has_tool_results = history.iter().any(|m| m.role == "tool");
         if let Some(stub) = self
             .response_cache
-            .maybe_cache_and_stub(persist_session_key, &final_response)
+            .maybe_cache_and_stub(persist_session_key, &final_response, has_tool_results)
         {
             overwrite_last_assistant_message(history, &stub);
         }
@@ -4200,7 +4203,11 @@ impl AgentRuntime {
                     match chat_result {
                         Ok(r) => {
                             final_response = r.content.unwrap_or_default();
-                            history.push(ChatMessage::assistant(&final_response));
+                            // 保留 reasoning_content，避免 DeepSeek thinking mode 400 错误
+                            history.push(ChatMessage::assistant_with_reasoning(
+                                &final_response,
+                                r.reasoning_content.clone(),
+                            ));
                         }
                         Err(e) => {
                             warn!(error = %e, "Final no-tools LLM call failed");
@@ -4215,8 +4222,11 @@ impl AgentRuntime {
                 // No tool calls, we have the final response
                 final_response = response.content.unwrap_or_default();
 
-                // Add to history
-                history.push(ChatMessage::assistant(&final_response));
+                // 保留 reasoning_content，避免 DeepSeek thinking mode 400 错误
+                history.push(ChatMessage::assistant_with_reasoning(
+                    &final_response,
+                    response.reasoning_content.clone(),
+                ));
                 break;
             }
         }
@@ -6902,7 +6912,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let stub = cache
-            .maybe_cache_and_stub(session_key, &cached_list)
+            .maybe_cache_and_stub(session_key, &cached_list, true)
             .expect("content should be cached");
         let history = vec![ChatMessage::assistant(&stub)];
 
