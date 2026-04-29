@@ -41,9 +41,14 @@ impl FileTracker {
     /// 记录文件读取
     pub fn record_read(&mut self, path: PathBuf, content: &str) {
         let summary = if content.len() > self.max_summary_chars {
+            // 找到安全的 UTF-8 字符边界，避免在多字节字符中间截断导致 panic
+            let mut boundary = self.max_summary_chars;
+            while boundary > 0 && !content.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
             format!(
                 "{}...\n[content truncated]",
-                &content[..self.max_summary_chars]
+                &content[..boundary]
             )
         } else {
             content.to_string()
@@ -211,5 +216,44 @@ mod tests {
         assert_eq!(recent[0].path, PathBuf::from("/third.rs"));
         assert_eq!(recent[1].path, PathBuf::from("/second.rs"));
         assert_eq!(recent[2].path, PathBuf::from("/first.rs"));
+    }
+
+    #[test]
+    fn test_file_tracker_chinese_text_truncation() {
+        // Bug #70: 中文字符在 UTF-8 中占 3 字节，字节索引 2000 可能落在字符中间导致 panic
+        let mut tracker = FileTracker::new();
+
+        // 构造超过 2000 字节的中文内容（每个中文字符 3 字节）
+        let chinese_content = "你好世界".repeat(200); // 4*3*200 = 2400 字节
+        assert!(chinese_content.len() > 2000);
+
+        // 不应 panic
+        tracker.record_read(PathBuf::from("/chinese.md"), &chinese_content);
+
+        let records = tracker.all_records();
+        let record = records.get(&PathBuf::from("/chinese.md")).unwrap();
+
+        // 摘要应被截断且包含截断标记
+        assert!(record.summary.contains("[content truncated]"));
+        // 截断后的内容必须是有效的 UTF-8（不会 panic 说明已通过）
+        let _ = record.summary.chars().count();
+    }
+
+    #[test]
+    fn test_file_tracker_mixed_text_truncation() {
+        // 混合 ASCII + 中文 + emoji 的截断测试
+        let mut tracker = FileTracker::new();
+
+        let mut mixed = String::new();
+        // 构造恰好使字节 2000 落在多字节字符中间的内容
+        mixed.push_str(&"a".repeat(1999)); // 1999 字节 ASCII
+        mixed.push_str("假");               // 3 字节中文，总 2002 字节
+        mixed.push_str(&"b".repeat(100));   // 追加更多
+
+        tracker.record_read(PathBuf::from("/mixed.txt"), &mixed);
+
+        let records = tracker.all_records();
+        let record = records.get(&PathBuf::from("/mixed.txt")).unwrap();
+        assert!(record.summary.contains("[content truncated]"));
     }
 }
