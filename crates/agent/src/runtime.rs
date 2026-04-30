@@ -1599,6 +1599,9 @@ impl AgentRuntime {
         // 从 config 中提取 nudge 配置 (在 config 被 move 之前)
         let nudge_config = crate::skill_nudge::NudgeConfig::from_config(&config.self_improve.nudge);
 
+        // 从 config 中提取 L1 配置 (在 config 被 move 之前)
+        let l1_cache_max_per_session = config.memory.memory_system.layer1.cache_max_per_session;
+
         Ok(Self {
             config,
             paths,
@@ -1624,7 +1627,9 @@ impl AgentRuntime {
             cap_request_cooldown: HashMap::new(),
             channel_contacts,
             path_policy,
-            response_cache: crate::response_cache::ResponseCache::new(),
+            response_cache: crate::response_cache::ResponseCache::with_config(
+                l1_cache_max_per_session,
+            ),
             memory_system: None,
             memory_injector_needs_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             skill_nudge_engine: crate::skill_nudge::SkillNudgeEngine::new(nudge_config),
@@ -1779,11 +1784,15 @@ impl AgentRuntime {
         use crate::compact::{
             MAX_FILE_RECOVERY_TOKENS, MAX_SESSION_MEMORY_RECOVERY_TOKENS, MAX_SKILL_RECOVERY_TOKENS,
         };
-        use crate::memory_system::{MemorySystem, MemorySystemConfig};
+        use crate::memory_system::MemorySystem;
 
-        let config = MemorySystemConfig::default();
+        let config = self.config.memory.memory_system.clone();
         // Use paths.base as both workspace and config directory
         let base_dir = self.paths.base.clone();
+
+        // Extract layer2 config before moving config into MemorySystem
+        let layer2_config: crate::history_projector::TimeBasedMCConfig =
+            config.layer2.clone().into();
 
         let mut memory_system = MemorySystem::new(config, base_dir.clone(), base_dir, session_id);
 
@@ -1801,7 +1810,6 @@ impl AgentRuntime {
         );
 
         // Layer 2: Micro Compact
-        let layer2_config = crate::history_projector::TimeBasedMCConfig::default();
         crate::memory_event!(
             layer2,
             config,
@@ -1813,8 +1821,8 @@ impl AgentRuntime {
         crate::memory_event!(
             layer3,
             config,
-            crate::session_memory::MAX_TOTAL_SESSION_MEMORY_TOKENS,
-            crate::session_memory::MAX_SECTION_LENGTH
+            memory_system.config().layer3.max_total_session_memory_tokens,
+            memory_system.config().layer3.max_section_length
         );
 
         // Layer 4: Full Compact
@@ -1825,7 +1833,7 @@ impl AgentRuntime {
             layer4,
             config,
             memory_system.config().token_budget,
-            memory_system.config().compact_threshold,
+            memory_system.config().layer4.compact_threshold_ratio,
             recovery_budget
         );
 
@@ -1833,9 +1841,9 @@ impl AgentRuntime {
         crate::memory_event!(
             layer5,
             config,
-            crate::auto_memory::MIN_MESSAGES_FOR_EXTRACTION,
-            crate::auto_memory::EXTRACTION_COOLDOWN_MESSAGES,
-            crate::auto_memory::MAX_MEMORY_FILE_TOKENS
+            memory_system.config().layer5.min_messages_for_extraction,
+            memory_system.config().layer5.extraction_cooldown_messages,
+            memory_system.config().layer5.max_memory_file_tokens
         );
 
         // Layer 6: Auto Dream (interval is typically 24 hours)
@@ -2639,7 +2647,7 @@ impl AgentRuntime {
         let threshold = self
             .memory_system
             .as_ref()
-            .map(|m| m.config().compact_threshold)
+            .map(|m| m.config().layer4.compact_threshold_ratio)
             .unwrap_or(0.8);
         crate::memory_event!(
             layer4,
@@ -3722,7 +3730,7 @@ impl AgentRuntime {
 
         // Layer 2: 时间触发的轻量压缩
         // 检查会话最后更新时间，如果超过阈值则清理旧工具结果
-        let time_config = TimeBasedMCConfig::default();
+        let time_config: TimeBasedMCConfig = self.config.memory.memory_system.layer2.clone().into();
         if let Some(updated_at_str) = session_metadata.get("updated_at").and_then(|v| v.as_str()) {
             if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(updated_at_str) {
                 let last_assistant_timestamp = Some(updated_at.with_timezone(&chrono::Utc));
@@ -4025,13 +4033,13 @@ impl AgentRuntime {
                     token_usage,
                     estimated_tokens,
                     memory_system.config().token_budget,
-                    memory_system.config().compact_threshold
+                    memory_system.config().layer4.compact_threshold_ratio
                 );
                 if memory_system.should_compact(estimated_tokens) {
                     info!(
                         estimated_tokens,
                         token_budget = memory_system.config().token_budget,
-                        threshold = memory_system.config().compact_threshold,
+                        threshold = memory_system.config().layer4.compact_threshold_ratio,
                         "[layer4] Pre-loop compact check triggered"
                     );
 
@@ -4556,7 +4564,7 @@ impl AgentRuntime {
                 }
 
                 // Layer 4: Full Compact - 当 token 超过预算阈值时触发 LLM 语义压缩
-                // 预算阈值: token_budget * compact_threshold (默认 100_000 * 0.8 = 80_000)
+                // 预算阈值: token_budget * compact_threshold_ratio (默认 100_000 * 0.8 = 80_000)
                 let estimated_tokens = estimate_messages_tokens(&current_messages);
                 // Update Layer 4 token usage metrics
                 if let Some(memory_system) = self.memory_system.as_ref() {
@@ -4565,13 +4573,13 @@ impl AgentRuntime {
                         token_usage,
                         estimated_tokens,
                         memory_system.config().token_budget,
-                        memory_system.config().compact_threshold
+                        memory_system.config().layer4.compact_threshold_ratio
                     );
                     if memory_system.should_compact(estimated_tokens) {
                         info!(
                             estimated_tokens,
                             token_budget = memory_system.config().token_budget,
-                            threshold = memory_system.config().compact_threshold,
+                            threshold = memory_system.config().layer4.compact_threshold_ratio,
                             "[layer4] Full compact threshold reached"
                         );
 

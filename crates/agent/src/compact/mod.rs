@@ -84,6 +84,17 @@ impl Default for CompactConfig {
     }
 }
 
+impl From<blockcell_core::config::Layer4Config> for CompactConfig {
+    fn from(c: blockcell_core::config::Layer4Config) -> Self {
+        Self {
+            token_threshold: 100_000, // derived from MemorySystemConfig.token_budget
+            threshold_ratio: c.compact_threshold_ratio,
+            keep_recent_messages: c.keep_recent_messages,
+            max_output_tokens: c.max_output_tokens,
+        }
+    }
+}
+
 /// 压缩结果
 #[derive(Debug)]
 pub struct CompactResult {

@@ -31,6 +31,20 @@ impl Default for InjectionConfig {
     }
 }
 
+impl From<blockcell_core::config::Layer5Config> for InjectionConfig {
+    fn from(c: blockcell_core::config::Layer5Config) -> Self {
+        Self {
+            max_tokens: c.injection_max_tokens,
+            priority_order: vec![
+                MemoryType::User,
+                MemoryType::Feedback,
+                MemoryType::Project,
+                MemoryType::Reference,
+            ],
+        }
+    }
+}
+
 /// 注入的记忆内容
 #[derive(Debug, Clone)]
 pub struct InjectedMemory {

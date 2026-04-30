@@ -20,7 +20,7 @@ pub struct SkillRecord {
 }
 
 /// 技能追踪器
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SkillTracker {
     /// 已加载的技能记录（名称 -> 记录）
     records: HashMap<String, SkillRecord>,
@@ -34,6 +34,14 @@ impl SkillTracker {
         Self {
             records: HashMap::new(),
             max_summary_chars: 2000, // 约 500 tokens
+        }
+    }
+
+    /// 创建带自定义摘要长度限制的技能追踪器
+    pub fn with_config(max_summary_chars: usize) -> Self {
+        Self {
+            records: HashMap::new(),
+            max_summary_chars,
         }
     }
 
@@ -82,6 +90,12 @@ impl SkillTracker {
     /// 是否为空
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+}
+
+impl Default for SkillTracker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

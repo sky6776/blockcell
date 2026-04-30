@@ -6,7 +6,7 @@ use crate::auto_memory::{ExtractionCursor, ExtractionCursorManager, MemoryType};
 use crate::compact::{should_compact, CompactHookRegistry, FileTracker, SkillTracker};
 use crate::response_cache::ContentReplacementState;
 use crate::session_memory::{
-    get_session_memory_path, should_extract_memory, SessionMemoryConfig, SessionMemoryState,
+    get_session_memory_path, should_extract_memory, SessionMemoryState,
 };
 use blockcell_core::types::ChatMessage;
 use std::path::{Path, PathBuf};
@@ -16,35 +16,11 @@ use tokio::task::JoinHandle;
 /// 后台任务句柄类型
 pub type BackgroundTaskHandle = JoinHandle<()>;
 
-/// 记忆系统配置
-#[derive(Debug, Clone)]
-pub struct MemorySystemConfig {
-    /// Session Memory 配置
-    pub session_memory: SessionMemoryConfig,
-    /// 是否启用自动记忆提取
-    pub auto_memory_enabled: bool,
-    /// 是否启用 Compact
-    pub compact_enabled: bool,
-    /// Compact 触发阈值 (0.0-1.0)
-    pub compact_threshold: f64,
-    /// Token 预算
-    pub token_budget: usize,
-}
-
-impl Default for MemorySystemConfig {
-    fn default() -> Self {
-        Self {
-            session_memory: SessionMemoryConfig::default(),
-            auto_memory_enabled: true,
-            compact_enabled: true,
-            compact_threshold: 0.8,
-            token_budget: 100_000,
-        }
-    }
-}
+// Re-export MemorySystemConfig from core crate
+pub use blockcell_core::config::MemorySystemConfig;
 
 /// 记忆系统状态
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct MemorySystemState {
     /// Session Memory 状态
     pub session_memory: SessionMemoryState,
@@ -64,20 +40,6 @@ pub struct MemorySystemState {
     pub needs_cursor_reload: bool,
 }
 
-impl Default for MemorySystemState {
-    fn default() -> Self {
-        Self {
-            session_memory: SessionMemoryState::default(),
-            content_replacement: ContentReplacementState::default(),
-            auto_memory_cursors: Vec::new(),
-            has_pending_extraction: false,
-            file_tracker: FileTracker::new(),
-            skill_tracker: SkillTracker::new(),
-            background_tasks: Vec::new(),
-            needs_cursor_reload: false,
-        }
-    }
-}
 
 /// 记忆系统集成器
 ///
@@ -111,9 +73,15 @@ impl MemorySystem {
     ) -> Self {
         let cursor_manager = ExtractionCursorManager::new(&config_dir);
 
+        let tracker_summary_chars = config.layer4.tracker_summary_chars;
+
         Self {
             config,
-            state: MemorySystemState::default(),
+            state: MemorySystemState {
+                file_tracker: FileTracker::with_config(tracker_summary_chars),
+                skill_tracker: SkillTracker::with_config(tracker_summary_chars),
+                ..Default::default()
+            },
             compact_hooks: CompactHookRegistry::new(),
             workspace_dir,
             config_dir,
@@ -213,7 +181,7 @@ impl MemorySystem {
         should_compact(
             current_tokens,
             self.config.token_budget,
-            self.config.compact_threshold,
+            self.config.layer4.compact_threshold_ratio,
         )
     }
 
@@ -618,6 +586,7 @@ pub fn default_memory_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use blockcell_core::config::Layer4Config;
     use super::*;
 
     #[test]
@@ -625,7 +594,7 @@ mod tests {
         let config = MemorySystemConfig::default();
         assert!(config.auto_memory_enabled);
         assert!(config.compact_enabled);
-        assert_eq!(config.compact_threshold, 0.8);
+        assert_eq!(config.layer4.compact_threshold_ratio, 0.8);
     }
 
     #[test]
@@ -646,7 +615,10 @@ mod tests {
     fn test_should_compact() {
         let config = MemorySystemConfig {
             token_budget: 100_000,
-            compact_threshold: 0.8,
+            layer4: Layer4Config {
+                compact_threshold_ratio: 0.8,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let memory_system = MemorySystem::new(
@@ -703,7 +675,10 @@ mod tests {
     fn test_evaluate_memory_hooks_compact() {
         let config = MemorySystemConfig {
             token_budget: 100,
-            compact_threshold: 0.8,
+            layer4: Layer4Config {
+                compact_threshold_ratio: 0.8,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut memory_system = MemorySystem::new(
@@ -834,7 +809,10 @@ mod tests {
         // 测试 Compact 优先级高于其他操作
         let config = MemorySystemConfig {
             token_budget: 100,
-            compact_threshold: 0.8,
+            layer4: Layer4Config {
+                compact_threshold_ratio: 0.8,
+                ..Default::default()
+            },
             auto_memory_enabled: true,
             ..Default::default()
         };

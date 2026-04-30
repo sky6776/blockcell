@@ -11,6 +11,7 @@ mod tests {
     use blockcell_agent::session_memory::{
         should_extract_memory, SessionMemoryConfig, SessionMemoryState,
     };
+    use blockcell_core::config::{Layer3Config, Layer4Config};
     use blockcell_core::types::ChatMessage;
     use std::path::PathBuf;
 
@@ -34,7 +35,10 @@ mod tests {
     fn test_compact_trigger() {
         let config = MemorySystemConfig {
             token_budget: 100,
-            compact_threshold: 0.8,
+            layer4: Layer4Config {
+                compact_threshold_ratio: 0.8,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let memory_system = MemorySystem::new(
@@ -76,7 +80,10 @@ mod tests {
     fn test_post_sampling_hook_compact() {
         let config = MemorySystemConfig {
             token_budget: 100,
-            compact_threshold: 0.8,
+            layer4: Layer4Config {
+                compact_threshold_ratio: 0.8,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut memory_system = MemorySystem::new(
@@ -189,11 +196,11 @@ mod tests {
 
         assert!(config.auto_memory_enabled);
         assert!(config.compact_enabled);
-        assert_eq!(config.compact_threshold, 0.8);
+        assert_eq!(config.layer4.compact_threshold_ratio, 0.8);
         assert_eq!(config.token_budget, 100_000);
-        assert_eq!(config.session_memory.minimum_message_tokens_to_init, 10_000);
-        assert_eq!(config.session_memory.minimum_tokens_between_update, 5_000);
-        assert_eq!(config.session_memory.tool_calls_between_updates, 3);
+        assert_eq!(config.layer3.minimum_message_tokens_to_init, 10_000);
+        assert_eq!(config.layer3.minimum_tokens_between_update, 5_000);
+        assert_eq!(config.layer3.tool_calls_between_updates, 3);
     }
 
     // ========================================================================
@@ -582,7 +589,10 @@ mod tests {
         // 创建记忆系统并验证流程
         let config = MemorySystemConfig {
             token_budget: 50_000,
-            compact_threshold: 0.8,
+            layer4: Layer4Config {
+                compact_threshold_ratio: 0.8,
+                ..Default::default()
+            },
             auto_memory_enabled: true,
             ..Default::default()
         };
@@ -1212,7 +1222,10 @@ _No errors encountered._
         // Layer 4: 创建低预算配置以触发 Compact
         let config = MemorySystemConfig {
             token_budget: 1000, // 很低的预算
-            compact_threshold: 0.5,
+            layer4: Layer4Config {
+                compact_threshold_ratio: 0.5,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -1285,7 +1298,10 @@ _No errors encountered._
         // Compact 最高优先级
         let config = MemorySystemConfig {
             token_budget: 100,
-            compact_threshold: 0.8,
+            layer4: Layer4Config {
+                compact_threshold_ratio: 0.8,
+                ..Default::default()
+            },
             auto_memory_enabled: true,
             ..Default::default()
         };

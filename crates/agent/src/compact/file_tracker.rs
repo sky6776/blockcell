@@ -21,7 +21,7 @@ pub struct FileRecord {
 }
 
 /// 文件追踪器
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct FileTracker {
     /// 已读取的文件记录（路径 -> 记录）
     records: HashMap<PathBuf, FileRecord>,
@@ -35,6 +35,14 @@ impl FileTracker {
         Self {
             records: HashMap::new(),
             max_summary_chars: 2000, // 约 500 tokens
+        }
+    }
+
+    /// 创建带自定义摘要长度限制的文件追踪器
+    pub fn with_config(max_summary_chars: usize) -> Self {
+        Self {
+            records: HashMap::new(),
+            max_summary_chars,
         }
     }
 
@@ -102,6 +110,12 @@ impl FileTracker {
     /// 是否为空
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+}
+
+impl Default for FileTracker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

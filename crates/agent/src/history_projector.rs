@@ -139,6 +139,16 @@ impl Default for TimeBasedMCConfig {
     }
 }
 
+impl From<blockcell_core::config::Layer2Config> for TimeBasedMCConfig {
+    fn from(c: blockcell_core::config::Layer2Config) -> Self {
+        Self {
+            enabled: c.enabled,
+            gap_threshold_minutes: c.gap_threshold_minutes,
+            keep_recent: c.keep_recent,
+        }
+    }
+}
+
 /// 时间触发结果
 #[derive(Debug)]
 pub struct TimeTriggerResult {

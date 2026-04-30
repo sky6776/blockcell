@@ -41,6 +41,16 @@ impl ResponseCache {
         }
     }
 
+    /// Create ResponseCache with configurable max_per_session from Layer1Config
+    pub fn with_config(max_per_session: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ResponseCacheInner {
+                data: HashMap::new(),
+                max_per_session,
+            })),
+        }
+    }
+
     /// 安全获取锁，处理锁中毒情况
     ///
     /// 如果锁中毒（持有锁的线程 panic），会恢复并返回中毒时的数据。

@@ -36,6 +36,16 @@ impl Default for SessionMemoryConfig {
     }
 }
 
+impl From<blockcell_core::config::Layer3Config> for SessionMemoryConfig {
+    fn from(c: blockcell_core::config::Layer3Config) -> Self {
+        Self {
+            minimum_message_tokens_to_init: c.minimum_message_tokens_to_init,
+            minimum_tokens_between_update: c.minimum_tokens_between_update,
+            tool_calls_between_updates: c.tool_calls_between_updates,
+        }
+    }
+}
+
 /// Session Memory 状态
 #[derive(Debug, Default)]
 pub struct SessionMemoryState {
