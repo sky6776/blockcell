@@ -209,10 +209,7 @@ impl ChatMessage {
     /// `reasoning_content` 的 assistant 消息必须携带原始的
     /// `reasoning_content` 传回 API，否则会触发 400 永久错误。
     /// 使用此构造器确保 `reasoning_content` 不会丢失。
-    pub fn assistant_with_reasoning(
-        content: &str,
-        reasoning_content: Option<String>,
-    ) -> Self {
+    pub fn assistant_with_reasoning(content: &str, reasoning_content: Option<String>) -> Self {
         Self {
             id: Some(uuid::Uuid::new_v4().to_string()),
             role: "assistant".to_string(),

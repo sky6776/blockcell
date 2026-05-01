@@ -11,7 +11,7 @@ mod tests {
     use blockcell_agent::session_memory::{
         should_extract_memory, SessionMemoryConfig, SessionMemoryState,
     };
-    use blockcell_core::config::{Layer3Config, Layer4Config};
+    use blockcell_core::config::Layer4Config;
     use blockcell_core::types::ChatMessage;
     use std::path::PathBuf;
 
@@ -969,8 +969,8 @@ mod tests {
     #[test]
     fn test_compact_recovery_reinjection() {
         use blockcell_agent::compact::{
-            build_recovery_message, FileTracker, SkillTracker, MAX_FILES_TO_RECOVER,
-            MAX_SINGLE_FILE_TOKENS,
+            build_recovery_message, FileTracker, RecoveryBudget, SkillTracker,
+            MAX_FILES_TO_RECOVER, MAX_SINGLE_FILE_TOKENS,
         };
         use std::path::PathBuf;
 
@@ -1013,8 +1013,12 @@ _No errors encountered._
 "#;
 
         // 4. 构建恢复消息
-        let recovery_message =
-            build_recovery_message(&file_tracker, &skill_tracker, Some(session_memory));
+        let recovery_message = build_recovery_message(
+            &file_tracker,
+            &skill_tracker,
+            Some(session_memory),
+            &RecoveryBudget::default(),
+        );
 
         // 5. 验证恢复消息内容
         assert!(recovery_message.contains("Files Previously Read"));
@@ -1056,27 +1060,30 @@ _No errors encountered._
     /// 验证恢复消息的格式符合预期，能被 LLM 正确理解
     #[test]
     fn test_compact_recovery_message_format() {
-        use blockcell_agent::compact::{build_recovery_message, FileTracker, SkillTracker};
+        use blockcell_agent::compact::{
+            build_recovery_message, FileTracker, RecoveryBudget, SkillTracker,
+        };
 
         // 创建空的 tracker
         let file_tracker = FileTracker::new();
         let skill_tracker = SkillTracker::new();
+        let budget = RecoveryBudget::default();
 
         // 测试空内容
-        let empty_recovery = build_recovery_message(&file_tracker, &skill_tracker, None);
+        let empty_recovery = build_recovery_message(&file_tracker, &skill_tracker, None, &budget);
         assert!(empty_recovery.is_empty());
 
         // 只测试文件
         let mut file_tracker_only = FileTracker::new();
         file_tracker_only.record_read(PathBuf::from("/test.rs"), "test content");
-        let files_only = build_recovery_message(&file_tracker_only, &skill_tracker, None);
+        let files_only = build_recovery_message(&file_tracker_only, &skill_tracker, None, &budget);
         assert!(files_only.contains("Files Previously Read"));
         assert!(!files_only.contains("Skills Previously Loaded"));
 
         // 只测试技能
         let mut skill_tracker_only = SkillTracker::new();
         skill_tracker_only.record_load("test-skill", "skill content");
-        let skills_only = build_recovery_message(&file_tracker, &skill_tracker_only, None);
+        let skills_only = build_recovery_message(&file_tracker, &skill_tracker_only, None, &budget);
         assert!(!skills_only.contains("Files Previously Read"));
         assert!(skills_only.contains("Skills Previously Loaded"));
 
@@ -1085,6 +1092,7 @@ _No errors encountered._
             &file_tracker,
             &skill_tracker,
             Some("# Session\nTest content"),
+            &budget,
         );
         assert!(session_only.contains("Session Memory"));
     }
@@ -1095,7 +1103,8 @@ _No errors encountered._
     #[test]
     fn test_compact_recovery_token_budget() {
         use blockcell_agent::compact::{
-            build_recovery_message, FileTracker, SkillTracker, MAX_SINGLE_FILE_TOKENS,
+            build_recovery_message, FileTracker, RecoveryBudget, SkillTracker,
+            MAX_SINGLE_FILE_TOKENS,
         };
 
         // 创建包含大量内容的 tracker
@@ -1129,7 +1138,12 @@ _No errors encountered._
         }
 
         // 构建恢复消息
-        let recovery = build_recovery_message(&file_tracker, &skill_tracker, None);
+        let recovery = build_recovery_message(
+            &file_tracker,
+            &skill_tracker,
+            None,
+            &RecoveryBudget::default(),
+        );
 
         // 验证恢复消息不为空
         assert!(!recovery.is_empty());

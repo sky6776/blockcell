@@ -6,7 +6,7 @@ use crate::auto_memory::{ExtractionCursor, ExtractionCursorManager, MemoryType};
 use crate::compact::{should_compact, CompactHookRegistry, FileTracker, SkillTracker};
 use crate::response_cache::ContentReplacementState;
 use crate::session_memory::{
-    get_session_memory_path, should_extract_memory, SessionMemoryState,
+    get_session_memory_path, should_extract_memory, SessionMemoryConfig, SessionMemoryState,
 };
 use blockcell_core::types::ChatMessage;
 use std::path::{Path, PathBuf};
@@ -39,7 +39,6 @@ pub struct MemorySystemState {
     /// 是否需要重新加载游标状态（后台提取完成后设置）
     pub needs_cursor_reload: bool,
 }
-
 
 /// 记忆系统集成器
 ///
@@ -74,12 +73,17 @@ impl MemorySystem {
         let cursor_manager = ExtractionCursorManager::new(&config_dir);
 
         let tracker_summary_chars = config.layer4.tracker_summary_chars;
+        let session_memory_config: SessionMemoryConfig = config.layer3.clone().into();
 
         Self {
             config,
             state: MemorySystemState {
                 file_tracker: FileTracker::with_config(tracker_summary_chars),
                 skill_tracker: SkillTracker::with_config(tracker_summary_chars),
+                session_memory: SessionMemoryState {
+                    config: session_memory_config,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             compact_hooks: CompactHookRegistry::new(),
@@ -327,10 +331,12 @@ impl MemorySystem {
 
     /// 生成 Compact 恢复消息
     pub fn generate_compact_recovery(&self, session_memory_content: Option<&str>) -> String {
+        let budget = crate::compact::RecoveryBudget::from(&self.config.layer4);
         crate::compact::build_recovery_message(
             &self.state.file_tracker,
             &self.state.skill_tracker,
             session_memory_content,
+            &budget,
         )
     }
 
@@ -586,8 +592,8 @@ pub fn default_memory_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use blockcell_core::config::Layer4Config;
     use super::*;
+    use blockcell_core::config::Layer4Config;
 
     #[test]
     fn test_memory_system_config_default() {

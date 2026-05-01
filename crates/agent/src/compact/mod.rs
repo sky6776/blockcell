@@ -14,7 +14,6 @@
 
 mod file_tracker;
 mod hooks;
-mod recovery;
 mod skill_tracker;
 mod summary;
 
@@ -22,10 +21,6 @@ pub use file_tracker::{FileRecord, FileTracker};
 pub use hooks::{
     CompactHookRegistry, PostCompactContext, PostCompactHook, PostCompactResult, PreCompactContext,
     PreCompactHook, PreCompactResult,
-};
-pub use recovery::{
-    create_recovery_context, generate_recovery_message, CompactRecoveryContext, FileRecoveryState,
-    SkillRecoveryState,
 };
 pub use skill_tracker::{SkillRecord, SkillTracker};
 pub use summary::{
@@ -45,6 +40,48 @@ pub const MAX_SKILL_RECOVERY_TOKENS: usize = 25_000;
 pub const MAX_SESSION_MEMORY_RECOVERY_TOKENS: usize = 12_000;
 /// 最大恢复文件数
 pub const MAX_FILES_TO_RECOVER: usize = 5;
+
+/// Compact 恢复预算参数
+///
+/// 封装 Layer4Config 中的恢复预算字段，用于替代硬编码常量。
+/// 当从 Layer4Config 构造时，使用用户配置值；当使用 Default 时，回退到硬编码常量。
+#[derive(Debug, Clone)]
+pub struct RecoveryBudget {
+    /// 总文件恢复预算
+    pub max_file_recovery_tokens: usize,
+    /// 单个文件恢复上限
+    pub max_single_file_tokens: usize,
+    /// 技能恢复预算
+    pub max_skill_recovery_tokens: usize,
+    /// Session Memory 恢复预算
+    pub max_session_memory_recovery_tokens: usize,
+    /// 最大恢复文件数
+    pub max_files_to_recover: usize,
+}
+
+impl Default for RecoveryBudget {
+    fn default() -> Self {
+        Self {
+            max_file_recovery_tokens: MAX_FILE_RECOVERY_TOKENS,
+            max_single_file_tokens: MAX_SINGLE_FILE_TOKENS,
+            max_skill_recovery_tokens: MAX_SKILL_RECOVERY_TOKENS,
+            max_session_memory_recovery_tokens: MAX_SESSION_MEMORY_RECOVERY_TOKENS,
+            max_files_to_recover: MAX_FILES_TO_RECOVER,
+        }
+    }
+}
+
+impl From<&blockcell_core::config::Layer4Config> for RecoveryBudget {
+    fn from(c: &blockcell_core::config::Layer4Config) -> Self {
+        Self {
+            max_file_recovery_tokens: c.max_file_recovery_tokens,
+            max_single_file_tokens: c.max_single_file_tokens,
+            max_skill_recovery_tokens: c.max_skill_recovery_tokens,
+            max_session_memory_recovery_tokens: c.max_session_memory_recovery_tokens,
+            max_files_to_recover: c.max_files_to_recover,
+        }
+    }
+}
 
 /// 禁止工具使用的 preamble
 pub const NO_TOOLS_PREAMBLE: &str = r#"IMPORTANT: You are in compact mode.
@@ -84,13 +121,13 @@ impl Default for CompactConfig {
     }
 }
 
-impl From<blockcell_core::config::Layer4Config> for CompactConfig {
-    fn from(c: blockcell_core::config::Layer4Config) -> Self {
+impl From<blockcell_core::config::MemorySystemConfig> for CompactConfig {
+    fn from(c: blockcell_core::config::MemorySystemConfig) -> Self {
         Self {
-            token_threshold: 100_000, // derived from MemorySystemConfig.token_budget
-            threshold_ratio: c.compact_threshold_ratio,
-            keep_recent_messages: c.keep_recent_messages,
-            max_output_tokens: c.max_output_tokens,
+            token_threshold: c.token_budget,
+            threshold_ratio: c.layer4.compact_threshold_ratio,
+            keep_recent_messages: c.layer4.keep_recent_messages,
+            max_output_tokens: c.layer4.max_output_tokens,
         }
     }
 }
@@ -179,40 +216,44 @@ pub fn build_recovery_message(
     file_tracker: &FileTracker,
     skill_tracker: &SkillTracker,
     session_memory_content: Option<&str>,
+    budget: &RecoveryBudget,
 ) -> String {
     let mut recovery = String::new();
     let mut total_tokens = 0;
 
     // 1. 文件恢复
-    let files = file_tracker.get_recent_files(MAX_FILES_TO_RECOVER, MAX_SINGLE_FILE_TOKENS);
+    let files =
+        file_tracker.get_recent_files(budget.max_files_to_recover, budget.max_single_file_tokens);
     let files_count = files.len();
     if !files.is_empty() {
         recovery.push_str("## Files Previously Read\n\n");
 
         for file in &files {
-            let truncated_summary = truncate_to_tokens(&file.summary, MAX_SINGLE_FILE_TOKENS);
+            let truncated_summary =
+                truncate_to_tokens(&file.summary, budget.max_single_file_tokens);
             recovery.push_str(&format!(
                 "### {}\n```\n{}\n```\n\n",
                 file.path.display(),
                 truncated_summary
             ));
-            total_tokens += file.estimated_tokens.min(MAX_SINGLE_FILE_TOKENS);
+            total_tokens += file.estimated_tokens.min(budget.max_single_file_tokens);
         }
     }
 
     // 2. 技能恢复
-    let skills = skill_tracker.get_recent_skills(MAX_SINGLE_FILE_TOKENS);
+    let skills = skill_tracker.get_recent_skills(budget.max_single_file_tokens);
     let skills_count = skills.len();
     if !skills.is_empty() {
         recovery.push_str("## Skills Previously Loaded\n\n");
 
         for skill in &skills {
-            let truncated_summary = truncate_to_tokens(&skill.summary, MAX_SINGLE_FILE_TOKENS);
+            let truncated_summary =
+                truncate_to_tokens(&skill.summary, budget.max_single_file_tokens);
             recovery.push_str(&format!(
                 "### {}\n```\n{}\n```\n\n",
                 skill.name, truncated_summary
             ));
-            total_tokens += skill.estimated_tokens.min(MAX_SINGLE_FILE_TOKENS);
+            total_tokens += skill.estimated_tokens.min(budget.max_single_file_tokens);
         }
     }
 
@@ -220,7 +261,8 @@ pub fn build_recovery_message(
     if let Some(session_memory) = session_memory_content {
         if !session_memory.is_empty() {
             recovery.push_str("## Session Memory\n\n");
-            let truncated = truncate_to_tokens(session_memory, MAX_SESSION_MEMORY_RECOVERY_TOKENS);
+            let truncated =
+                truncate_to_tokens(session_memory, budget.max_session_memory_recovery_tokens);
             recovery.push_str(&truncated);
             total_tokens += estimate_tokens(&truncated);
         }

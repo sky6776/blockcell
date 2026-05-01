@@ -1766,12 +1766,24 @@ pub struct Layer1Config {
     pub cache_min_items: usize,
 }
 
-fn default_l1_max_result_size() -> usize { 50_000 }
-fn default_l1_max_per_message() -> usize { 150_000 }
-fn default_l1_preview_size() -> usize { 2_000 }
-fn default_l1_max_replacement() -> usize { 1_000 }
-fn default_l1_cache_max() -> usize { 10 }
-fn default_l1_cache_min_items() -> usize { 5 }
+fn default_l1_max_result_size() -> usize {
+    50_000
+}
+fn default_l1_max_per_message() -> usize {
+    150_000
+}
+fn default_l1_preview_size() -> usize {
+    2_000
+}
+fn default_l1_max_replacement() -> usize {
+    1_000
+}
+fn default_l1_cache_max() -> usize {
+    10
+}
+fn default_l1_cache_min_items() -> usize {
+    5
+}
 
 impl Default for Layer1Config {
     fn default() -> Self {
@@ -1798,8 +1810,12 @@ pub struct Layer2Config {
     pub keep_recent: u32,
 }
 
-fn default_l2_gap_threshold() -> u32 { 60 }
-fn default_l2_keep_recent() -> u32 { 5 }
+fn default_l2_gap_threshold() -> u32 {
+    60
+}
+fn default_l2_keep_recent() -> u32 {
+    5
+}
 
 impl Default for Layer2Config {
     fn default() -> Self {
@@ -1831,13 +1847,27 @@ pub struct Layer3Config {
     pub max_total_session_memory_tokens: usize,
 }
 
-fn default_l3_init_tokens() -> usize { 10_000 }
-fn default_l3_update_tokens() -> usize { 5_000 }
-fn default_l3_tool_calls() -> usize { 3 }
-fn default_l3_wait_timeout() -> u64 { 15_000 }
-fn default_l3_stale_threshold() -> u64 { 60_000 }
-fn default_l3_max_section() -> usize { 2_000 }
-fn default_l3_max_total_tokens() -> usize { 12_000 }
+fn default_l3_init_tokens() -> usize {
+    10_000
+}
+fn default_l3_update_tokens() -> usize {
+    5_000
+}
+fn default_l3_tool_calls() -> usize {
+    3
+}
+fn default_l3_wait_timeout() -> u64 {
+    15_000
+}
+fn default_l3_stale_threshold() -> u64 {
+    60_000
+}
+fn default_l3_max_section() -> usize {
+    2_000
+}
+fn default_l3_max_total_tokens() -> usize {
+    12_000
+}
 
 impl Default for Layer3Config {
     fn default() -> Self {
@@ -1877,15 +1907,33 @@ pub struct Layer4Config {
     pub tracker_summary_chars: usize,
 }
 
-fn default_l4_threshold_ratio() -> f64 { 0.8 }
-fn default_l4_keep_recent() -> usize { 2 }
-fn default_l4_max_output() -> usize { 12_000 }
-fn default_l4_file_recovery() -> usize { 50_000 }
-fn default_l4_single_file() -> usize { 5_000 }
-fn default_l4_max_files() -> usize { 5 }
-fn default_l4_skill_recovery() -> usize { 25_000 }
-fn default_l4_session_memory_recovery() -> usize { 12_000 }
-fn default_l4_tracker_summary() -> usize { 2_000 }
+fn default_l4_threshold_ratio() -> f64 {
+    0.8
+}
+fn default_l4_keep_recent() -> usize {
+    2
+}
+fn default_l4_max_output() -> usize {
+    12_000
+}
+fn default_l4_file_recovery() -> usize {
+    50_000
+}
+fn default_l4_single_file() -> usize {
+    5_000
+}
+fn default_l4_max_files() -> usize {
+    5
+}
+fn default_l4_skill_recovery() -> usize {
+    25_000
+}
+fn default_l4_session_memory_recovery() -> usize {
+    12_000
+}
+fn default_l4_tracker_summary() -> usize {
+    2_000
+}
 
 impl Default for Layer4Config {
     fn default() -> Self {
@@ -1917,10 +1965,18 @@ pub struct Layer5Config {
     pub injection_max_tokens: usize,
 }
 
-fn default_l5_min_messages() -> usize { 15 }
-fn default_l5_cooldown() -> usize { 5 }
-fn default_l5_max_file_tokens() -> usize { 4_000 }
-fn default_l5_injection_max() -> usize { 4_000 }
+fn default_l5_min_messages() -> usize {
+    15
+}
+fn default_l5_cooldown() -> usize {
+    5
+}
+fn default_l5_max_file_tokens() -> usize {
+    4_000
+}
+fn default_l5_injection_max() -> usize {
+    4_000
+}
 
 impl Default for Layer5Config {
     fn default() -> Self {
@@ -1955,7 +2011,9 @@ pub struct MemorySystemConfig {
     pub layer5: Layer5Config,
 }
 
-fn default_token_budget() -> usize { 100_000 }
+fn default_token_budget() -> usize {
+    100_000
+}
 
 impl Default for MemorySystemConfig {
     fn default() -> Self {
@@ -2001,8 +2059,7 @@ impl MemorySystemConfig {
             warnings.push(format!(
                 "layer1.maxResultSizeChars ({}) > layer1.maxToolResultsPerMessageChars ({}). \
                  Single result exceeds per-message budget.",
-                self.layer1.max_result_size_chars,
-                self.layer1.max_tool_results_per_message_chars
+                self.layer1.max_result_size_chars, self.layer1.max_tool_results_per_message_chars
             ));
         }
 
@@ -2040,8 +2097,7 @@ impl MemorySystemConfig {
         }
 
         // L4: single file × max files <= file recovery budget
-        let max_file_total =
-            self.layer4.max_single_file_tokens * self.layer4.max_files_to_recover;
+        let max_file_total = self.layer4.max_single_file_tokens * self.layer4.max_files_to_recover;
         if max_file_total > self.layer4.max_file_recovery_tokens {
             warnings.push(format!(
                 "layer4.maxSingleFileTokens ({}) × layer4.maxFilesToRecover ({}) = {} \
@@ -2072,8 +2128,7 @@ impl MemorySystemConfig {
             warnings.push(format!(
                 "layer5.injectionMaxTokens ({}) > 4 × layer5.maxMemoryFileTokens ({}). \
                  Injection budget may be too large relative to file size limit.",
-                self.layer5.injection_max_tokens,
-                self.layer5.max_memory_file_tokens
+                self.layer5.injection_max_tokens, self.layer5.max_memory_file_tokens
             ));
         }
 

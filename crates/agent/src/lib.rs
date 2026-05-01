@@ -36,9 +36,8 @@ pub use auto_memory::{
 pub use bus::MessageBus;
 pub use capability_adapter::{CapabilityRegistryAdapter, CoreEvolutionAdapter, ProviderLLMBridge};
 pub use compact::{
-    create_recovery_context, generate_compact_summary, generate_recovery_message,
-    CompactHookRegistry, CompactRecoveryContext, CompactSummary, CompactSummarySection,
-    FileRecoveryState, PostCompactHook, PreCompactHook, SkillRecoveryState,
+    generate_compact_summary, CompactHookRegistry, CompactSummary, CompactSummarySection,
+    PostCompactHook, PreCompactHook,
 };
 pub use context::ContextBuilder;
 pub use forked::{

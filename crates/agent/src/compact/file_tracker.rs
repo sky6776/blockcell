@@ -54,10 +54,7 @@ impl FileTracker {
             while boundary > 0 && !content.is_char_boundary(boundary) {
                 boundary -= 1;
             }
-            format!(
-                "{}...\n[content truncated]",
-                &content[..boundary]
-            )
+            format!("{}...\n[content truncated]", &content[..boundary])
         } else {
             content.to_string()
         };
@@ -261,8 +258,8 @@ mod tests {
         let mut mixed = String::new();
         // 构造恰好使字节 2000 落在多字节字符中间的内容
         mixed.push_str(&"a".repeat(1999)); // 1999 字节 ASCII
-        mixed.push_str("假");               // 3 字节中文，总 2002 字节
-        mixed.push_str(&"b".repeat(100));   // 追加更多
+        mixed.push_str("假"); // 3 字节中文，总 2002 字节
+        mixed.push_str(&"b".repeat(100)); // 追加更多
 
         tracker.record_read(PathBuf::from("/mixed.txt"), &mixed);
 

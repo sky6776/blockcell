@@ -1781,9 +1781,7 @@ impl AgentRuntime {
     /// - Loads cursor state from disk
     /// - Marks session as active (creates `.active` file)
     pub async fn init_memory_system(&mut self, session_id: String) -> std::io::Result<()> {
-        use crate::compact::{
-            MAX_FILE_RECOVERY_TOKENS, MAX_SESSION_MEMORY_RECOVERY_TOKENS, MAX_SKILL_RECOVERY_TOKENS,
-        };
+        use crate::compact::RecoveryBudget;
         use crate::memory_system::MemorySystem;
 
         let config = self.config.memory.memory_system.clone();
@@ -1821,14 +1819,18 @@ impl AgentRuntime {
         crate::memory_event!(
             layer3,
             config,
-            memory_system.config().layer3.max_total_session_memory_tokens,
+            memory_system
+                .config()
+                .layer3
+                .max_total_session_memory_tokens,
             memory_system.config().layer3.max_section_length
         );
 
         // Layer 4: Full Compact
-        let recovery_budget = MAX_FILE_RECOVERY_TOKENS
-            + MAX_SKILL_RECOVERY_TOKENS
-            + MAX_SESSION_MEMORY_RECOVERY_TOKENS;
+        let recovery_budget_config = RecoveryBudget::from(&memory_system.config().layer4);
+        let recovery_budget = recovery_budget_config.max_file_recovery_tokens
+            + recovery_budget_config.max_skill_recovery_tokens
+            + recovery_budget_config.max_session_memory_recovery_tokens;
         crate::memory_event!(
             layer4,
             config,
@@ -2354,11 +2356,15 @@ impl AgentRuntime {
     /// This loads the four memory files (user.md, project.md, feedback.md, reference.md)
     /// from the memory directory and makes them available for system prompt injection.
     pub async fn init_memory_injector(&mut self) -> std::io::Result<()> {
-        use crate::auto_memory::{get_memory_dir, MemoryInjector};
+        use crate::auto_memory::{get_memory_dir, InjectionConfig, MemoryInjector};
+
+        // Use Layer5Config-driven InjectionConfig instead of hardcoded defaults
+        let injection_config: InjectionConfig =
+            self.config.memory.memory_system.layer5.clone().into();
 
         // Use the config base directory (e.g., ~/.blockcell/memory/)
         let memory_dir = get_memory_dir(&self.paths.base);
-        let mut injector = MemoryInjector::default_injector();
+        let mut injector = MemoryInjector::new(injection_config);
 
         // Try to load memory files; log warning if directory doesn't exist
         match injector.load_memories(&memory_dir).await {
@@ -2411,10 +2417,14 @@ impl AgentRuntime {
             return Ok(());
         }
 
-        use crate::auto_memory::{get_memory_dir, MemoryInjector};
+        use crate::auto_memory::{get_memory_dir, InjectionConfig, MemoryInjector};
+
+        // Use Layer5Config-driven InjectionConfig instead of hardcoded defaults
+        let injection_config: InjectionConfig =
+            self.config.memory.memory_system.layer5.clone().into();
 
         let memory_dir = get_memory_dir(&self.paths.base);
-        let mut injector = MemoryInjector::default_injector();
+        let mut injector = MemoryInjector::new(injection_config);
         injector.load_memories(&memory_dir).await?;
 
         let count = injector.cache_size();
@@ -3132,15 +3142,18 @@ impl AgentRuntime {
         let has_tool_results = history.iter().any(|m| {
             m.role == "tool"
                 && match &m.content {
-                    serde_json::Value::String(s) => !s.is_empty() && s != "[]" && !s.starts_with("{\"error\""),
+                    serde_json::Value::String(s) => {
+                        !s.is_empty() && s != "[]" && !s.starts_with("{\"error\"")
+                    }
                     serde_json::Value::Null => false,
                     _ => true,
                 }
         });
-        if let Some(stub) = self
-            .response_cache
-            .maybe_cache_and_stub(persist_session_key, &final_response, has_tool_results)
-        {
+        if let Some(stub) = self.response_cache.maybe_cache_and_stub(
+            persist_session_key,
+            &final_response,
+            has_tool_results,
+        ) {
             overwrite_last_assistant_message(history, &stub);
         }
 
