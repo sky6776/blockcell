@@ -6,6 +6,39 @@ use tracing::debug;
 // Import memory_event macro for Layer 1 metrics
 use crate::memory_event;
 
+/// 默认可缓存最小字符数（低于此数不缓存）
+const DEFAULT_CACHEABLE_MIN_CHARS: usize = 800;
+
+/// ResponseCache 配置参数
+///
+/// 封装 Layer1Config 中的缓存相关字段，用于替代硬编码常量。
+/// 当从 Layer1Config 构造时，使用用户配置值；当使用 Default 时，回退到硬编码常量。
+#[derive(Debug, Clone)]
+pub struct ResponseCacheConfig {
+    /// 每会话最大缓存条目数
+    pub cache_max_per_session: usize,
+    /// 可缓存最小字符数（低于此数不缓存）
+    pub cacheable_min_chars: usize,
+}
+
+impl Default for ResponseCacheConfig {
+    fn default() -> Self {
+        Self {
+            cache_max_per_session: 50,
+            cacheable_min_chars: DEFAULT_CACHEABLE_MIN_CHARS,
+        }
+    }
+}
+
+impl From<&blockcell_core::config::Layer1Config> for ResponseCacheConfig {
+    fn from(c: &blockcell_core::config::Layer1Config) -> Self {
+        Self {
+            cache_max_per_session: c.cache_max_per_session,
+            cacheable_min_chars: c.cacheable_min_chars,
+        }
+    }
+}
+
 /// Per-session cache for large list/table responses.
 ///
 /// When the LLM returns a long numbered/bulleted list, storing the full text in history
@@ -20,8 +53,8 @@ pub struct ResponseCache {
 struct ResponseCacheInner {
     /// session_key → ref_id → CacheEntry
     data: HashMap<String, HashMap<String, CacheEntry>>,
-    /// Maximum cached entries per session (evicts oldest on overflow).
-    max_per_session: usize,
+    /// Configuration parameters (from Layer1Config)
+    config: ResponseCacheConfig,
 }
 
 struct CacheEntry {
@@ -33,20 +66,15 @@ struct CacheEntry {
 
 impl ResponseCache {
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(ResponseCacheInner {
-                data: HashMap::new(),
-                max_per_session: 10,
-            })),
-        }
+        Self::with_config(ResponseCacheConfig::default())
     }
 
-    /// Create ResponseCache with configurable max_per_session from Layer1Config
-    pub fn with_config(max_per_session: usize) -> Self {
+    /// Create ResponseCache with configurable parameters from Layer1Config
+    pub fn with_config(config: ResponseCacheConfig) -> Self {
         Self {
             inner: Arc::new(Mutex::new(ResponseCacheInner {
                 data: HashMap::new(),
-                max_per_session,
+                config,
             })),
         }
     }
@@ -94,7 +122,7 @@ impl ResponseCache {
         if !has_tool_results {
             return None;
         }
-        if !Self::is_cacheable(content) {
+        if !self.is_cacheable(content) {
             return None;
         }
         let items = Self::extract_list_items(content);
@@ -129,7 +157,7 @@ impl ResponseCache {
         };
 
         let mut inner = self.get_lock();
-        let max_per_session = inner.max_per_session;
+        let max_per_session = inner.config.cache_max_per_session;
         let session_cache = inner.data.entry(session_key.to_string()).or_default();
 
         // Evict oldest entry if at capacity
@@ -176,8 +204,9 @@ impl ResponseCache {
     // ──────────────────────────────────────────────
 
     /// Content is cacheable when it is long enough and contains a list.
-    fn is_cacheable(content: &str) -> bool {
-        content.chars().count() > 800
+    fn is_cacheable(&self, content: &str) -> bool {
+        let min_chars = self.get_lock().config.cacheable_min_chars;
+        content.chars().count() > min_chars
     }
 
     /// Extract list items from a numbered or bulleted list.

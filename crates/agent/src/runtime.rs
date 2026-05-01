@@ -1600,7 +1600,8 @@ impl AgentRuntime {
         let nudge_config = crate::skill_nudge::NudgeConfig::from_config(&config.self_improve.nudge);
 
         // 从 config 中提取 L1 配置 (在 config 被 move 之前)
-        let l1_cache_max_per_session = config.memory.memory_system.layer1.cache_max_per_session;
+        let l1_config: crate::response_cache::ResponseCacheConfig =
+            (&config.memory.memory_system.layer1).into();
 
         Ok(Self {
             config,
@@ -1627,9 +1628,7 @@ impl AgentRuntime {
             cap_request_cooldown: HashMap::new(),
             channel_contacts,
             path_policy,
-            response_cache: crate::response_cache::ResponseCache::with_config(
-                l1_cache_max_per_session,
-            ),
+            response_cache: crate::response_cache::ResponseCache::with_config(l1_config),
             memory_system: None,
             memory_injector_needs_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             skill_nudge_engine: crate::skill_nudge::SkillNudgeEngine::new(nudge_config),
@@ -4791,6 +4790,10 @@ impl AgentRuntime {
                         memory_system.session_id(),
                     );
                     let model = self.config.agents.defaults.model.clone();
+                    let max_section_length = memory_system
+                        .session_memory_state()
+                        .config
+                        .max_section_length;
 
                     // 非阻塞执行
                     let handle = tokio::spawn(async move {
@@ -4813,6 +4816,7 @@ impl AgentRuntime {
                             &memory_path,
                             &current_memory,
                             crate::session_memory::DEFAULT_SESSION_MEMORY_TEMPLATE,
+                            max_section_length,
                         )
                         .await;
 
@@ -4840,6 +4844,9 @@ impl AgentRuntime {
                     let history_clone = history.clone();
                     let config_dir = memory_system.config_dir().to_path_buf();
                     let model = self.config.agents.defaults.model.clone();
+                    // 使用 Layer5Config 驱动的 AutoMemoryConfig
+                    let auto_mem_config: crate::auto_memory::AutoMemoryConfig =
+                        self.config.memory.memory_system.layer5.clone().into();
                     // 使用预先获取的 cursor_reload_flag
                     let cursor_reload_flag = cursor_reload_flag
                         .clone()
@@ -4853,6 +4860,7 @@ impl AgentRuntime {
                         let model_for_type = model.clone();
                         let reload_flag_for_type = Arc::clone(&reload_flag);
                         let cursor_reload_flag_for_type = Arc::clone(&cursor_reload_flag);
+                        let auto_mem_config_for_type = auto_mem_config.clone();
 
                         // 获取最后一条用户消息的 UUID（用于游标更新）
                         let last_user_uuid = history_for_type
@@ -4866,18 +4874,20 @@ impl AgentRuntime {
                         let message_count = history_for_type.len();
 
                         let handle = tokio::spawn(async move {
-                            // 创建提取器（会加载持久化的游标状态）
-                            let mut extractor = match crate::auto_memory::AutoMemoryExtractor::new(
-                                &config_dir_for_type,
-                            )
-                            .await
-                            {
-                                Ok(e) => e,
-                                Err(e) => {
-                                    warn!(error = %e, "[layer5] Failed to create AutoMemoryExtractor");
-                                    return;
-                                }
-                            };
+                            // 创建提取器（会加载持久化的游标状态，使用 Layer5Config 驱动的配置）
+                            let mut extractor =
+                                match crate::auto_memory::AutoMemoryExtractor::with_config(
+                                    &config_dir_for_type,
+                                    auto_mem_config_for_type,
+                                )
+                                .await
+                                {
+                                    Ok(e) => e,
+                                    Err(e) => {
+                                        warn!(error = %e, "[layer5] Failed to create AutoMemoryExtractor");
+                                        return;
+                                    }
+                                };
 
                             let system_prompt = Arc::new(
                                 "你是一个记忆提取助手。请从对话中提取用户偏好、项目信息、反馈和外部资源引用。"

@@ -21,8 +21,8 @@ pub mod scanner;
 
 pub use cursor::{ExtractionCursor, ExtractionCursorManager};
 pub use extractor::{
-    extract_auto_memory, should_extract_auto_memory, AutoMemoryExtractor, ExtractionParams,
-    ExtractionResult,
+    should_extract_auto_memory, should_extract_auto_memory_with_config, AutoMemoryConfig,
+    AutoMemoryExtractor, ExtractionParams, ExtractionResult,
 };
 pub use injector::{format_memory_for_context, InjectedMemory, InjectionConfig, MemoryInjector};
 pub use memory_type::{get_memory_file_path, MemoryType, MEMORY_FILE_NAMES};

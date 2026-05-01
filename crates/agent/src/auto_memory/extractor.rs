@@ -2,11 +2,8 @@
 //!
 //! 后台提取四种类型记忆的核心逻辑。
 
-use super::cursor::{ExtractionCursor, ExtractionCursorManager};
-use super::{
-    get_memory_file_path, MemoryType, EXTRACTION_COOLDOWN_MESSAGES, MAX_MEMORY_FILE_TOKENS,
-    MIN_MESSAGES_FOR_EXTRACTION,
-};
+use super::cursor::ExtractionCursorManager;
+use super::{get_memory_file_path, MemoryType};
 use crate::forked::{
     create_auto_mem_can_use_tool, run_forked_agent, CacheSafeParams, ForkedAgentParams,
 };
@@ -16,6 +13,37 @@ use blockcell_providers::ProviderPool;
 use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Auto Memory 配置（从 Layer5Config 派生）
+#[derive(Debug, Clone)]
+pub struct AutoMemoryConfig {
+    /// 触发提取的最小消息数
+    pub min_messages_for_extraction: usize,
+    /// 提取冷却消息数
+    pub extraction_cooldown_messages: usize,
+    /// 记忆文件最大 token 数
+    pub max_memory_file_tokens: usize,
+}
+
+impl Default for AutoMemoryConfig {
+    fn default() -> Self {
+        Self {
+            min_messages_for_extraction: super::MIN_MESSAGES_FOR_EXTRACTION,
+            extraction_cooldown_messages: super::EXTRACTION_COOLDOWN_MESSAGES,
+            max_memory_file_tokens: super::MAX_MEMORY_FILE_TOKENS,
+        }
+    }
+}
+
+impl From<blockcell_core::config::Layer5Config> for AutoMemoryConfig {
+    fn from(c: blockcell_core::config::Layer5Config) -> Self {
+        Self {
+            min_messages_for_extraction: c.min_messages_for_extraction,
+            extraction_cooldown_messages: c.extraction_cooldown_messages,
+            max_memory_file_tokens: c.max_memory_file_tokens,
+        }
+    }
+}
 
 /// 提取结果
 #[derive(Debug)]
@@ -60,30 +88,43 @@ pub struct AutoMemoryExtractor {
     config_dir: std::path::PathBuf,
     /// 游标管理器
     cursor_manager: ExtractionCursorManager,
+    /// 配置
+    config: AutoMemoryConfig,
 }
 
 impl AutoMemoryExtractor {
     /// 创建提取器
     pub async fn new(config_dir: &Path) -> std::io::Result<Self> {
+        Self::with_config(config_dir, AutoMemoryConfig::default()).await
+    }
+
+    /// 创建提取器（带可配置参数）
+    pub async fn with_config(config_dir: &Path, config: AutoMemoryConfig) -> std::io::Result<Self> {
         let mut cursor_manager = ExtractionCursorManager::new(config_dir);
         cursor_manager.load().await?;
 
         Ok(Self {
             config_dir: config_dir.to_path_buf(),
             cursor_manager,
+            config,
         })
     }
 
     /// 检查是否需要提取
     pub fn should_extract(&self, current_message_count: usize) -> Vec<MemoryType> {
-        if current_message_count < MIN_MESSAGES_FOR_EXTRACTION {
+        if current_message_count < self.config.min_messages_for_extraction {
             return Vec::new();
         }
 
         self.cursor_manager
             .all_cursors()
             .iter()
-            .filter(|c| c.should_extract(current_message_count, EXTRACTION_COOLDOWN_MESSAGES))
+            .filter(|c| {
+                c.should_extract(
+                    current_message_count,
+                    self.config.extraction_cooldown_messages,
+                )
+            })
             .map(|c| c.memory_type)
             .collect()
     }
@@ -111,7 +152,11 @@ impl AutoMemoryExtractor {
             .unwrap_or_else(|_| memory_type.template().to_string());
 
         // 构建提取 prompt
-        let extraction_prompt = build_extraction_prompt(memory_type, &current_content);
+        let extraction_prompt = build_extraction_prompt(
+            memory_type,
+            &current_content,
+            self.config.max_memory_file_tokens,
+        );
 
         // 创建 CacheSafeParams
         let cache_safe_params = CacheSafeParams {
@@ -264,7 +309,11 @@ const EXTRACTION_ENHANCEMENT: &str = r#"
 "#;
 
 /// 构建提取 prompt
-fn build_extraction_prompt(memory_type: MemoryType, current_content: &str) -> String {
+fn build_extraction_prompt(
+    memory_type: MemoryType,
+    current_content: &str,
+    max_memory_file_tokens: usize,
+) -> String {
     format!(
         r#"Update the {} memory file.
 
@@ -288,166 +337,39 @@ Use the file_edit tool to update the memory file at the configured path.
         memory_type.name(),
         current_content,
         memory_type.usage_guide(),
-        MAX_MEMORY_FILE_TOKENS,
+        max_memory_file_tokens,
         EXTRACTION_ENHANCEMENT,
     )
 }
 
-/// 检查是否应该提取自动记忆
-pub fn should_extract_auto_memory(
+/// 检查是否应该提取自动记忆（使用配置参数）
+pub fn should_extract_auto_memory_with_config(
     cursor_manager: &ExtractionCursorManager,
     current_message_count: usize,
+    config: &AutoMemoryConfig,
 ) -> Vec<MemoryType> {
-    if current_message_count < MIN_MESSAGES_FOR_EXTRACTION {
+    if current_message_count < config.min_messages_for_extraction {
         return Vec::new();
     }
 
     cursor_manager
         .all_cursors()
         .iter()
-        .filter(|c| c.should_extract(current_message_count, EXTRACTION_COOLDOWN_MESSAGES))
+        .filter(|c| c.should_extract(current_message_count, config.extraction_cooldown_messages))
         .map(|c| c.memory_type)
         .collect()
 }
 
-/// 执行单次自动记忆提取
-///
-/// ## 参数
-/// - `provider_pool`: LLM Provider 池（必需）
-/// - `config_dir`: 配置目录
-/// - `memory_type`: 记忆类型
-/// - `system_prompt`: 系统提示
-/// - `model`: 模型名称
-/// - `messages`: 消息历史
-/// - `cursor`: 用于验证提取条件的游标
-pub async fn extract_auto_memory(
-    provider_pool: Arc<ProviderPool>,
-    config_dir: &Path,
-    memory_type: MemoryType,
-    system_prompt: Arc<String>,
-    model: &str,
-    messages: Vec<ChatMessage>,
-    cursor: ExtractionCursor, // 用于验证提取条件
-) -> ExtractionResult {
-    // 使用 cursor 验证是否满足提取条件
-    let current_message_count = messages.len();
-    if !cursor.should_extract(current_message_count, EXTRACTION_COOLDOWN_MESSAGES) {
-        tracing::debug!(
-            memory_type = memory_type.name(),
-            last_count = cursor.last_message_count,
-            current_count = current_message_count,
-            "[auto_memory] extraction skipped - cooldown not met"
-        );
-        return ExtractionResult {
-            memory_type,
-            success: false,
-            input_tokens: 0,
-            output_tokens: 0,
-            error: Some("Extraction cooldown not met".to_string()),
-            cursor_save_failed: false,
-        };
-    }
-
-    let memory_path = get_memory_file_path(config_dir, memory_type);
-
-    // 读取当前内容
-    let current_content = tokio::fs::read_to_string(&memory_path)
-        .await
-        .unwrap_or_else(|_| memory_type.template().to_string());
-
-    // 构建 prompt
-    let extraction_prompt = build_extraction_prompt(memory_type, &current_content);
-
-    // 创建 CacheSafeParams
-    let cache_safe_params = CacheSafeParams {
-        system_prompt,
-        model: model.to_string(),
-        fork_context_messages: messages,
-        ..Default::default()
-    };
-
-    // 使用 Builder 模式构建 ForkedAgentParams
-    // 这确保必需参数（provider_pool）在编译时被验证
-    let params = match ForkedAgentParams::builder()
-        .provider_pool(provider_pool)
-        .prompt_messages(vec![ChatMessage::user(&extraction_prompt)])
-        .cache_safe_params(cache_safe_params)
-        .can_use_tool(create_auto_mem_can_use_tool(config_dir))
-        .query_source("auto_memory")
-        .fork_label(memory_type.name())
-        .max_turns(1)
-        .skip_transcript(true)
-        .build()
-    {
-        Ok(p) => p,
-        Err(e) => {
-            return ExtractionResult {
-                memory_type,
-                success: false,
-                input_tokens: 0,
-                output_tokens: 0,
-                error: Some(e.to_string()),
-                cursor_save_failed: false,
-            };
-        }
-    };
-
-    // 运行 Forked Agent
-    let result = run_forked_agent(params).await;
-
-    match result {
-        Ok(forked_result) => {
-            // 安全扫描: 检查写入后的记忆文件内容
-            if let Ok(updated_content) = tokio::fs::read_to_string(&memory_path).await {
-                let scan_result =
-                    crate::auto_memory::scanner::scan_memory_content(&updated_content);
-                if let Err(threats) = scan_result {
-                    tracing::warn!(
-                        memory_type = memory_type.name(),
-                        threat_count = threats.len(),
-                        "[auto_memory] 安全扫描发现威胁, 回滚记忆文件"
-                    );
-                    // 回滚到提取前的内容
-                    let _ = tokio::fs::write(&memory_path, &current_content).await;
-                    return ExtractionResult {
-                        memory_type,
-                        success: false,
-                        input_tokens: forked_result.total_usage.input_tokens as usize,
-                        output_tokens: forked_result.total_usage.output_tokens as usize,
-                        error: Some(format!(
-                            "安全扫描发现 {} 个威胁, 记忆文件已回滚",
-                            threats.len()
-                        )),
-                        cursor_save_failed: false,
-                    };
-                }
-            }
-
-            tracing::info!(
-                memory_type = memory_type.name(),
-                input_tokens = forked_result.total_usage.input_tokens,
-                output_tokens = forked_result.total_usage.output_tokens,
-                "[auto_memory] extraction completed"
-            );
-
-            ExtractionResult {
-                memory_type,
-                success: true,
-                input_tokens: forked_result.total_usage.input_tokens as usize,
-                output_tokens: forked_result.total_usage.output_tokens as usize,
-                error: None,
-                cursor_save_failed: false,
-            }
-        }
-        Err(e) => ExtractionResult {
-            memory_type,
-            success: false,
-            input_tokens: 0,
-            output_tokens: 0,
-            error: Some(e.to_string()),
-            cursor_save_failed: false,
-        },
-    }
+/// 检查是否应该提取自动记忆（使用默认常量）
+pub fn should_extract_auto_memory(
+    cursor_manager: &ExtractionCursorManager,
+    current_message_count: usize,
+) -> Vec<MemoryType> {
+    should_extract_auto_memory_with_config(
+        cursor_manager,
+        current_message_count,
+        &AutoMemoryConfig::default(),
+    )
 }
 
 #[cfg(test)]
@@ -456,7 +378,7 @@ mod tests {
 
     #[test]
     fn test_build_extraction_prompt() {
-        let prompt = build_extraction_prompt(MemoryType::User, "current content");
+        let prompt = build_extraction_prompt(MemoryType::User, "current content", 4000);
         assert!(prompt.contains("user memory file"));
         assert!(prompt.contains("current content"));
         assert!(prompt.contains("4000 tokens"));

@@ -48,16 +48,7 @@ impl FileTracker {
 
     /// 记录文件读取
     pub fn record_read(&mut self, path: PathBuf, content: &str) {
-        let summary = if content.len() > self.max_summary_chars {
-            // 找到安全的 UTF-8 字符边界，避免在多字节字符中间截断导致 panic
-            let mut boundary = self.max_summary_chars;
-            while boundary > 0 && !content.is_char_boundary(boundary) {
-                boundary -= 1;
-            }
-            format!("{}...\n[content truncated]", &content[..boundary])
-        } else {
-            content.to_string()
-        };
+        let summary = self.truncate_summary(content);
 
         let estimated_tokens = estimate_tokens(content);
 
@@ -70,6 +61,32 @@ impl FileTracker {
                 estimated_tokens,
             },
         );
+    }
+
+    /// 截断内容生成摘要（安全处理 UTF-8 边界）
+    fn truncate_summary(&self, content: &str) -> String {
+        if content.len() <= self.max_summary_chars {
+            return content.to_string();
+        }
+
+        // 找到安全的 UTF-8 字符边界，避免在多字节字符中间截断导致 panic
+        let mut boundary = self.max_summary_chars;
+        while boundary > 0 && !content.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+
+        // 边界情况：如果 boundary 为 0，找到第一个有效字符
+        // 这确保至少保留第一个字符，避免返回空前缀
+        if boundary == 0 {
+            if let Some(first_char) = content.chars().next() {
+                boundary = first_char.len_utf8();
+            } else {
+                // 内容为空（不应该发生，因为前面已检查长度）
+                return content.to_string();
+            }
+        }
+
+        format!("{}...\n[content truncated]", &content[..boundary])
     }
 
     /// 获取最近读取的文件（按时间排序）

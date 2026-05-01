@@ -29,15 +29,15 @@ pub mod task_manager;
 pub(crate) mod token;
 
 pub use auto_memory::{
-    extract_auto_memory, get_memory_dir, get_memory_file_path, should_extract_auto_memory,
-    AutoMemoryExtractor, ExtractionCursor, ExtractionCursorManager, ExtractionParams,
-    ExtractionResult, MemoryType,
+    get_memory_dir, get_memory_file_path, should_extract_auto_memory,
+    should_extract_auto_memory_with_config, AutoMemoryConfig, AutoMemoryExtractor,
+    ExtractionCursor, ExtractionCursorManager, ExtractionParams, ExtractionResult, MemoryType,
 };
 pub use bus::MessageBus;
 pub use capability_adapter::{CapabilityRegistryAdapter, CoreEvolutionAdapter, ProviderLLMBridge};
 pub use compact::{
     generate_compact_summary, CompactHookRegistry, CompactSummary, CompactSummarySection,
-    PostCompactHook, PreCompactHook,
+    PostCompactHook, PreCompactHook, RecoveryBudget,
 };
 pub use context::ContextBuilder;
 pub use forked::{
@@ -53,11 +53,12 @@ pub use memory_system::{
     evaluate_memory_hooks, BackgroundTaskHandle, MemorySystem, MemorySystemConfig,
     MemorySystemState, PostSamplingAction,
 };
-pub use response_cache::ResponseCache;
+pub use response_cache::{ResponseCache, ResponseCacheConfig};
 pub use runtime::{AgentRuntime, ConfirmRequest};
 pub use session_memory::{
     get_session_memory_content_for_compact, get_session_memory_dir, get_session_memory_path,
-    should_extract_memory, wait_for_session_memory_extraction, Section, SectionPriority,
-    SessionMemoryConfig, SessionMemoryState, DEFAULT_SESSION_MEMORY_TEMPLATE,
+    should_extract_memory, wait_for_session_memory_extraction,
+    wait_for_session_memory_extraction_with_timeout, Section, SectionPriority, SessionMemoryConfig,
+    SessionMemoryState, DEFAULT_SESSION_MEMORY_TEMPLATE,
 };
 pub use task_manager::TaskManager;

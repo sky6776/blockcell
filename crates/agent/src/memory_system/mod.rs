@@ -352,7 +352,12 @@ impl MemorySystem {
 
     /// 检查是否应该触发自动记忆提取
     pub fn should_extract_auto_memory(&self, message_count: usize) -> Vec<MemoryType> {
-        crate::auto_memory::should_extract_auto_memory(&self.cursor_manager, message_count)
+        let config = crate::auto_memory::AutoMemoryConfig::from(self.config.layer5.clone());
+        crate::auto_memory::should_extract_auto_memory_with_config(
+            &self.cursor_manager,
+            message_count,
+            &config,
+        )
     }
 
     /// 保存游标状态

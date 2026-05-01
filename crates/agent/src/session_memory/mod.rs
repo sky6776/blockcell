@@ -27,7 +27,7 @@ pub use extractor::{
 };
 pub use recovery::{
     get_session_memory_content_for_compact, get_session_memory_dir, get_session_memory_path,
-    wait_for_session_memory_extraction,
+    wait_for_session_memory_extraction, wait_for_session_memory_extraction_with_timeout,
 };
 pub use template::{
     validate_session_memory, Section, SectionPriority, ValidationResult,

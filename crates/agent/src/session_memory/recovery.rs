@@ -29,6 +29,22 @@ pub async fn wait_for_session_memory_extraction(
     memory_path: &Path,
     extraction_started_at: Option<std::time::Instant>,
 ) -> Result<(), std::io::Error> {
+    wait_for_session_memory_extraction_with_timeout(
+        memory_path,
+        extraction_started_at,
+        EXTRACTION_WAIT_TIMEOUT_MS,
+        EXTRACTION_STALE_THRESHOLD_MS,
+    )
+    .await
+}
+
+/// 等待 Session Memory 提取完成（带可配置超时）
+pub async fn wait_for_session_memory_extraction_with_timeout(
+    memory_path: &Path,
+    extraction_started_at: Option<std::time::Instant>,
+    wait_timeout_ms: u64,
+    stale_threshold_ms: u64,
+) -> Result<(), std::io::Error> {
     // 如果没有提取任务，直接返回
     let start_time = match extraction_started_at {
         Some(t) => t,
@@ -37,11 +53,11 @@ pub async fn wait_for_session_memory_extraction(
 
     // 计算剩余等待时间
     let elapsed = start_time.elapsed().as_millis() as u64;
-    let remaining = EXTRACTION_WAIT_TIMEOUT_MS.saturating_sub(elapsed);
+    let remaining = wait_timeout_ms.saturating_sub(elapsed);
 
     if remaining == 0 {
         // 已超时，检查是否 stale
-        if elapsed > EXTRACTION_STALE_THRESHOLD_MS {
+        if elapsed > stale_threshold_ms {
             tracing::warn!(
                 elapsed_ms = elapsed,
                 "[session_memory] extraction is stale, proceeding without waiting"
@@ -176,11 +192,19 @@ impl SessionMemoryRecoveryContext {
         template: &str,
         max_tokens: usize,
         extraction_started_at: Option<std::time::Instant>,
+        extraction_wait_timeout_ms: u64,
+        extraction_stale_threshold_ms: u64,
     ) -> Result<Self, std::io::Error> {
         let memory_path = get_session_memory_path(workspace_dir, session_id);
 
-        // 等待提取完成
-        wait_for_session_memory_extraction(&memory_path, extraction_started_at).await?;
+        // 等待提取完成（使用可配置超时）
+        wait_for_session_memory_extraction_with_timeout(
+            &memory_path,
+            extraction_started_at,
+            extraction_wait_timeout_ms,
+            extraction_stale_threshold_ms,
+        )
+        .await?;
 
         // 获取内容
         let content =

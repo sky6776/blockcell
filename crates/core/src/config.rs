@@ -1764,6 +1764,9 @@ pub struct Layer1Config {
     pub cache_max_per_session: usize,
     #[serde(default = "default_l1_cache_min_items")]
     pub cache_min_items: usize,
+    /// 可缓存最小字符数（低于此数不缓存）
+    #[serde(default = "default_cacheable_min_chars")]
+    pub cacheable_min_chars: usize,
 }
 
 fn default_l1_max_result_size() -> usize {
@@ -1784,6 +1787,9 @@ fn default_l1_cache_max() -> usize {
 fn default_l1_cache_min_items() -> usize {
     5
 }
+fn default_cacheable_min_chars() -> usize {
+    800
+}
 
 impl Default for Layer1Config {
     fn default() -> Self {
@@ -1794,6 +1800,7 @@ impl Default for Layer1Config {
             max_replacement_entries: 1_000,
             cache_max_per_session: 10,
             cache_min_items: 5,
+            cacheable_min_chars: 800,
         }
     }
 }
@@ -1802,7 +1809,7 @@ impl Default for Layer1Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Layer2Config {
-    #[serde(default = "default_true_val")]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_l2_gap_threshold")]
     pub gap_threshold_minutes: u32,
@@ -1995,9 +2002,9 @@ impl Default for Layer5Config {
 pub struct MemorySystemConfig {
     #[serde(default = "default_token_budget")]
     pub token_budget: usize,
-    #[serde(default = "default_true_val")]
+    #[serde(default = "default_true")]
     pub auto_memory_enabled: bool,
-    #[serde(default = "default_true_val")]
+    #[serde(default = "default_true")]
     pub compact_enabled: bool,
     #[serde(default)]
     pub layer1: Layer1Config,
@@ -2175,7 +2182,7 @@ pub struct SelfImproveNudgeConfig {
     #[serde(default = "default_memory_hard_threshold")]
     pub memory_hard_threshold: u32,
     /// 是否启用 nudge (默认: true)
-    #[serde(default = "default_true_val")]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// 最小 nudge 间隔秒数 (默认: 300)
     #[serde(default = "default_min_nudge_interval_secs")]
@@ -2193,9 +2200,6 @@ fn default_memory_soft_threshold() -> u32 {
 }
 fn default_memory_hard_threshold() -> u32 {
     6
-}
-fn default_true_val() -> bool {
-    true
 }
 fn default_min_nudge_interval_secs() -> u64 {
     300
@@ -2219,7 +2223,7 @@ impl Default for SelfImproveNudgeConfig {
 #[serde(rename_all = "camelCase")]
 pub struct SelfImproveReviewConfig {
     /// 是否启用 Review (默认: true)
-    #[serde(default = "default_true_val")]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Review 最大轮次 (默认: 8)
     #[serde(default = "default_max_review_rounds")]

@@ -131,6 +131,10 @@ mod tests {
                 minimum_message_tokens_to_init: 10_000,
                 minimum_tokens_between_update: 5_000,
                 tool_calls_between_updates: 3,
+                extraction_wait_timeout_ms: 15_000,
+                extraction_stale_threshold_ms: 60_000,
+                max_section_length: 2_000,
+                max_total_session_memory_tokens: 12_000,
             },
             ..Default::default()
         };
@@ -449,7 +453,8 @@ mod tests {
     #[test]
     fn test_layer3_layer4_recovery_interaction() {
         use blockcell_agent::compact::{
-            FileRecoveryState, MAX_FILE_RECOVERY_TOKENS, MAX_SINGLE_FILE_TOKENS,
+            FileRecord, FileTracker, RecoveryBudget, MAX_FILE_RECOVERY_TOKENS,
+            MAX_SINGLE_FILE_TOKENS,
         };
         use blockcell_agent::session_memory::{Section, SectionPriority};
 
@@ -464,14 +469,21 @@ mod tests {
         assert_eq!(MAX_FILE_RECOVERY_TOKENS, 50_000);
         assert_eq!(MAX_SINGLE_FILE_TOKENS, 5_000);
 
-        // 验证恢复上下文能跟踪文件状态
-        let file_state = FileRecoveryState {
-            path: PathBuf::from("/tmp/test.rs"),
-            content_summary: "fn main() {}".to_string(),
-            estimated_tokens: 1000,
-            was_modified: false,
-        };
-        assert!(file_state.estimated_tokens <= MAX_SINGLE_FILE_TOKENS);
+        // 验证 RecoveryBudget 默认值与常量一致
+        let budget = RecoveryBudget::default();
+        assert_eq!(budget.max_file_recovery_tokens, MAX_FILE_RECOVERY_TOKENS);
+        assert_eq!(budget.max_single_file_tokens, MAX_SINGLE_FILE_TOKENS);
+        assert_eq!(budget.max_skill_recovery_tokens, 25_000);
+        assert_eq!(budget.max_session_memory_recovery_tokens, 12_000);
+        assert_eq!(budget.max_files_to_recover, 5);
+
+        // 验证 FileTracker 能跟踪文件状态
+        let mut tracker = FileTracker::new();
+        tracker.record_read(PathBuf::from("/tmp/test.rs"), "fn main() {}");
+        let recent =
+            tracker.get_recent_files(budget.max_files_to_recover, budget.max_single_file_tokens);
+        assert_eq!(recent.len(), 1);
+        assert!(recent[0].estimated_tokens <= MAX_SINGLE_FILE_TOKENS);
     }
 
     /// 测试 Layer 5 + Layer 7 交互：自动记忆提取与 Forked Agent
@@ -732,6 +744,10 @@ mod tests {
             minimum_message_tokens_to_init: 5_000,
             minimum_tokens_between_update: 2_000,
             tool_calls_between_updates: 2,
+            extraction_wait_timeout_ms: 15_000,
+            extraction_stale_threshold_ms: 60_000,
+            max_section_length: 2_000,
+            max_total_session_memory_tokens: 12_000,
         };
         let mut state = SessionMemoryState {
             config,
