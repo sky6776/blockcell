@@ -19,15 +19,38 @@ pub struct ResponseCacheConfig {
     pub cache_max_per_session: usize,
     /// 可缓存最小字符数（低于此数不缓存）
     pub cacheable_min_chars: usize,
+    /// 预览大小（字节）
+    pub preview_size_bytes: usize,
+    /// 消息级别工具结果上限（字符数）
+    pub max_tool_results_per_message_chars: usize,
+    /// 内容替换最大条目数
+    pub max_replacement_entries: usize,
 }
 
 impl Default for ResponseCacheConfig {
     fn default() -> Self {
         Self {
-            cache_max_per_session: 50,
+            cache_max_per_session: default_l1_cache_max(),
             cacheable_min_chars: DEFAULT_CACHEABLE_MIN_CHARS,
+            preview_size_bytes: default_l1_preview_size(),
+            max_tool_results_per_message_chars: default_l1_max_per_message(),
+            max_replacement_entries: default_l1_max_replacement(),
         }
     }
+}
+
+/// Default value functions matching Layer1Config defaults
+fn default_l1_cache_max() -> usize {
+    10
+}
+fn default_l1_preview_size() -> usize {
+    2_000
+}
+fn default_l1_max_per_message() -> usize {
+    150_000
+}
+fn default_l1_max_replacement() -> usize {
+    1_000
 }
 
 impl From<&blockcell_core::config::Layer1Config> for ResponseCacheConfig {
@@ -35,6 +58,9 @@ impl From<&blockcell_core::config::Layer1Config> for ResponseCacheConfig {
         Self {
             cache_max_per_session: c.cache_max_per_session,
             cacheable_min_chars: c.cacheable_min_chars,
+            preview_size_bytes: c.preview_size_bytes,
+            max_tool_results_per_message_chars: c.max_tool_results_per_message_chars,
+            max_replacement_entries: c.max_replacement_entries,
         }
     }
 }
@@ -310,13 +336,13 @@ use std::path::PathBuf;
 /// 工具结果存储子目录名
 pub const TOOL_RESULTS_SUBDIR: &str = "tool-results";
 
-/// 预览大小（字节）
+/// 预览大小（字节）— 默认值，用于向后兼容（测试等场景）
 pub const PREVIEW_SIZE_BYTES: usize = 2000;
 
 /// 默认最大结果大小 (~50KB)
 pub const DEFAULT_MAX_RESULT_SIZE_CHARS: usize = 50_000;
 
-/// 消息级别上限 (~150KB)
+/// 消息级别上限 (~150KB) — 默认值，用于向后兼容
 pub const MAX_TOOL_RESULTS_PER_MESSAGE_CHARS: usize = 150_000;
 
 /// 清理标记消息
@@ -406,7 +432,7 @@ pub struct PersistToolResultError {
 /// ```
 ///
 /// 这确保了 Forked Agent 的状态修改不会影响父代理的 Prompt Cache 一致性。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ContentReplacementState {
     /// 已处理的 tool_use_id 集合
     pub seen_ids: HashSet<String>,
@@ -414,6 +440,8 @@ pub struct ContentReplacementState {
     pub replacements: HashMap<String, String>,
     /// 插入顺序（用于 LRU 淘汰）
     insertion_order: Vec<String>,
+    /// 最大条目数限制（来自 Layer1Config）
+    max_replacement_entries: usize,
 }
 
 /// 最大条目数限制
@@ -438,10 +466,31 @@ pub struct ToolResultCandidate {
     pub size: usize,
 }
 
+impl Default for ContentReplacementState {
+    fn default() -> Self {
+        Self {
+            seen_ids: HashSet::new(),
+            replacements: HashMap::new(),
+            insertion_order: Vec::new(),
+            max_replacement_entries: MAX_REPLACEMENT_ENTRIES,
+        }
+    }
+}
+
 impl ContentReplacementState {
     /// 创建新的状态
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 创建指定最大条目数的 ContentReplacementState
+    pub fn with_max_entries(max_replacement_entries: usize) -> Self {
+        Self {
+            seen_ids: HashSet::new(),
+            replacements: HashMap::new(),
+            insertion_order: Vec::new(),
+            max_replacement_entries,
+        }
     }
 
     /// 检查是否已处理
@@ -478,7 +527,7 @@ impl ContentReplacementState {
 
     /// 如果超过限制，删除最老的条目
     fn prune_if_needed(&mut self) {
-        while self.insertion_order.len() > MAX_REPLACEMENT_ENTRIES {
+        while self.insertion_order.len() > self.max_replacement_entries {
             if let Some(oldest_id) = self.insertion_order.first().cloned() {
                 self.seen_ids.remove(&oldest_id);
                 self.replacements.remove(&oldest_id);
@@ -495,6 +544,7 @@ impl ContentReplacementState {
             seen_ids: self.seen_ids.clone(),
             replacements: self.replacements.clone(),
             insertion_order: self.insertion_order.clone(),
+            max_replacement_entries: self.max_replacement_entries,
         }
     }
 
@@ -693,18 +743,22 @@ fn sanitize_session_key(session_key: &str) -> String {
 /// 构建内存 fallback 替换消息（当磁盘持久化失败时）
 ///
 /// 包含预览内容，告知用户磁盘持久化失败但数据已通过预览保留。
-fn build_memory_fallback_message(content: &str, tool_use_id: &str) -> String {
+fn build_memory_fallback_message(
+    content: &str,
+    tool_use_id: &str,
+    preview_size_bytes: usize,
+) -> String {
     // 清理 tool_use_id 以防止换行符注入到日志/显示中
     let safe_tool_use_id = sanitize_tool_use_id(tool_use_id);
 
-    let (preview, has_more) = generate_preview(content, PREVIEW_SIZE_BYTES);
+    let (preview, has_more) = generate_preview(content, preview_size_bytes);
 
     let mut message = format!(
         "{}\n{}\n\nTool ID: {}\nPreview (first {}):\n{}",
         MEMORY_FALLBACK_TAG,
         DISK_PERSIST_FAILED_WARNING,
         safe_tool_use_id,
-        format_file_size(PREVIEW_SIZE_BYTES),
+        format_file_size(preview_size_bytes),
         preview
     );
     if has_more {
@@ -716,7 +770,10 @@ fn build_memory_fallback_message(content: &str, tool_use_id: &str) -> String {
 }
 
 /// 构建大结果消息
-pub fn build_large_tool_result_message(result: &PersistedToolResult) -> String {
+pub fn build_large_tool_result_message(
+    result: &PersistedToolResult,
+    preview_size_bytes: usize,
+) -> String {
     let mut message = format!(
         "{}\nOutput too large ({}). Full output saved to: {}\n\n",
         PERSISTED_OUTPUT_TAG,
@@ -725,7 +782,7 @@ pub fn build_large_tool_result_message(result: &PersistedToolResult) -> String {
     );
     message.push_str(&format!(
         "Preview (first {}):\n{}",
-        format_file_size(PREVIEW_SIZE_BYTES),
+        format_file_size(preview_size_bytes),
         result.preview
     ));
     if result.has_more {
@@ -745,6 +802,7 @@ pub async fn persist_tool_result(
     tool_use_id: &str,
     session_key: &str,
     workspace_dir: &std::path::Path,
+    preview_size_bytes: usize,
 ) -> Result<PersistedToolResult, PersistToolResultError> {
     // 清理 tool_use_id 防止路径注入
     let safe_tool_use_id = sanitize_tool_use_id(tool_use_id);
@@ -829,7 +887,7 @@ pub async fn persist_tool_result(
         }
     }
 
-    let (preview, has_more) = generate_preview(content, PREVIEW_SIZE_BYTES);
+    let (preview, has_more) = generate_preview(content, preview_size_bytes);
 
     Ok(PersistedToolResult {
         filepath,
@@ -888,7 +946,7 @@ mod layer1_tests {
             has_more: true,
         };
 
-        let message = build_large_tool_result_message(&result);
+        let message = build_large_tool_result_message(&result, PREVIEW_SIZE_BYTES);
         assert!(message.starts_with(PERSISTED_OUTPUT_TAG));
         assert!(message.ends_with(PERSISTED_OUTPUT_CLOSING_TAG));
         assert!(message.contains("97.7 KB"));
@@ -917,6 +975,7 @@ mod layer1_tests {
                 &state,
                 DEFAULT_MAX_RESULT_SIZE_CHARS,
                 workspace,
+                PREVIEW_SIZE_BYTES,
             )
             .await;
 
@@ -1105,6 +1164,7 @@ pub async fn process_tool_result(
     state: &ContentReplacementState,
     threshold: usize,
     workspace_dir: &std::path::Path,
+    preview_size_bytes: usize,
 ) -> Option<String> {
     // 检查是否已经处理过
     if state.is_seen(tool_use_id) {
@@ -1118,9 +1178,17 @@ pub async fn process_tool_result(
     }
 
     // 需要持久化
-    match persist_tool_result(content, tool_use_id, session_key, workspace_dir).await {
+    match persist_tool_result(
+        content,
+        tool_use_id,
+        session_key,
+        workspace_dir,
+        preview_size_bytes,
+    )
+    .await
+    {
         Ok(result) => {
-            let message = build_large_tool_result_message(&result);
+            let message = build_large_tool_result_message(&result, preview_size_bytes);
             Some(message)
         }
         Err(e) => {
@@ -1130,7 +1198,8 @@ pub async fn process_tool_result(
                 error = %e.error,
                 "[process_tool_result] Failed to persist, using memory fallback"
             );
-            let fallback_message = build_memory_fallback_message(content, tool_use_id);
+            let fallback_message =
+                build_memory_fallback_message(content, tool_use_id, preview_size_bytes);
             Some(fallback_message)
         }
     }
@@ -1271,6 +1340,7 @@ pub async fn apply_budget_async(
     budget: usize,
     workspace_dir: &std::path::Path,
     session_key: &str,
+    preview_size_bytes: usize,
 ) -> Vec<blockcell_core::types::ChatMessage> {
     // 计算总大小
     let total_size: usize = candidates.iter().map(|c| c.size).sum();
@@ -1327,6 +1397,7 @@ pub async fn apply_budget_async(
             &candidate.tool_use_id,
             session_key,
             workspace_dir,
+            preview_size_bytes,
         )
         .await
         {
@@ -1343,7 +1414,7 @@ pub async fn apply_budget_async(
                 crate::session_metrics::get_memory_metrics()
                     .layer1
                     .increment_stored_count();
-                let message = build_large_tool_result_message(&result);
+                let message = build_large_tool_result_message(&result, preview_size_bytes);
                 replacements.insert(candidate.tool_use_id.clone(), message);
             }
             Err(e) => {
@@ -1355,8 +1426,11 @@ pub async fn apply_budget_async(
                     "Failed to persist tool result to disk, using memory fallback"
                 );
 
-                let fallback_message =
-                    build_memory_fallback_message(&candidate.content, &candidate.tool_use_id);
+                let fallback_message = build_memory_fallback_message(
+                    &candidate.content,
+                    &candidate.tool_use_id,
+                    preview_size_bytes,
+                );
                 replacements.insert(candidate.tool_use_id.clone(), fallback_message);
             }
         }

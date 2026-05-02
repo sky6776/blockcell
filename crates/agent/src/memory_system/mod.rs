@@ -74,10 +74,14 @@ impl MemorySystem {
 
         let tracker_summary_chars = config.layer4.tracker_summary_chars;
         let session_memory_config: SessionMemoryConfig = config.layer3.clone().into();
+        let max_replacement_entries = config.layer1.max_replacement_entries;
 
         Self {
             config,
             state: MemorySystemState {
+                content_replacement: ContentReplacementState::with_max_entries(
+                    max_replacement_entries,
+                ),
                 file_tracker: FileTracker::with_config(tracker_summary_chars),
                 skill_tracker: SkillTracker::with_config(tracker_summary_chars),
                 session_memory: SessionMemoryState {

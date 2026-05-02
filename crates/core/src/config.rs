@@ -1752,6 +1752,7 @@ impl Default for MemoryVectorConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Layer1Config {
+    /// 单个工具结果的最大字符数（仅用于配置验证）
     #[serde(default = "default_l1_max_result_size")]
     pub max_result_size_chars: usize,
     #[serde(default = "default_l1_max_per_message")]
@@ -1762,8 +1763,6 @@ pub struct Layer1Config {
     pub max_replacement_entries: usize,
     #[serde(default = "default_l1_cache_max")]
     pub cache_max_per_session: usize,
-    #[serde(default = "default_l1_cache_min_items")]
-    pub cache_min_items: usize,
     /// 可缓存最小字符数（低于此数不缓存）
     #[serde(default = "default_cacheable_min_chars")]
     pub cacheable_min_chars: usize,
@@ -1784,9 +1783,6 @@ fn default_l1_max_replacement() -> usize {
 fn default_l1_cache_max() -> usize {
     10
 }
-fn default_l1_cache_min_items() -> usize {
-    5
-}
 fn default_cacheable_min_chars() -> usize {
     800
 }
@@ -1799,7 +1795,6 @@ impl Default for Layer1Config {
             preview_size_bytes: 2_000,
             max_replacement_entries: 1_000,
             cache_max_per_session: 10,
-            cache_min_items: 5,
             cacheable_min_chars: 800,
         }
     }

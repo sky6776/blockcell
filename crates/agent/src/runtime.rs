@@ -1802,8 +1802,8 @@ impl AgentRuntime {
         crate::memory_event!(
             layer1,
             config,
-            50, // max_tool_results (default per session)
-            crate::response_cache::PREVIEW_SIZE_BYTES
+            memory_system.config().layer1.cache_max_per_session,
+            memory_system.config().layer1.preview_size_bytes
         );
 
         // Layer 2: Micro Compact
@@ -4003,7 +4003,11 @@ impl AgentRuntime {
                 crate::response_cache::collect_tool_result_candidates(&current_messages);
             if !candidates.is_empty() {
                 let total_size: usize = candidates.iter().map(|c| c.size).sum();
-                let budget = crate::response_cache::MAX_TOOL_RESULTS_PER_MESSAGE_CHARS;
+                let budget = memory_system
+                    .config()
+                    .layer1
+                    .max_tool_results_per_message_chars;
+                let preview_size_bytes = memory_system.config().layer1.preview_size_bytes;
 
                 if total_size > budget {
                     debug!(
@@ -4023,6 +4027,7 @@ impl AgentRuntime {
                         budget,
                         &self.paths.base,
                         &session_key,
+                        preview_size_bytes,
                     )
                     .await;
 
