@@ -2,7 +2,6 @@
 //!
 //! 提供 Post-Compact 恢复和等待提取完成的功能。
 
-use super::{EXTRACTION_STALE_THRESHOLD_MS, EXTRACTION_WAIT_TIMEOUT_MS};
 use crate::memory_event;
 use crate::token::estimate_tokens;
 use std::path::{Path, PathBuf};
@@ -25,15 +24,22 @@ pub fn get_session_memory_path(workspace_dir: &Path, session_id: &str) -> PathBu
 /// 等待 Session Memory 提取完成
 ///
 /// 用于 Post-Compact 恢复前等待后台提取完成。
+/// 使用 Layer3Config 中的超时参数作为默认值。
+///
+/// 注意：此便捷函数使用硬编码常量作为回退值。
+/// 生产代码应使用 `wait_for_session_memory_extraction_with_timeout()` 并传入
+/// 从 Layer3Config 获取的超时参数。
 pub async fn wait_for_session_memory_extraction(
     memory_path: &Path,
     extraction_started_at: Option<std::time::Instant>,
+    wait_timeout_ms: u64,
+    stale_threshold_ms: u64,
 ) -> Result<(), std::io::Error> {
     wait_for_session_memory_extraction_with_timeout(
         memory_path,
         extraction_started_at,
-        EXTRACTION_WAIT_TIMEOUT_MS,
-        EXTRACTION_STALE_THRESHOLD_MS,
+        wait_timeout_ms,
+        stale_threshold_ms,
     )
     .await
 }

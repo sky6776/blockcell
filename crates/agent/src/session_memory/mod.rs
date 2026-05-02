@@ -36,8 +36,10 @@ pub use template::{
 
 use std::path::PathBuf;
 
-/// 时间阈值常量 — 仅用作 wait_for_session_memory_extraction() 的回退值，
-/// 运行时使用 SessionMemoryConfig 中的对应字段
+/// 时间阈值常量 — 仅用作 SessionMemoryConfig::default() 的回退值，
+/// 运行时使用 Layer3Config 中的对应字段。
+/// 注意：wait_for_session_memory_extraction() 已改为接受参数，
+/// 不再使用这些常量作为默认值。
 pub const EXTRACTION_WAIT_TIMEOUT_MS: u64 = 15_000;
 pub const EXTRACTION_STALE_THRESHOLD_MS: u64 = 60_000;
 

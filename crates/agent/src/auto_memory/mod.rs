@@ -34,6 +34,10 @@ pub const MIN_MESSAGES_FOR_EXTRACTION: usize = 15;
 pub const EXTRACTION_COOLDOWN_MESSAGES: usize = 5;
 pub const MAX_MEMORY_FILE_TOKENS: usize = 4000;
 
+/// 注入预算默认值 — 仅用作 InjectionConfig::default() 的回退值，
+/// 运行时使用 Layer5Config.injection_max_tokens
+pub const DEFAULT_INJECTION_MAX_TOKENS: usize = 4000;
+
 /// 记忆目录名
 pub const MEMORY_DIR_NAME: &str = "memory";
 

@@ -214,19 +214,19 @@ pub fn build_recovery_message(
     }
 
     // 2. 技能恢复
-    let skills = skill_tracker.get_recent_skills(budget.max_single_file_tokens);
+    let skills = skill_tracker.get_recent_skills(budget.max_skill_recovery_tokens);
     let skills_count = skills.len();
     if !skills.is_empty() {
         recovery.push_str("## Skills Previously Loaded\n\n");
 
         for skill in &skills {
             let truncated_summary =
-                truncate_to_tokens(&skill.summary, budget.max_single_file_tokens);
+                truncate_to_tokens(&skill.summary, budget.max_skill_recovery_tokens);
             recovery.push_str(&format!(
                 "### {}\n```\n{}\n```\n\n",
                 skill.name, truncated_summary
             ));
-            total_tokens += skill.estimated_tokens.min(budget.max_single_file_tokens);
+            total_tokens += skill.estimated_tokens.min(budget.max_skill_recovery_tokens);
         }
     }
 
