@@ -8,6 +8,7 @@
 //! 3. Post-Compact 恢复 (文件 + 技能 + Session Memory)
 //!
 //! ## 恢复预算
+//! 所有恢复预算参数均可通过 Layer4Config 配置，默认值：
 //! - 文件: 50,000 tokens (最多 5 个文件，每个文件最多 5,000 tokens)
 //! - 技能: 25,000 tokens
 //! - Session Memory: 12,000 tokens
@@ -30,6 +31,8 @@ pub use summary::{
 use crate::token::estimate_tokens;
 
 /// Compact 配置
+/// 以下常量仅用作 RecoveryBudget::default() 的回退值，
+/// 运行时使用 Layer4Config 中的对应字段。
 /// 总文件恢复预算
 pub const MAX_FILE_RECOVERY_TOKENS: usize = 50_000;
 /// 单个文件恢复上限 (设计文档: "单文件上限 | 5,000 tokens")
@@ -95,41 +98,6 @@ pub fn should_compact(
     threshold: f64, // 默认 0.8
 ) -> bool {
     current_tokens >= (budget_tokens as f64 * threshold) as usize
-}
-
-/// Compact 配置
-#[derive(Debug, Clone)]
-pub struct CompactConfig {
-    /// Token 阈值（超过此值触发压缩）
-    pub token_threshold: usize,
-    /// 阈值比例（默认 0.8）
-    pub threshold_ratio: f64,
-    /// 保留最近消息数
-    pub keep_recent_messages: usize,
-    /// 最大输出 tokens
-    pub max_output_tokens: usize,
-}
-
-impl Default for CompactConfig {
-    fn default() -> Self {
-        Self {
-            token_threshold: 100_000,
-            threshold_ratio: 0.8,
-            keep_recent_messages: 2,
-            max_output_tokens: 12_000,
-        }
-    }
-}
-
-impl From<blockcell_core::config::MemorySystemConfig> for CompactConfig {
-    fn from(c: blockcell_core::config::MemorySystemConfig) -> Self {
-        Self {
-            token_threshold: c.token_budget,
-            threshold_ratio: c.layer4.compact_threshold_ratio,
-            keep_recent_messages: c.layer4.keep_recent_messages,
-            max_output_tokens: c.layer4.max_output_tokens,
-        }
-    }
 }
 
 /// 压缩结果
@@ -329,14 +297,6 @@ mod tests {
     fn test_should_compact_above_threshold() {
         // 超过阈值，应压缩
         assert!(should_compact(100_000, 100_000, 0.8));
-    }
-
-    #[test]
-    fn test_compact_config_default() {
-        let config = CompactConfig::default();
-        assert_eq!(config.token_threshold, 100_000);
-        assert_eq!(config.threshold_ratio, 0.8);
-        assert_eq!(config.keep_recent_messages, 2);
     }
 
     #[test]

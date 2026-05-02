@@ -36,11 +36,13 @@ pub use template::{
 
 use std::path::PathBuf;
 
-/// 时间阈值常量
+/// 时间阈值常量 — 仅用作 wait_for_session_memory_extraction() 的回退值，
+/// 运行时使用 SessionMemoryConfig 中的对应字段
 pub const EXTRACTION_WAIT_TIMEOUT_MS: u64 = 15_000;
 pub const EXTRACTION_STALE_THRESHOLD_MS: u64 = 60_000;
 
-/// Section 限制常量
+/// Section 限制常量 — 仅用作 SessionMemoryConfig::default() 的回退值，
+/// 运行时使用 Layer3Config 中的对应字段
 pub const MAX_SECTION_LENGTH: usize = 2000;
 pub const MAX_TOTAL_SESSION_MEMORY_TOKENS: usize = 12000;
 

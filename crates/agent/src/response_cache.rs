@@ -15,6 +15,8 @@ const DEFAULT_CACHEABLE_MIN_CHARS: usize = 800;
 /// 当从 Layer1Config 构造时，使用用户配置值；当使用 Default 时，回退到硬编码常量。
 #[derive(Debug, Clone)]
 pub struct ResponseCacheConfig {
+    /// 单个工具结果的最大字符数（超过此值触发持久化）
+    pub max_result_size_chars: usize,
     /// 每会话最大缓存条目数
     pub cache_max_per_session: usize,
     /// 可缓存最小字符数（低于此数不缓存）
@@ -30,6 +32,7 @@ pub struct ResponseCacheConfig {
 impl Default for ResponseCacheConfig {
     fn default() -> Self {
         Self {
+            max_result_size_chars: DEFAULT_MAX_RESULT_SIZE_CHARS,
             cache_max_per_session: default_l1_cache_max(),
             cacheable_min_chars: DEFAULT_CACHEABLE_MIN_CHARS,
             preview_size_bytes: default_l1_preview_size(),
@@ -56,6 +59,7 @@ fn default_l1_max_replacement() -> usize {
 impl From<&blockcell_core::config::Layer1Config> for ResponseCacheConfig {
     fn from(c: &blockcell_core::config::Layer1Config) -> Self {
         Self {
+            max_result_size_chars: c.max_result_size_chars,
             cache_max_per_session: c.cache_max_per_session,
             cacheable_min_chars: c.cacheable_min_chars,
             preview_size_bytes: c.preview_size_bytes,
@@ -336,13 +340,13 @@ use std::path::PathBuf;
 /// 工具结果存储子目录名
 pub const TOOL_RESULTS_SUBDIR: &str = "tool-results";
 
-/// 预览大小（字节）— 默认值，用于向后兼容（测试等场景）
+/// 预览大小（字节）— 仅用作 Default 回退值，运行时使用 Layer1Config.preview_size_bytes
 pub const PREVIEW_SIZE_BYTES: usize = 2000;
 
-/// 默认最大结果大小 (~50KB)
+/// 默认最大结果大小 (~50KB) — 仅用作 Default 回退值，运行时使用 Layer1Config.max_result_size_chars
 pub const DEFAULT_MAX_RESULT_SIZE_CHARS: usize = 50_000;
 
-/// 消息级别上限 (~150KB) — 默认值，用于向后兼容
+/// 消息级别上限 (~150KB) — 仅用作 Default 回退值，运行时使用 Layer1Config.max_tool_results_per_message_chars
 pub const MAX_TOOL_RESULTS_PER_MESSAGE_CHARS: usize = 150_000;
 
 /// 清理标记消息
@@ -444,7 +448,7 @@ pub struct ContentReplacementState {
     max_replacement_entries: usize,
 }
 
-/// 最大条目数限制
+/// 最大条目数限制 — 仅用作 Default 回退值，运行时使用 Layer1Config.max_replacement_entries
 pub const MAX_REPLACEMENT_ENTRIES: usize = 1000;
 
 /// 可序列化的替换决策记录，写入 transcript
