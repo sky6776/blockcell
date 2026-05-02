@@ -119,6 +119,8 @@ pub struct CompactResult {
     pub success: bool,
     /// 错误信息（如果失败）
     pub error: Option<String>,
+    /// 保留的最近消息（来自 Layer4Config.keep_recent_messages）
+    pub recent_messages: Vec<blockcell_core::types::ChatMessage>,
 }
 
 impl CompactResult {
@@ -133,6 +135,7 @@ impl CompactResult {
             cache_creation_tokens: 0,
             success: false,
             error: Some(error.to_string()),
+            recent_messages: Vec::new(),
         }
     }
 
@@ -144,6 +147,7 @@ impl CompactResult {
         post_compact_tokens: usize,
         cache_read_tokens: u64,
         cache_creation_tokens: u64,
+        recent_messages: Vec<blockcell_core::types::ChatMessage>,
     ) -> Self {
         Self {
             summary_message,
@@ -154,6 +158,7 @@ impl CompactResult {
             cache_creation_tokens,
             success: true,
             error: None,
+            recent_messages,
         }
     }
 
@@ -307,6 +312,7 @@ mod tests {
         assert_eq!(result.error, Some("Test error message".to_string()));
         assert!(result.summary_message.is_empty());
         assert!(result.recovery_message.is_empty());
+        assert!(result.recent_messages.is_empty());
     }
 
     #[test]
@@ -318,6 +324,7 @@ mod tests {
             20_000,
             80_000, // cache_read_tokens
             10_000, // cache_creation_tokens
+            Vec::new(),
         );
 
         assert!(result.success);
@@ -328,6 +335,7 @@ mod tests {
         assert_eq!(result.post_compact_tokens, 20_000);
         assert_eq!(result.cache_read_tokens, 80_000);
         assert_eq!(result.cache_creation_tokens, 10_000);
+        assert!(result.recent_messages.is_empty());
     }
 
     #[test]
@@ -339,6 +347,7 @@ mod tests {
             50,
             80,
             10,
+            Vec::new(),
         );
 
         let message = result.to_compact_message();

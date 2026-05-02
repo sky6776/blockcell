@@ -168,11 +168,13 @@ impl CompactSummary {
 /// - `system_prompt`: 系统提示
 /// - `model`: 模型名称
 /// - `messages`: 消息历史
+/// - `max_output_tokens`: 输出 token 上限（来自 Layer4Config.max_output_tokens）
 pub async fn generate_compact_summary(
     provider_pool: Arc<ProviderPool>,
     system_prompt: Arc<String>,
     model: &str,
     messages: Vec<ChatMessage>,
+    max_output_tokens: u32,
 ) -> Result<CompactSummaryResult, CompactError> {
     use super::NO_TOOLS_PREAMBLE;
     use crate::forked::{
@@ -203,6 +205,7 @@ pub async fn generate_compact_summary(
         .query_source("compact")
         .fork_label("compact_summary")
         .max_turns(1)
+        .max_output_tokens(max_output_tokens)
         .skip_transcript(true)
         .build()
         .map_err(|e| CompactError::ForkedAgent(e.to_string()))?;

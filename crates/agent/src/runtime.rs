@@ -2626,7 +2626,24 @@ impl AgentRuntime {
 
         let pre_compact_tokens = estimate_messages_tokens(messages);
 
-        // ========== 0. Memory Flush — 压缩前保存重要信息 ==========
+        // ========== 0. 提取 keep_recent_messages 配置 ==========
+        let keep_recent_messages = self
+            .memory_system
+            .as_ref()
+            .map(|m| m.config().layer4.keep_recent_messages)
+            .unwrap_or(2);
+        // 保留最后 N 条消息（来自 Layer4Config.keep_recent_messages）
+        let recent_messages: Vec<ChatMessage> = messages
+            .iter()
+            .rev()
+            .take(keep_recent_messages)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        // ========== 0b. Memory Flush — 压缩前保存重要信息 ==========
         self.flush_memories(messages).await;
 
         // ========== 1. 熔断器检查 ==========
@@ -2678,11 +2695,17 @@ impl AgentRuntime {
         let model = self.config.agents.defaults.model.clone();
 
         // ========== 6. 执行 LLM 语义压缩 ==========
+        let max_output_tokens = self
+            .memory_system
+            .as_ref()
+            .map(|m| m.config().layer4.max_output_tokens as u32)
+            .unwrap_or(12_000);
         let summary_result = generate_compact_summary(
             Arc::clone(&self.provider_pool),
             system_prompt,
             &model,
             messages.to_vec(),
+            max_output_tokens,
         )
         .await;
 
@@ -2793,6 +2816,7 @@ impl AgentRuntime {
             cache_creation_tokens,
             success: true,
             error: None,
+            recent_messages,
         }
     }
 
@@ -3649,10 +3673,11 @@ impl AgentRuntime {
 
             if result.success {
                 // Store compacted history
-                let compacted_messages = vec![
-                    ChatMessage::system(&result.to_compact_message()),
-                    ChatMessage::user("请继续当前任务。"),
-                ];
+                let mut compacted_messages =
+                    vec![ChatMessage::system(&result.to_compact_message())];
+                // 保留最近消息（来自 Layer4Config.keep_recent_messages）
+                compacted_messages.extend(result.recent_messages);
+                compacted_messages.push(ChatMessage::user("请继续当前任务。"));
                 self.session_store.save(&session_key, &compacted_messages)?;
 
                 // Clear trackers
@@ -4077,6 +4102,8 @@ impl AgentRuntime {
                         current_messages.clear();
                         current_messages
                             .push(ChatMessage::system(&compact_result.to_compact_message()));
+                        // 保留最近消息（来自 Layer4Config.keep_recent_messages）
+                        current_messages.extend(compact_result.recent_messages);
                         current_messages.push(ChatMessage::user("请继续当前任务。"));
 
                         info!(
@@ -4619,6 +4646,8 @@ impl AgentRuntime {
                             current_messages.clear();
                             current_messages
                                 .push(ChatMessage::system(&compact_result.to_compact_message()));
+                            // 保留最近消息（来自 Layer4Config.keep_recent_messages）
+                            current_messages.extend(compact_result.recent_messages);
                             // 添加当前用户消息作为继续点
                             current_messages.push(ChatMessage::user("请继续当前任务。"));
 
@@ -4969,6 +4998,8 @@ impl AgentRuntime {
                         // 压缩成功，替换历史
                         history.clear();
                         history.push(ChatMessage::system(&compact_result.to_compact_message()));
+                        // 保留最近消息（来自 Layer4Config.keep_recent_messages）
+                        history.extend(compact_result.recent_messages);
                         history.push(ChatMessage::user("请继续当前任务。"));
 
                         info!(
