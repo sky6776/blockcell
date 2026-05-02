@@ -11,6 +11,6 @@ pub use consolidator::{
 };
 pub use cron_service::CronService;
 pub use dream_service::{DreamService, DreamServiceConfig};
-pub use ghost::{GhostService, GhostServiceConfig};
+pub use ghost::{GhostMaintenanceService, GhostMaintenanceServiceConfig};
 pub use heartbeat::HeartbeatService;
 pub use job::{CronJob, JobPayload, JobSchedule, JobState, ScheduleKind};

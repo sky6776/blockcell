@@ -58,6 +58,8 @@ pub async fn tool(tool_name: &str, params_json: &str, agent: Option<&str>) -> an
     let config = resolved.config;
     let paths = resolved.paths;
     paths.ensure_dirs()?;
+    let memory_file_store = Arc::new(blockcell_agent::MemoryFileStore::open(&paths)?);
+    let skill_file_store = Arc::new(blockcell_agent::SkillFileStore::open(&paths)?);
 
     let tool = registry.get(tool_name).ok_or_else(|| {
         anyhow::anyhow!(
@@ -93,6 +95,10 @@ pub async fn tool(tool_name: &str, params_json: &str, agent: Option<&str>) -> an
         spawn_handle: None,
         task_manager: None,
         memory_store: None,
+        memory_file_store: Some(memory_file_store),
+        ghost_memory_lifecycle: None,
+        skill_file_store: Some(skill_file_store),
+        session_search: None,
         capability_registry: None,
         core_evolution: None,
         event_emitter: None,

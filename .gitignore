@@ -96,3 +96,5 @@ Thumbs.db
 # Added by code-review-graph
 .code-review-graph/
 .mcp.json
+AGENTS.md
+.codex/

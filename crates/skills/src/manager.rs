@@ -1,6 +1,7 @@
 use crate::service::{EvolutionService, EvolutionServiceConfig};
 use crate::versioning::{VersionManager, VersionSource};
 use blockcell_core::{Paths, Result};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -750,6 +751,29 @@ pub struct SkillCard {
     pub supports_local_exec: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPromptSnapshot {
+    version: u32,
+    generated_at: String,
+    skills: Vec<SkillPromptSnapshotEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPromptSnapshotEntry {
+    name: String,
+    description: String,
+    source: SkillSource,
+    available: bool,
+    path: String,
+    prompt_bundle: String,
+    summary_bundle: String,
+    tools: Vec<String>,
+}
+
+const SKILLS_PROMPT_SNAPSHOT_FILE: &str = ".skills_prompt_snapshot.json";
+
 #[derive(Debug, Clone)]
 pub struct Skill {
     pub name: String,
@@ -1062,6 +1086,8 @@ impl SkillManager {
             self.scan_directory_with_priority(&workspace_dir, true)?;
         }
 
+        self.write_prompt_snapshot(paths)?;
+
         Ok(())
     }
 
@@ -1069,6 +1095,7 @@ impl SkillManager {
     /// Returns the names of newly discovered skills (not previously loaded).
     pub fn reload_skills(&mut self, paths: &Paths) -> Result<Vec<String>> {
         let before: std::collections::HashSet<String> = self.skills.keys().cloned().collect();
+        Self::invalidate_prompt_snapshot(paths)?;
         self.load_from_paths(paths)?;
         let new_skills: Vec<String> = self
             .skills
@@ -1080,6 +1107,48 @@ impl SkillManager {
             info!(new_skills = ?new_skills, "Hot-reloaded new skills");
         }
         Ok(new_skills)
+    }
+
+    pub fn invalidate_prompt_snapshot(paths: &Paths) -> Result<()> {
+        let snapshot_path = paths.skills_dir().join(SKILLS_PROMPT_SNAPSHOT_FILE);
+        if snapshot_path.exists() {
+            std::fs::remove_file(snapshot_path)?;
+        }
+        Ok(())
+    }
+
+    fn write_prompt_snapshot(&self, paths: &Paths) -> Result<()> {
+        let skills_dir = paths.skills_dir();
+        std::fs::create_dir_all(&skills_dir)?;
+        let mut entries = self
+            .skills
+            .values()
+            .map(|skill| SkillPromptSnapshotEntry {
+                name: skill.name.clone(),
+                description: skill.meta.description.clone(),
+                source: skill.meta.source.clone(),
+                available: skill.available,
+                path: skill.path.display().to_string(),
+                prompt_bundle: skill.load_prompt_bundle().unwrap_or_default(),
+                summary_bundle: skill.load_summary_bundle().unwrap_or_default(),
+                tools: skill.meta.effective_tools(),
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        let snapshot = SkillPromptSnapshot {
+            version: 1,
+            generated_at: Utc::now().to_rfc3339(),
+            skills: entries,
+        };
+        let snapshot_path = skills_dir.join(SKILLS_PROMPT_SNAPSHOT_FILE);
+        let tmp_path = snapshot_path.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(&tmp_path, serde_json::to_string_pretty(&snapshot)?)?;
+        std::fs::rename(tmp_path, snapshot_path)?;
+        Ok(())
     }
 
     fn scan_directory_with_priority(&mut self, dir: &PathBuf, is_workspace: bool) -> Result<()> {
@@ -1866,6 +1935,43 @@ tools:
             .iter()
             .any(|entry| entry == "weather.py"));
         assert!(card.supports_local_exec);
+    }
+
+    #[test]
+    fn test_skill_prompt_snapshot_is_written_and_invalidated_by_reload() {
+        let base = temp_skill_dir("blockcell-skill-prompt-snapshot-root");
+        let paths = Paths::with_base(base.clone());
+        let skill_dir = paths.skills_dir().join("deploy_docs");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(
+            skill_dir.join("meta.yaml"),
+            r#"
+name: deploy_docs
+description: Deploy docs
+"#,
+        )
+        .expect("write meta");
+        fs::write(skill_dir.join("SKILL.md"), "Write deploy docs.").expect("write skill md");
+
+        let snapshot_path = paths.skills_dir().join(".skills_prompt_snapshot.json");
+        let mut manager = SkillManager::new();
+        manager.load_from_paths(&paths).expect("load skills");
+
+        assert!(snapshot_path.exists());
+        let first_snapshot = fs::read_to_string(&snapshot_path).expect("read snapshot");
+        assert!(first_snapshot.contains("deploy_docs"));
+        assert!(first_snapshot.contains("Write deploy docs."));
+
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "Write deploy docs with rollback notes.",
+        )
+        .expect("rewrite skill md");
+        manager.reload_skills(&paths).expect("reload skills");
+
+        let second_snapshot = fs::read_to_string(&snapshot_path).expect("read updated snapshot");
+        assert!(second_snapshot.contains("rollback notes"));
+        assert_ne!(first_snapshot, second_snapshot);
     }
 
     #[test]

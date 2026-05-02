@@ -304,14 +304,14 @@ impl Tool for MemoryMaintenanceTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "memory_maintenance",
-            description: "Memory maintenance operations for Ghost Agent. Actions: garden (compress daily memories into long-term facts), cleanup (remove expired/trivial entries), stats (memory health report), compact (merge duplicate entries).",
+            description: "Memory maintenance operations for Ghost Agent. Actions: garden (clean short-term memory and maintain long-term facts), cleanup (remove expired/trivial entries), stats (memory health report), compact (merge duplicate entries).",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["garden", "cleanup", "stats", "compact"],
-                        "description": "garden: scan recent daily memories and extract long-term facts. cleanup: remove expired entries and purge recycle bin. stats: get memory health report. compact: merge duplicate entries."
+                        "description": "garden: scan recent short-term memories, clean junk, and maintain long-term facts with memory_upsert/memory_forget. cleanup: remove expired entries and purge recycle bin. stats: get memory health report. compact: merge duplicate entries."
                     },
                     "days": {
                         "type": "integer",
@@ -362,7 +362,7 @@ impl Tool for MemoryMaintenanceTool {
                 let prune_report = prune_ghost_maintenance_logs(store, dry_run)?;
                 let junk_report = sweep_junk_short_term(store, 30, dry_run)?;
 
-                // Query recent short-term memories
+                // Query recent short-term memories for batch long-term maintenance.
                 let query_params = json!({
                     "scope": "short_term",
                     "time_range_days": days,
@@ -371,7 +371,8 @@ impl Tool for MemoryMaintenanceTool {
                 let recent = store.query_json(query_params)?;
                 let items = recent.as_array().map(|a| a.len()).unwrap_or(0);
 
-                // Query existing long-term memories for dedup check
+                // Query existing long-term memories so the model can avoid duplicates and
+                // merge stable facts using memory_upsert dedup keys.
                 let lt_params = json!({
                     "scope": "long_term",
                     "top_k": 50
@@ -391,7 +392,7 @@ impl Tool for MemoryMaintenanceTool {
                         "recent_short_term_count": items,
                         "existing_long_term_count": lt_count,
                         "stats": stats,
-                        "note": "Would scan and extract important facts from short-term to long-term memory."
+                        "note": "Would scan recent short-term memory, maintain long-term memory, and remove trivial entries."
                     }));
                 }
 
@@ -414,7 +415,8 @@ impl Tool for MemoryMaintenanceTool {
                     "expired_cleaned": expired,
                     "recycle_purged": purged,
                     "recent_memories": recent,
-                    "instruction": "Review the recent_memories above. For each important fact (user preferences, project details, recurring patterns), call memory_upsert with scope='long_term'. For trivial entries (weather queries, simple greetings), call memory_forget to delete them."
+                    "long_term_memories": long_term,
+                    "instruction": "Review recent_memories and long_term_memories. Promote only stable user preferences, project facts, recurring patterns, and durable lessons by calling memory_upsert with scope='long_term' and a dedup_key. Delete trivial, expired, or duplicate short-term entries with memory_forget. Do not create skills here; skills are handled by Ghost Learning."
                 }))
             }
 
@@ -592,6 +594,10 @@ mod tests {
             permissions: blockcell_core::types::PermissionSet::new(),
             task_manager: None,
             memory_store: Some(memory_store),
+            memory_file_store: None,
+            ghost_memory_lifecycle: None,
+            skill_file_store: None,
+            session_search: None,
             outbound_tx: None,
             spawn_handle: None,
             capability_registry: None,
@@ -672,5 +678,31 @@ mod tests {
             Some(7)
         );
         assert!(recent_query.get("days").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_memory_maintenance_garden_provides_long_term_maintenance_instruction() {
+        let store = Arc::new(CaptureMemoryStore::new());
+        let tool = MemoryMaintenanceTool;
+
+        let result = tool
+            .execute(
+                test_context(store),
+                json!({
+                    "action": "garden",
+                    "days": 7,
+                    "dry_run": false
+                }),
+            )
+            .await
+            .expect("garden should succeed");
+
+        assert!(result.get("recent_memories").is_some());
+        assert!(result.get("long_term_memories").is_some());
+        assert_eq!(result.get("existing_long_term"), Some(&json!(0)));
+        let rendered = serde_json::to_string(&result).expect("render garden result");
+        assert!(rendered.contains(&format!("memory_{}", "upsert")));
+        assert!(rendered.contains("scope='long_term'"));
+        assert!(rendered.contains("memory_forget"));
     }
 }

@@ -5,10 +5,16 @@ pub mod compact;
 pub mod context;
 pub(crate) mod error;
 pub mod forked;
+pub mod ghost_background_review;
+pub mod ghost_learning;
+pub mod ghost_memory_provider;
+pub mod ghost_metrics;
+pub mod ghost_recall;
 pub mod health;
 pub mod history_projector;
 pub mod intent;
 pub mod memory_adapter;
+pub mod memory_file_store;
 pub mod memory_system;
 pub mod prompt_skill_executor;
 pub mod response_cache;
@@ -17,6 +23,7 @@ pub mod session_memory;
 pub mod session_metrics;
 pub mod skill_decision;
 pub mod skill_executor;
+pub mod skill_file_store;
 pub mod skill_index;
 pub mod skill_kernel;
 pub mod skill_mutex;
@@ -46,9 +53,22 @@ pub use forked::{
     create_skill_review_can_use_tool, run_forked_agent, CacheSafeParams, CanUseToolFn,
     ForkedAgentParams, ForkedAgentResult, ToolDefinition, ToolPermission, UsageMetrics,
 };
+pub use ghost_learning::{
+    GhostEpisodeSnapshot, GhostLearningBoundary, GhostLearningBoundaryKind, GhostLearningPolicy,
+    LearningDecision,
+};
+pub use ghost_memory_provider::{
+    GhostMemoryProvider, GhostMemoryProviderManager, LocalFileGhostMemoryProvider,
+};
+pub use ghost_metrics::{
+    get_ghost_metrics, ghost_metrics_summary, reset_ghost_metrics_for_paths, GhostMetricsSnapshot,
+};
 pub use health::HealthChecker;
 pub use intent::{IntentCategory, IntentClassifier};
 pub use memory_adapter::MemoryStoreAdapter;
+pub use memory_file_store::{
+    MemoryFileMutation, MemoryFileSnapshot, MemoryFileStore, MemoryFileTarget,
+};
 pub use memory_system::{
     evaluate_memory_hooks, BackgroundTaskHandle, MemorySystem, MemorySystemConfig,
     MemorySystemState, PostSamplingAction,
@@ -61,4 +81,5 @@ pub use session_memory::{
     wait_for_session_memory_extraction_with_timeout, Section, SectionPriority, SessionMemoryConfig,
     SessionMemoryState, DEFAULT_SESSION_MEMORY_TEMPLATE,
 };
+pub use skill_file_store::{SkillFileMutation, SkillFileStore};
 pub use task_manager::TaskManager;

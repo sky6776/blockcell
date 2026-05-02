@@ -441,6 +441,10 @@ pub async fn run(
         if let Some(ref store) = memory_store_handle {
             runtime.set_memory_store(store.clone());
         }
+        if let Err(e) = runtime.init_memory_file_store() {
+            warn!(error = %e, "Failed to initialize file memory store");
+        }
+
         runtime.set_capability_registry(cap_registry_handle.clone());
         runtime.set_core_evolution(core_evo_handle.clone());
 
@@ -659,6 +663,10 @@ pub async fn run(
         if let Some(ref store) = memory_store_handle {
             runtime.set_memory_store(store.clone());
         }
+        if let Err(e) = runtime.init_memory_file_store() {
+            warn!(error = %e, "Failed to initialize file memory store");
+        }
+
         runtime.set_capability_registry(cap_registry_handle.clone());
         runtime.set_core_evolution(core_evo_handle.clone());
 

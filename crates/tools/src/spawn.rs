@@ -176,6 +176,10 @@ mod tests {
             permissions: blockcell_core::types::PermissionSet::new(),
             task_manager: None,
             memory_store: None,
+            memory_file_store: None,
+            ghost_memory_lifecycle: None,
+            skill_file_store: None,
+            session_search: None,
             outbound_tx: None,
             spawn_handle: Some(Arc::new(CaptureSpawnHandle {
                 captured_task: Arc::clone(&captured_task),

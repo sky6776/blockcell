@@ -147,6 +147,9 @@ pub async fn test(tool_name: &str, params_json: &str) -> anyhow::Result<()> {
     let mcp_manager = Arc::new(McpManager::load(&paths).await?);
     let registry = build_tool_registry_with_all_mcp(Some(&mcp_manager)).await?;
     let paths = Paths::new();
+    paths.ensure_dirs()?;
+    let memory_file_store = Arc::new(blockcell_agent::MemoryFileStore::open(&paths)?);
+    let skill_file_store = Arc::new(blockcell_agent::SkillFileStore::open(&paths)?);
 
     let tool = registry
         .get(tool_name)
@@ -176,6 +179,10 @@ pub async fn test(tool_name: &str, params_json: &str) -> anyhow::Result<()> {
         spawn_handle: None,
         task_manager: None,
         memory_store: None,
+        memory_file_store: Some(memory_file_store),
+        ghost_memory_lifecycle: None,
+        skill_file_store: Some(skill_file_store),
+        session_search: None,
         capability_registry: None,
         core_evolution: None,
         event_emitter: None,

@@ -696,16 +696,15 @@ fn is_auto_mem_path(path: &str, memory_dir: &Path) -> bool {
                 }
             }
         }
-        // 路径以 memory_dir 开头但文件和父目录都不存在
-        // 这是创建新文件的情况，允许在验证目录内创建新文件
-        // 但必须拒绝包含 .. 组件的路径（防止路径遍历逃逸）
+        // 路径以 memory_dir 开头但文件和父目录都不存在，保守拒绝。
+        // 创建新文件时父目录必须已存在并通过 canonicalize 验证。
         if path
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
         {
             return false;
         }
-        return true;
+        return false;
     }
 
     // 路径不以 memory_dir 开头，保守拒绝（安全优先）

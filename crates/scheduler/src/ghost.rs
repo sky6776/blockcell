@@ -3,19 +3,23 @@ use chrono::Utc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-/// Ghost Agent system prompt — a background maintenance persona.
+/// Ghost maintenance system prompt — a background maintenance persona.
 /// Optimized for minimal token usage (P2-2).
 #[allow(dead_code)]
 const GHOST_SYSTEM_PROMPT: &str = r#"You are Ghost, Blockcell's background maintenance agent.
 Constraints: background-only, restricted permissions, minimize tokens.
 Tools: memory_maintenance, community_hub, list_dir, file_ops, notification (critical only).
-Rules: NEVER save routine logs to memory. Only save genuine user-relevant discoveries to long-term memory.
+Rules: NEVER save routine logs to memory. Maintain SQLite long-term memory only for genuine durable facts. Do not create skills.
 Output: respond with a brief JSON summary at the end (see routine prompt for format).
 "#;
 
-/// Configuration for the Ghost Agent, read from config.json5 agents.ghost.
+/// Configuration for the scheduled Ghost maintenance service, read from config.json5 agents.ghost.
+///
+/// This is intentionally separate from embedded Ghost learning. Embedded learning
+/// runs inside AgentRuntime during normal user turns and does not depend on this
+/// scheduled maintenance service being enabled.
 #[derive(Debug, Clone)]
-pub struct GhostServiceConfig {
+pub struct GhostMaintenanceServiceConfig {
     pub enabled: bool,
     pub model: Option<String>,
     pub schedule: String,
@@ -23,7 +27,7 @@ pub struct GhostServiceConfig {
     pub auto_social: bool,
 }
 
-impl GhostServiceConfig {
+impl GhostMaintenanceServiceConfig {
     pub fn from_config(config: &Config) -> Self {
         let ghost = &config.agents.ghost;
         Self {
@@ -69,15 +73,15 @@ impl SyncTracker {
     }
 }
 
-pub struct GhostService {
-    config: GhostServiceConfig,
+pub struct GhostMaintenanceService {
+    config: GhostMaintenanceServiceConfig,
     #[allow(dead_code)]
     paths: Paths,
     inbound_tx: mpsc::Sender<InboundMessage>,
     sync_tracker: SyncTracker,
 }
 
-impl GhostService {
+impl GhostMaintenanceService {
     fn normalize_cron_schedule(expr: &str) -> String {
         let parts: Vec<&str> = expr.split_whitespace().filter(|p| !p.is_empty()).collect();
         if parts.len() == 5 {
@@ -93,7 +97,7 @@ impl GhostService {
     }
 
     pub fn new(
-        config: GhostServiceConfig,
+        config: GhostMaintenanceServiceConfig,
         paths: Paths,
         inbound_tx: mpsc::Sender<InboundMessage>,
     ) -> Self {
@@ -107,9 +111,9 @@ impl GhostService {
 
     /// Build the routine prompt based on config.
     /// Optimized for minimal token usage (P2-2): concise instructions + JSON output format.
-    pub fn build_routine_prompt(config: &GhostServiceConfig) -> String {
+    pub fn build_routine_prompt(config: &GhostMaintenanceServiceConfig) -> String {
         let mut steps = vec![
-            "1. memory_maintenance(action=\"garden\") → follow returned instructions. Extract important facts to long-term, delete trivial entries.".to_string(),
+            "1. memory_maintenance(action=\"garden\") → follow returned instructions. Promote only stable facts to SQLite long_term memory; delete trivial entries. Do not create skills.".to_string(),
             "2. list_dir workspace/media + workspace/downloads → file_ops delete files >7 days old. Skip if age unknown.".to_string(),
         ];
 
@@ -122,7 +126,7 @@ impl GhostService {
         let steps_str = steps.join("\n");
         format!(
             "Ghost routine. Execute steps in order:\n{}\n\n\
-             Rules: NEVER memory_upsert routine logs. Only save genuine user-relevant discoveries.\n\n\
+             Rules: NEVER memory_upsert routine logs. Only maintain genuine durable facts/preferences/projects/tasks in SQLite long_term memory. Do not create skills.\n\n\
              After all steps, output ONLY this JSON (no other text):\n\
              {{\"memory\":{{\"gardened\":N,\"promoted\":N,\"deleted\":N}},\
              \"cleanup\":{{\"files_deleted\":N}},\
@@ -142,7 +146,7 @@ impl GhostService {
             return Ok(());
         }
 
-        info!("👻 Ghost Agent: starting routine cycle");
+        info!("👻 GhostMaintenanceService: starting routine cycle");
         self.sync_tracker.record_sync();
 
         let content = Self::build_routine_prompt(&self.config);
@@ -171,7 +175,7 @@ impl GhostService {
             error!(error = %e, "Ghost: failed to send routine message");
         }
 
-        info!("👻 Ghost Agent: routine message dispatched");
+        info!("👻 GhostMaintenanceService: routine message dispatched");
         Ok(())
     }
 
@@ -182,7 +186,7 @@ impl GhostService {
             max_syncs = self.config.max_syncs_per_day,
             auto_social = self.config.auto_social,
             enabled = self.config.enabled,
-            "👻 GhostService started"
+            "👻 GhostMaintenanceService started"
         );
 
         // Parse cron schedule to determine check interval.
@@ -218,7 +222,7 @@ impl GhostService {
                 _ = check_interval.tick() => {
                     // Hot-reload config
                     if let Ok(new_config) = Config::load_or_default(&config_paths) {
-                        let new_ghost = GhostServiceConfig::from_config(&new_config);
+                        let new_ghost = GhostMaintenanceServiceConfig::from_config(&new_config);
 
                         // Check if relevant fields changed
                         let schedule_changed = new_ghost.schedule != self.config.schedule;
@@ -253,9 +257,9 @@ impl GhostService {
                             }
 
                             if !self.config.enabled {
-                                info!("👻 GhostService disabled via config");
+                                info!("👻 GhostMaintenanceService disabled via config");
                             } else {
-                                info!("👻 GhostService enabled/updated via config: {}", self.config.schedule);
+                                info!("👻 GhostMaintenanceService enabled/updated via config: {}", self.config.schedule);
                             }
                         }
                     }
@@ -281,7 +285,7 @@ impl GhostService {
                     }
                 }
                 _ = shutdown.recv() => {
-                    info!("👻 GhostService shutting down");
+                    info!("👻 GhostMaintenanceService shutting down");
                     break;
                 }
             }
@@ -305,12 +309,29 @@ mod tests {
     }
 
     #[test]
-    fn test_ghost_config_from_config() {
+    fn test_ghost_maintenance_config_from_config() {
         let config = Config::default();
-        let ghost_config = GhostServiceConfig::from_config(&config);
+        let ghost_config = GhostMaintenanceServiceConfig::from_config(&config);
         assert!(!ghost_config.enabled);
         assert!(ghost_config.model.is_none());
         assert_eq!(ghost_config.max_syncs_per_day, 10);
         assert!(ghost_config.auto_social);
+    }
+
+    #[test]
+    fn test_routine_prompt_allows_sqlite_long_term_maintenance() {
+        let config = GhostMaintenanceServiceConfig {
+            enabled: true,
+            model: None,
+            schedule: "0 0 */4 * * *".to_string(),
+            max_syncs_per_day: 10,
+            auto_social: false,
+        };
+        let prompt = GhostMaintenanceService::build_routine_prompt(&config);
+
+        assert!(prompt.contains("memory_maintenance"));
+        assert!(prompt.contains("SQLite long_term memory"));
+        assert!(prompt.contains(&format!("memory_{}", "upsert")));
+        assert!(prompt.contains("Do not create skills"));
     }
 }

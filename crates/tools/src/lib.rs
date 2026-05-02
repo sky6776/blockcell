@@ -34,6 +34,7 @@ pub mod registry;
 pub mod registry_builder;
 pub mod security_scan;
 pub mod session_recall;
+pub mod session_search;
 pub mod skill_manage;
 pub mod skills;
 pub mod spawn;
@@ -97,6 +98,15 @@ pub type TaskManagerHandle = Arc<dyn TaskManagerOps + Send + Sync>;
 
 /// Opaque handle to the memory store, passed through ToolContext.
 pub type MemoryStoreHandle = Arc<dyn MemoryStoreOps + Send + Sync>;
+
+/// Opaque handle to file memory, passed through ToolContext.
+pub type MemoryFileStoreHandle = Arc<dyn MemoryFileStoreOps + Send + Sync>;
+
+/// Opaque handle to workspace file skills, passed through ToolContext.
+pub type SkillFileStoreHandle = Arc<dyn SkillFileStoreOps + Send + Sync>;
+
+/// Opaque handle to read-only session search for background learning review.
+pub type SessionSearchHandle = Arc<dyn SessionSearchOps + Send + Sync>;
 
 /// Opaque handle to the response cache, passed through ToolContext.
 pub type ResponseCacheHandle = Arc<dyn ResponseCacheOps + Send + Sync>;
@@ -211,6 +221,40 @@ pub trait MemoryStoreOps: Send + Sync {
     fn maintenance(&self, recycle_days: i64) -> Result<(usize, usize)>;
 }
 
+/// Trait abstracting file-backed USER.md / MEMORY.md operations.
+pub trait MemoryFileStoreOps: Send + Sync {
+    fn add_file_memory_json(&self, target: &str, content: &str) -> Result<Value>;
+    fn replace_file_memory_json(
+        &self,
+        target: &str,
+        old_text: &str,
+        content: &str,
+    ) -> Result<Value>;
+    fn remove_file_memory_json(&self, target: &str, old_text: &str) -> Result<Value>;
+    fn restore_latest_file_memory_json(&self, target: &str) -> Result<Value>;
+}
+
+pub trait GhostMemoryLifecycleOps: Send + Sync {
+    fn on_memory_write_json(&self, target: &str, action: &str, content: &str) -> Result<Value>;
+}
+
+/// Trait abstracting file-backed workspace skill operations.
+pub trait SkillFileStoreOps: Send + Sync {
+    fn view_skill_json(&self, name: &str) -> Result<Value>;
+    fn create_skill_json(&self, name: &str, description: &str, content: &str) -> Result<Value>;
+    fn edit_skill_json(&self, name: &str, content: &str) -> Result<Value>;
+    fn patch_skill_json(&self, name: &str, old_text: &str, content: &str) -> Result<Value>;
+    fn delete_skill_json(&self, name: &str) -> Result<Value>;
+    fn write_skill_file_json(&self, name: &str, path: &str, content: &str) -> Result<Value>;
+    fn remove_skill_file_json(&self, name: &str, path: &str) -> Result<Value>;
+    fn restore_latest_skill_json(&self, name: &str) -> Result<Value>;
+}
+
+/// Trait abstracting read-only session search operations.
+pub trait SessionSearchOps: Send + Sync {
+    fn search_session_json(&self, query: &str, limit: usize) -> Result<Value>;
+}
+
 /// Trait abstracting session response cache operations needed by tools.
 /// The cache stores large list/table responses and allows retrieval by ref_id.
 pub trait ResponseCacheOps: Send + Sync {
@@ -242,6 +286,10 @@ pub struct ToolContext {
     pub permissions: PermissionSet,
     pub task_manager: Option<TaskManagerHandle>,
     pub memory_store: Option<MemoryStoreHandle>,
+    pub memory_file_store: Option<MemoryFileStoreHandle>,
+    pub ghost_memory_lifecycle: Option<Arc<dyn GhostMemoryLifecycleOps + Send + Sync>>,
+    pub skill_file_store: Option<SkillFileStoreHandle>,
+    pub session_search: Option<SessionSearchHandle>,
     pub outbound_tx: Option<OutboundSender>,
     pub spawn_handle: Option<Arc<dyn SpawnHandle>>,
     pub capability_registry: Option<CapabilityRegistryHandle>,

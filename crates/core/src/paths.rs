@@ -234,6 +234,18 @@ impl Paths {
         self.workspace().join("tool_evolution_records")
     }
 
+    pub fn ghost_dir(&self) -> PathBuf {
+        self.workspace().join("ghost")
+    }
+
+    pub fn ghost_ledger_db(&self) -> PathBuf {
+        self.ghost_dir().join("ghost_ledger.db")
+    }
+
+    pub fn ghost_reports_dir(&self) -> PathBuf {
+        self.ghost_dir().join("reports")
+    }
+
     pub fn builtin_skills_dir(&self) -> PathBuf {
         // Try multiple candidate paths, return the first that exists on disk.
         // 1. exe/../skills  (installed layout: bin/blockcell + skills/)
@@ -269,6 +281,8 @@ impl Paths {
         std::fs::create_dir_all(self.evolved_tools_dir())?;
         std::fs::create_dir_all(self.tool_artifacts_dir())?;
         std::fs::create_dir_all(self.tool_evolution_records_dir())?;
+        std::fs::create_dir_all(self.ghost_dir())?;
+        std::fs::create_dir_all(self.ghost_reports_dir())?;
         std::fs::create_dir_all(self.logs_dir())?;
         // Bootstrap BLOCKCELL.md with default template if it does not exist
         let blockcell_md = self.blockcell_md();
@@ -344,6 +358,19 @@ mod tests {
         assert_eq!(
             paths.logs_dir(),
             PathBuf::from("/tmp/blockcell/workspace/logs")
+        );
+    }
+
+    #[test]
+    fn test_ghost_learning_paths_live_under_workspace_ghost() {
+        let paths = Paths::with_base(PathBuf::from("/tmp/blockcell-test"));
+        assert_eq!(
+            paths.ghost_dir(),
+            PathBuf::from("/tmp/blockcell-test/workspace/ghost")
+        );
+        assert_eq!(
+            paths.ghost_ledger_db(),
+            PathBuf::from("/tmp/blockcell-test/workspace/ghost/ghost_ledger.db")
         );
     }
 }

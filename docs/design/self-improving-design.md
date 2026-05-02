@@ -363,4 +363,3 @@ exact → line_trimmed → whitespace_norm → indent_flex → escape_norm
 | Frontmatter 验证 | 内联 | validate_skill_frontmatter | ✅ |
 | 名称验证 | 隐式 | VALID_SKILL_NAME_RE | ✅ |
 | Clippy | N/A (Python) | `-D warnings` 零警告 | ✅ |
-

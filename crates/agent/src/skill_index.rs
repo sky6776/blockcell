@@ -2,7 +2,7 @@
 //!
 //! 核心思路:
 //! - 启动时只加载 meta 信息 (name, category, description, tools)
-//! - Agent 需要使用 Skill 时, 通过 skill_manage view 按需加载完整内容
+//! - Agent 需要使用 Skill 时, 通过 skill_view 按需加载完整内容
 //! - 减少系统提示词长度, 节省 token
 //!
 //! 参考 Hermes `agent_core/skill_index.py`
@@ -343,7 +343,7 @@ impl SkillIndex {
     ///
     /// 格式:
     /// ```text
-    /// ## Available Skills (index only, use skill_manage view to load)
+    /// ## Available Skills (index only, use skill_view to load)
     /// - flask-k8s-deploy [devops]: Deploy Flask apps to Kubernetes (tools: exec, write_file)
     /// - rust-debug [software-development]: Debug Rust compilation errors (always loaded)
     /// ```
@@ -353,7 +353,7 @@ impl SkillIndex {
         }
 
         let mut summary = String::from(
-            "## Available Skills (index only, use `skill_manage view` to load full content)\n",
+            "## Available Skills (index only, use `skill_view` to load full content)\n",
         );
 
         let mut entries: Vec<_> = self.entries.values().collect();
@@ -627,7 +627,7 @@ mod tests {
         assert!(summary.contains("Available Skills"));
         assert!(summary.contains("deploy"));
         assert!(summary.contains("devops"));
-        assert!(summary.contains("skill_manage view"));
+        assert!(summary.contains("skill_view"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

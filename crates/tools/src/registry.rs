@@ -24,15 +24,15 @@ use crate::fs::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
 use crate::http_request::HttpRequestTool;
 use crate::image_understand::ImageUnderstandTool;
 use crate::knowledge_graph::KnowledgeGraphTool;
-use crate::memory::{MemoryForgetTool, MemoryQueryTool, MemoryUpsertTool};
+use crate::memory::{MemoryForgetTool, MemoryManageTool, MemoryQueryTool, MemoryUpsertTool};
 use crate::memory_maintenance::MemoryMaintenanceTool;
 use crate::message::MessageTool;
 use crate::network_monitor::NetworkMonitorTool;
 use crate::ocr::OcrTool;
 use crate::office_write::OfficeWriteTool;
 use crate::session_recall::SessionRecallTool;
-use crate::skill_manage::SkillManageTool;
-use crate::skills::ListSkillsTool;
+use crate::session_search::SessionSearchTool;
+use crate::skills::{ListSkillsTool, SkillManageTool, SkillViewTool};
 use crate::spawn::SpawnTool;
 use crate::stream_subscribe::StreamSubscribeTool;
 use crate::system_info::{CapabilityEvolveTool, SystemInfoTool};
@@ -46,13 +46,16 @@ use crate::{Tool, ToolContext};
 
 pub const GLOBAL_CORE_TOOL_NAMES: &[&str] = &[
     "memory_query",
+    "memory_manage",
     "memory_upsert",
     "memory_forget",
     "spawn",
     "list_tasks",
     "agent_status",
     "list_skills",
+    "skill_view",
     "skill_manage",
+    "session_search",
     "cron",
     "toggle_manage",
     "web_fetch",
@@ -108,11 +111,14 @@ impl ToolRegistry {
 
         // Memory tools
         registry.register(Arc::new(MemoryQueryTool));
+        registry.register(Arc::new(MemoryManageTool));
         registry.register(Arc::new(MemoryUpsertTool));
         registry.register(Arc::new(MemoryForgetTool));
+        registry.register(Arc::new(SessionSearchTool));
 
         // Skill evolution tools
         registry.register(Arc::new(ListSkillsTool));
+        registry.register(Arc::new(SkillViewTool));
         registry.register(Arc::new(SkillManageTool));
 
         // System info & capability evolution tools
