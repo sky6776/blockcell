@@ -565,11 +565,13 @@ mod tests {
 
     #[test]
     fn test_should_extract_memory_already_initialized() {
-        let mut state = SessionMemoryState::default();
-        state.initialized = true;
-        state.last_memory_message_index = Some(100);
-        state.last_memory_message_id = Some("msg-100".to_string());
-        state.tokens_at_last_extraction = 10_000;
+        let state = SessionMemoryState {
+            initialized: true,
+            last_memory_message_index: Some(100),
+            last_memory_message_id: Some("msg-100".to_string()),
+            tokens_at_last_extraction: 10_000,
+            ..Default::default()
+        };
 
         // 已初始化，需要满足间隔条件（验证消息可构造）
         let _messages: Vec<ChatMessage> = (0..20)

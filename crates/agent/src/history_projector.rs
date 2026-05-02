@@ -468,7 +468,7 @@ mod tests {
         let tokens = rough_token_count_estimation(text);
         assert!(tokens > 0);
         // Approximately 29 chars / 4 ≈ 7 tokens
-        assert!(tokens >= 6 && tokens <= 8);
+        assert!((6..=8).contains(&tokens));
     }
 
     #[test]

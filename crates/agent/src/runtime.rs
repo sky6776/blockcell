@@ -1418,7 +1418,13 @@ fn runtime_session_search_score(text: &str, tokens: &[String]) -> usize {
     let lower = text.to_lowercase();
     tokens
         .iter()
-        .map(|token| lower.contains(token).then_some(token.len()).unwrap_or(0))
+        .map(|token| {
+            if lower.contains(token) {
+                token.len()
+            } else {
+                0
+            }
+        })
         .sum()
 }
 
@@ -1836,6 +1842,9 @@ impl AgentRuntime {
         // 从 config 中提取 nudge 配置 (在 config 被 move 之前)
         let nudge_config = crate::skill_nudge::NudgeConfig::from_config(&config.self_improve.nudge);
 
+        let response_cache_config =
+            crate::response_cache::ResponseCacheConfig::from(&config.memory.memory_system.layer1);
+
         Ok(Self {
             config,
             paths,
@@ -1864,7 +1873,9 @@ impl AgentRuntime {
             cap_request_cooldown: HashMap::new(),
             channel_contacts,
             path_policy,
-            response_cache: crate::response_cache::ResponseCache::new(),
+            response_cache: crate::response_cache::ResponseCache::with_config(
+                response_cache_config,
+            ),
             memory_system: None,
             memory_injector_needs_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             skill_nudge_engine: crate::skill_nudge::SkillNudgeEngine::new(nudge_config),
@@ -2016,12 +2027,9 @@ impl AgentRuntime {
     /// - Loads cursor state from disk
     /// - Marks session as active (creates `.active` file)
     pub async fn init_memory_system(&mut self, session_id: String) -> std::io::Result<()> {
-        use crate::compact::{
-            MAX_FILE_RECOVERY_TOKENS, MAX_SESSION_MEMORY_RECOVERY_TOKENS, MAX_SKILL_RECOVERY_TOKENS,
-        };
-        use crate::memory_system::{MemorySystem, MemorySystemConfig};
+        use crate::memory_system::MemorySystem;
 
-        let config = MemorySystemConfig::default();
+        let config = self.config.memory.memory_system.clone();
         // Use paths.base as both workspace and config directory
         let base_dir = self.paths.base.clone();
 
@@ -2036,12 +2044,14 @@ impl AgentRuntime {
         crate::memory_event!(
             layer1,
             config,
-            50, // max_tool_results (default per session)
-            crate::response_cache::PREVIEW_SIZE_BYTES
+            memory_system.config().layer1.cache_max_per_session,
+            memory_system.config().layer1.preview_size_bytes
         );
 
         // Layer 2: Micro Compact
-        let layer2_config = crate::history_projector::TimeBasedMCConfig::default();
+        let layer2_config = crate::history_projector::TimeBasedMCConfig::from(
+            memory_system.config().layer2.clone(),
+        );
         crate::memory_event!(
             layer2,
             config,
@@ -2053,14 +2063,20 @@ impl AgentRuntime {
         crate::memory_event!(
             layer3,
             config,
-            crate::session_memory::MAX_TOTAL_SESSION_MEMORY_TOKENS,
-            crate::session_memory::MAX_SECTION_LENGTH
+            memory_system
+                .config()
+                .layer3
+                .max_total_session_memory_tokens,
+            memory_system.config().layer3.max_section_length
         );
 
         // Layer 4: Full Compact
-        let recovery_budget = MAX_FILE_RECOVERY_TOKENS
-            + MAX_SKILL_RECOVERY_TOKENS
-            + MAX_SESSION_MEMORY_RECOVERY_TOKENS;
+        let recovery_budget = memory_system.config().layer4.max_file_recovery_tokens
+            + memory_system.config().layer4.max_skill_recovery_tokens
+            + memory_system
+                .config()
+                .layer4
+                .max_session_memory_recovery_tokens;
         crate::memory_event!(
             layer4,
             config,
@@ -2073,9 +2089,9 @@ impl AgentRuntime {
         crate::memory_event!(
             layer5,
             config,
-            crate::auto_memory::MIN_MESSAGES_FOR_EXTRACTION,
-            crate::auto_memory::EXTRACTION_COOLDOWN_MESSAGES,
-            crate::auto_memory::MAX_MEMORY_FILE_TOKENS
+            memory_system.config().layer5.min_messages_for_extraction,
+            memory_system.config().layer5.extraction_cooldown_messages,
+            memory_system.config().layer5.max_memory_file_tokens
         );
 
         // Layer 6: Auto Dream (interval is typically 24 hours)
@@ -2619,11 +2635,13 @@ impl AgentRuntime {
     /// This loads the four memory files (user.md, project.md, feedback.md, reference.md)
     /// from the memory directory and makes them available for system prompt injection.
     pub async fn init_memory_injector(&mut self) -> std::io::Result<()> {
-        use crate::auto_memory::{get_memory_dir, MemoryInjector};
+        use crate::auto_memory::{get_memory_dir, InjectionConfig, MemoryInjector};
 
         // Use the config base directory (e.g., ~/.blockcell/memory/)
         let memory_dir = get_memory_dir(&self.paths.base);
-        let mut injector = MemoryInjector::default_injector();
+        let mut injector = MemoryInjector::new(InjectionConfig::from(
+            self.config.memory.memory_system.layer5.clone(),
+        ));
 
         // Try to load memory files; log warning if directory doesn't exist
         match injector.load_memories(&memory_dir).await {
@@ -2676,10 +2694,12 @@ impl AgentRuntime {
             return Ok(());
         }
 
-        use crate::auto_memory::{get_memory_dir, MemoryInjector};
+        use crate::auto_memory::{get_memory_dir, InjectionConfig, MemoryInjector};
 
         let memory_dir = get_memory_dir(&self.paths.base);
-        let mut injector = MemoryInjector::default_injector();
+        let mut injector = MemoryInjector::new(InjectionConfig::from(
+            self.config.memory.memory_system.layer5.clone(),
+        ));
         injector.load_memories(&memory_dir).await?;
 
         let count = injector.cache_size();
@@ -4574,7 +4594,7 @@ impl AgentRuntime {
 
         // Layer 2: 时间触发的轻量压缩
         // 检查会话最后更新时间，如果超过阈值则清理旧工具结果
-        let time_config = TimeBasedMCConfig::default();
+        let time_config = TimeBasedMCConfig::from(self.config.memory.memory_system.layer2.clone());
         if let Some(updated_at_str) = session_metadata.get("updated_at").and_then(|v| v.as_str()) {
             if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(updated_at_str) {
                 let last_assistant_timestamp = Some(updated_at.with_timezone(&chrono::Utc));
@@ -4788,7 +4808,12 @@ impl AgentRuntime {
         history.push(ChatMessage::user(&msg.content));
 
         // Layer 4: Initialize memory system if needed
-        if self.memory_system.is_none() {
+        let needs_memory_system_init = self
+            .memory_system
+            .as_ref()
+            .map(|memory_system| memory_system.session_id() != session_key)
+            .unwrap_or(true);
+        if needs_memory_system_init {
             if let Err(e) = self.init_memory_system(session_key.clone()).await {
                 warn!(error = %e, "[layer4] Failed to initialize memory system");
             }
@@ -4856,7 +4881,11 @@ impl AgentRuntime {
                 crate::response_cache::collect_tool_result_candidates(&current_messages);
             if !candidates.is_empty() {
                 let total_size: usize = candidates.iter().map(|c| c.size).sum();
-                let budget = crate::response_cache::MAX_TOOL_RESULTS_PER_MESSAGE_CHARS;
+                let budget = self
+                    .memory_system
+                    .as_ref()
+                    .map(|ms| ms.config().layer1.max_tool_results_per_message_chars)
+                    .unwrap_or(crate::response_cache::MAX_TOOL_RESULTS_PER_MESSAGE_CHARS);
                 let preview_size_bytes = self
                     .memory_system
                     .as_ref()
@@ -5750,6 +5779,7 @@ impl AgentRuntime {
                     let history_clone = history.clone();
                     let config_dir = memory_system.config_dir().to_path_buf();
                     let model = self.config.agents.defaults.model.clone();
+                    let layer5_config = memory_system.config().layer5.clone();
                     // 使用预先获取的 cursor_reload_flag
                     let cursor_reload_flag = cursor_reload_flag
                         .clone()
@@ -5761,6 +5791,7 @@ impl AgentRuntime {
                         let history_for_type = history_clone.clone();
                         let config_dir_for_type = config_dir.clone();
                         let model_for_type = model.clone();
+                        let layer5_config_for_type = layer5_config.clone();
                         let reload_flag_for_type = Arc::clone(&reload_flag);
                         let cursor_reload_flag_for_type = Arc::clone(&cursor_reload_flag);
 
@@ -5777,17 +5808,21 @@ impl AgentRuntime {
 
                         let handle = tokio::spawn(async move {
                             // 创建提取器（会加载持久化的游标状态）
-                            let mut extractor = match crate::auto_memory::AutoMemoryExtractor::new(
-                                &config_dir_for_type,
-                            )
-                            .await
-                            {
-                                Ok(e) => e,
-                                Err(e) => {
-                                    warn!(error = %e, "[layer5] Failed to create AutoMemoryExtractor");
-                                    return;
-                                }
-                            };
+                            let extractor_config =
+                                crate::auto_memory::AutoMemoryConfig::from(layer5_config_for_type);
+                            let mut extractor =
+                                match crate::auto_memory::AutoMemoryExtractor::with_config(
+                                    &config_dir_for_type,
+                                    extractor_config,
+                                )
+                                .await
+                                {
+                                    Ok(e) => e,
+                                    Err(e) => {
+                                        warn!(error = %e, "[layer5] Failed to create AutoMemoryExtractor");
+                                        return;
+                                    }
+                                };
 
                             let system_prompt = Arc::new(
                                 "你是一个记忆提取助手。请从对话中提取用户偏好、项目信息、反馈和外部资源引用。"
@@ -9899,6 +9934,104 @@ description: local demo
         assert_eq!(
             extract_json_from_text(text),
             "{\"argv\":[\"search\",\"btc\"]}"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_memory_system_uses_runtime_memory_config() {
+        let mut config = Config::default();
+        config.memory.memory_system.token_budget = 1_000;
+        config.memory.memory_system.layer1.preview_size_bytes = 123;
+        config.memory.memory_system.layer2.gap_threshold_minutes = 7;
+        config
+            .memory
+            .memory_system
+            .layer3
+            .minimum_message_tokens_to_init = 111;
+        config.memory.memory_system.layer3.max_section_length = 222;
+        config.memory.memory_system.layer4.compact_threshold_ratio = 0.5;
+        config.memory.memory_system.layer4.keep_recent_messages = 3;
+        config
+            .memory
+            .memory_system
+            .layer5
+            .min_messages_for_extraction = 2;
+
+        let mut runtime = test_runtime_with_provider_and_paths(
+            Paths::with_base(std::env::temp_dir().join(format!(
+                "blockcell-memory-config-runtime-{}",
+                uuid::Uuid::new_v4()
+            ))),
+            Arc::new(TestProvider),
+            config,
+        );
+
+        runtime
+            .init_memory_system("cli:configured-session".to_string())
+            .await
+            .unwrap();
+
+        let memory_system = runtime.memory_system().expect("memory system initialized");
+        assert_eq!(memory_system.session_id(), "cli:configured-session");
+        assert_eq!(memory_system.config().token_budget, 1_000);
+        assert_eq!(memory_system.config().layer1.preview_size_bytes, 123);
+        assert_eq!(memory_system.config().layer2.gap_threshold_minutes, 7);
+        assert_eq!(
+            memory_system
+                .session_memory_state()
+                .config
+                .minimum_message_tokens_to_init,
+            111
+        );
+        assert_eq!(
+            memory_system
+                .session_memory_state()
+                .config
+                .max_section_length,
+            222
+        );
+        assert!(memory_system.should_compact(500));
+        assert!(!memory_system.should_compact(499));
+        assert_eq!(memory_system.config().layer4.keep_recent_messages, 3);
+        assert_eq!(memory_system.config().layer5.min_messages_for_extraction, 2);
+    }
+
+    #[tokio::test]
+    async fn process_message_reinitializes_memory_system_for_new_session() {
+        let mut runtime = test_runtime_with_provider(Arc::new(TestProvider));
+
+        let first = InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "memory-session-a".to_string(),
+            content: "hello a".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let first_session = first.session_key();
+        runtime.process_message(first).await.unwrap();
+        assert_eq!(
+            runtime.memory_system().map(|system| system.session_id()),
+            Some(first_session.as_str())
+        );
+
+        let second = InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "memory-session-b".to_string(),
+            content: "hello b".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let second_session = second.session_key();
+        runtime.process_message(second).await.unwrap();
+        assert_eq!(
+            runtime.memory_system().map(|system| system.session_id()),
+            Some(second_session.as_str())
         );
     }
 

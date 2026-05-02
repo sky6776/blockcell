@@ -164,7 +164,7 @@ mod tests {
     fn test_estimate_tokens_cjk() {
         let tokens = estimate_tokens("你好世界");
         // "你好世界" should be 4 tokens with tiktoken (each char is a token)
-        assert!(tokens >= 4 && tokens <= 10, "Got {} tokens", tokens);
+        assert!((4..=10).contains(&tokens), "Got {} tokens", tokens);
     }
 
     #[test]

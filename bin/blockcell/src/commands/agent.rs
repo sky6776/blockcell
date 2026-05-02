@@ -1,6 +1,7 @@
 use blockcell_agent::{
     AgentRuntime, CapabilityRegistryAdapter, ConfirmRequest, CoreEvolutionAdapter,
-    MemoryStoreAdapter, MessageBus, ProviderLLMBridge, ResponseCache, TaskManager,
+    MemoryStoreAdapter, MessageBus, ProviderLLMBridge, ResponseCache, ResponseCacheConfig,
+    TaskManager,
 };
 #[cfg(feature = "dingtalk")]
 use blockcell_channels::dingtalk::DingTalkChannel;
@@ -672,7 +673,9 @@ pub async fn run(
 
         // Create shared ResponseCache for CLI and runtime
         // This allows the /clear command to clear the in-memory cache
-        let response_cache = ResponseCache::new();
+        let response_cache = ResponseCache::with_config(ResponseCacheConfig::from(
+            &config.memory.memory_system.layer1,
+        ));
         runtime.set_response_cache(response_cache.clone());
 
         // Initialize Layer 5 memory injector (7-layer memory system)

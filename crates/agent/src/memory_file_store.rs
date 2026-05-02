@@ -252,7 +252,7 @@ impl MemoryFileStore {
     }
 
     fn latest_snapshot_for(&self, target: MemoryFileTarget) -> Result<Option<PathBuf>> {
-        let prefix = format!("{}", target.as_str()) + "_";
+        let prefix = format!("{}_", target.as_str());
         let mut latest: Option<PathBuf> = None;
         for entry in fs::read_dir(&self.snapshots_dir)? {
             let entry = entry?;

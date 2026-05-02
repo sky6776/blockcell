@@ -453,8 +453,7 @@ mod tests {
     #[test]
     fn test_layer3_layer4_recovery_interaction() {
         use blockcell_agent::compact::{
-            FileRecord, FileTracker, RecoveryBudget, MAX_FILE_RECOVERY_TOKENS,
-            MAX_SINGLE_FILE_TOKENS,
+            FileTracker, RecoveryBudget, MAX_FILE_RECOVERY_TOKENS, MAX_SINGLE_FILE_TOKENS,
         };
         use blockcell_agent::session_memory::{Section, SectionPriority};
 

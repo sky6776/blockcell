@@ -907,6 +907,7 @@ pub async fn persist_tool_result(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod layer1_tests {
     use super::*;
 

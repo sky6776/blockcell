@@ -1,7 +1,7 @@
 use anyhow::Context;
 use blockcell_agent::{
     AgentRuntime, CapabilityRegistryAdapter, ConfirmRequest, CoreEvolutionAdapter,
-    MemoryStoreAdapter, MessageBus, ProviderLLMBridge, TaskManager,
+    MemoryStoreAdapter, MessageBus, ProviderLLMBridge, ResponseCacheConfig, TaskManager,
 };
 #[cfg(feature = "dingtalk")]
 use blockcell_channels::dingtalk::DingTalkChannel;
@@ -822,7 +822,9 @@ async fn spawn_agent_runtime(
     runtime.set_event_tx(ws_broadcast_tx);
 
     // Create shared ResponseCache and register it
-    let response_cache = blockcell_agent::ResponseCache::new();
+    let response_cache = blockcell_agent::ResponseCache::with_config(ResponseCacheConfig::from(
+        &agent_config.memory.memory_system.layer1,
+    ));
     runtime.set_response_cache(response_cache.clone());
     {
         let mut caches = response_caches.write().await;

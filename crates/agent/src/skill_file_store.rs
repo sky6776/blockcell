@@ -271,8 +271,7 @@ impl SkillFileStore {
     pub fn remove_file(&self, name: &str, relative_path: &str) -> Result<SkillFileMutation> {
         let skill_name = validate_skill_name(name)?;
         let relative_path = validate_skill_relative_path(relative_path)?;
-        if relative_path == PathBuf::from("SKILL.md") || relative_path == PathBuf::from("meta.yaml")
-        {
+        if relative_path == Path::new("SKILL.md") || relative_path == Path::new("meta.yaml") {
             return Err(Error::Validation(
                 "use delete to remove the whole skill".to_string(),
             ));
@@ -352,7 +351,7 @@ impl SkillFileStore {
     }
 
     fn latest_snapshot_for(&self, skill_name: &str) -> Result<Option<PathBuf>> {
-        let prefix = format!("{}", skill_name) + "_";
+        let prefix = format!("{skill_name}_");
         let mut latest: Option<PathBuf> = None;
         for entry in fs::read_dir(&self.snapshots_dir)? {
             let entry = entry?;
