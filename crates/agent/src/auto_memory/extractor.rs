@@ -23,14 +23,21 @@ pub struct AutoMemoryConfig {
     pub extraction_cooldown_messages: usize,
     /// 记忆文件最大 token 数
     pub max_memory_file_tokens: usize,
+    /// 提取时间冷却阈值（秒）
+    pub extraction_time_cooldown_secs: u64,
+    /// 内容变化阈值（字符数）
+    pub content_change_threshold: usize,
 }
 
 impl Default for AutoMemoryConfig {
     fn default() -> Self {
+        use super::cursor::{CONTENT_CHANGE_THRESHOLD, TIME_COOLDOWN_SECS};
         Self {
             min_messages_for_extraction: super::MIN_MESSAGES_FOR_EXTRACTION,
             extraction_cooldown_messages: super::EXTRACTION_COOLDOWN_MESSAGES,
             max_memory_file_tokens: super::MAX_MEMORY_FILE_TOKENS,
+            extraction_time_cooldown_secs: TIME_COOLDOWN_SECS,
+            content_change_threshold: CONTENT_CHANGE_THRESHOLD,
         }
     }
 }
@@ -41,6 +48,8 @@ impl From<blockcell_core::config::Layer5Config> for AutoMemoryConfig {
             min_messages_for_extraction: c.min_messages_for_extraction,
             extraction_cooldown_messages: c.extraction_cooldown_messages,
             max_memory_file_tokens: c.max_memory_file_tokens,
+            extraction_time_cooldown_secs: c.extraction_time_cooldown_secs,
+            content_change_threshold: c.content_change_threshold,
         }
     }
 }

@@ -26,14 +26,15 @@ use super::memory_type::MemoryType;
 ///
 /// 默认 5 分钟 = 300 秒
 ///
-/// **注意**: 此常量保留供未来配置接口使用。
-/// 当前实现在调用 `check_time_cooldown` 或 `should_extract_full` 时接收参数，
-/// 不使用此默认值。未来可能添加配置文件支持，届时可使用此常量作为默认值。
-#[allow(dead_code)]
+/// 仅用作 AutoMemoryConfig::default() 的回退值，
+/// 运行时使用 Layer5Config.extraction_time_cooldown_secs
 pub const TIME_COOLDOWN_SECS: u64 = 300;
 
 /// 内容变化阈值（字符数）
-/// 内容变化需要超过此阈值才触发提取
+///
+/// 默认值 500，可通过 Layer5Config.content_change_threshold 配置。
+/// 仅用作 AutoMemoryConfig::default() 的回退值，
+/// 运行时使用 Layer5Config.content_change_threshold
 pub const CONTENT_CHANGE_THRESHOLD: usize = 500;
 
 /// 单个记忆类型的游标
@@ -116,7 +117,12 @@ impl ExtractionCursor {
     /// 检查内容是否有实质性变化
     ///
     /// 通过计算内容签名来检测变化
-    pub fn check_content_change(&self, current_content: &str) -> bool {
+    /// `content_change_threshold` 来自 Layer5Config.content_change_threshold
+    pub fn check_content_change(
+        &self,
+        current_content: &str,
+        content_change_threshold: usize,
+    ) -> bool {
         let current_signature = compute_content_signature(current_content);
 
         match self.last_content_signature {
@@ -128,10 +134,17 @@ impl ExtractionCursor {
                     && current_content
                         .len()
                         .saturating_sub(estimate_content_len_from_signature(last_sig))
-                        >= CONTENT_CHANGE_THRESHOLD
+                        >= content_change_threshold
             }
             None => true, // 从未提取过，内容变化通过
         }
+    }
+
+    /// 检查内容是否有实质性变化（使用默认阈值）
+    ///
+    /// 便捷方法，使用 CONTENT_CHANGE_THRESHOLD 常量作为默认值
+    pub fn check_content_change_default(&self, current_content: &str) -> bool {
+        self.check_content_change(current_content, CONTENT_CHANGE_THRESHOLD)
     }
 
     /// 综合检查是否应该提取
@@ -140,6 +153,8 @@ impl ExtractionCursor {
     /// 1. 消息计数冷却
     /// 2. 时间冷却
     /// 3. 内容变化（可选，根据 need_content_change 参数）
+    ///
+    /// `content_change_threshold` 来自 Layer5Config.content_change_threshold
     pub fn should_extract_full(
         &self,
         current_message_count: usize,
@@ -147,6 +162,7 @@ impl ExtractionCursor {
         message_cooldown: usize,
         time_cooldown_secs: u64,
         require_content_change: bool,
+        content_change_threshold: usize,
     ) -> ExtractionDecision {
         // 1. 消息计数冷却
         let messages_since_last = current_message_count.saturating_sub(self.last_message_count);
@@ -194,7 +210,8 @@ impl ExtractionCursor {
 
         // 3. 内容变化（可选）
         if require_content_change {
-            let content_changed = self.check_content_change(current_content);
+            let content_changed =
+                self.check_content_change(current_content, content_change_threshold);
             if !content_changed {
                 return ExtractionDecision::Wait {
                     reason: ExtractionWaitReason::NoContentChange,

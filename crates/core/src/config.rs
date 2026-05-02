@@ -1752,7 +1752,7 @@ impl Default for MemoryVectorConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Layer1Config {
-    /// 单个工具结果的最大字符数（仅用于配置验证）
+    /// 单个工具结果的最大字符数（超过此值触发持久化，通过 ResponseCacheConfig 在运行时生效）
     #[serde(default = "default_l1_max_result_size")]
     pub max_result_size_chars: usize,
     #[serde(default = "default_l1_max_per_message")]
@@ -1965,6 +1965,12 @@ pub struct Layer5Config {
     pub max_memory_file_tokens: usize,
     #[serde(default = "default_l5_injection_max")]
     pub injection_max_tokens: usize,
+    /// 提取时间冷却阈值（秒），距离上次提取需经过此时间
+    #[serde(default = "default_l5_time_cooldown_secs")]
+    pub extraction_time_cooldown_secs: u64,
+    /// 内容变化阈值（字符数），内容变化需超过此值才触发提取
+    #[serde(default = "default_l5_content_change_threshold")]
+    pub content_change_threshold: usize,
 }
 
 fn default_l5_min_messages() -> usize {
@@ -1979,6 +1985,12 @@ fn default_l5_max_file_tokens() -> usize {
 fn default_l5_injection_max() -> usize {
     4_000
 }
+fn default_l5_time_cooldown_secs() -> u64 {
+    300
+}
+fn default_l5_content_change_threshold() -> usize {
+    500
+}
 
 impl Default for Layer5Config {
     fn default() -> Self {
@@ -1987,6 +1999,8 @@ impl Default for Layer5Config {
             extraction_cooldown_messages: 5,
             max_memory_file_tokens: 4_000,
             injection_max_tokens: 4_000,
+            extraction_time_cooldown_secs: 300,
+            content_change_threshold: 500,
         }
     }
 }

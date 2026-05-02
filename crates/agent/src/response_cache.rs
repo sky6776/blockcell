@@ -560,12 +560,16 @@ impl ContentReplacementState {
     }
 
     /// 从 transcript 记录重建状态
+    ///
+    /// 使用 `max_replacement_entries` 参数确保重建后的状态保留
+    /// 用户配置的条目上限，而非静默回退到默认值。
     pub fn reconstruct(
         tool_use_ids: &[String],
         records: &[ContentReplacementRecord],
         inherited_replacements: Option<&HashMap<String, String>>,
+        max_replacement_entries: usize,
     ) -> Self {
-        let mut state = Self::default();
+        let mut state = Self::with_max_entries(max_replacement_entries);
 
         // 收集所有候选 tool_use_id
         for tool_use_id in tool_use_ids {
@@ -1035,7 +1039,12 @@ mod layer1_tests {
             "inherited".to_string(),
         )]));
 
-        let state = ContentReplacementState::reconstruct(&tool_ids, &records, inherited);
+        let state = ContentReplacementState::reconstruct(
+            &tool_ids,
+            &records,
+            inherited,
+            MAX_REPLACEMENT_ENTRIES,
+        );
 
         // 验证 tool_ids 中的 ID 被标记为已处理
         assert!(state.is_seen("tool-1"));
