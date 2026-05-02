@@ -1,13 +1,12 @@
-//! 自动记忆提取器
-//!
-//! 后台提取四种类型记忆的核心逻辑。
-
+//! 鑷姩璁板繂鎻愬彇鍣?//!
+//! 鍚庡彴鎻愬彇鍥涚绫诲瀷璁板繂鐨勬牳蹇冮€昏緫銆?
 use super::cursor::ExtractionCursorManager;
 use super::{get_memory_file_path, MemoryType};
 use crate::forked::{
     create_auto_mem_can_use_tool, run_forked_agent, CacheSafeParams, ForkedAgentParams,
 };
 use crate::memory_event;
+use crate::unified_security_scanner::scan_learned_memory_content;
 use blockcell_core::types::ChatMessage;
 use blockcell_providers::ProviderPool;
 use std::path::Path;
@@ -23,9 +22,9 @@ pub struct AutoMemoryConfig {
     pub extraction_cooldown_messages: usize,
     /// 记忆文件最大 token 数
     pub max_memory_file_tokens: usize,
-    /// 提取时间冷却阈值（秒）
+    /// 鎻愬彇鏃堕棿鍐峰嵈闃堝€硷紙绉掞級
     pub extraction_time_cooldown_secs: u64,
-    /// 内容变化阈值（字符数）
+    /// 鍐呭鍙樺寲闃堝€硷紙瀛楃鏁帮級
     pub content_change_threshold: usize,
 }
 
@@ -54,50 +53,50 @@ impl From<blockcell_core::config::Layer5Config> for AutoMemoryConfig {
     }
 }
 
-/// 提取结果
+/// 鎻愬彇缁撴灉
 #[derive(Debug)]
 pub struct ExtractionResult {
-    /// 记忆类型
+    /// 璁板繂绫诲瀷
     pub memory_type: MemoryType,
-    /// 提取成功
+    /// 鎻愬彇鎴愬姛
     pub success: bool,
-    /// 输入 tokens
+    /// 杈撳叆 tokens
     pub input_tokens: usize,
-    /// 输出 tokens
+    /// 杈撳嚭 tokens
     pub output_tokens: usize,
-    /// 错误信息
+    /// 閿欒淇℃伅
     pub error: Option<String>,
-    /// 游标保存是否失败
+    /// 娓告爣淇濆瓨鏄惁澶辫触
     pub cursor_save_failed: bool,
 }
 
-/// 提取参数
+/// 鎻愬彇鍙傛暟
 ///
 /// 封装 `extract` 方法所需的所有参数，避免函数签名过长。
 pub struct ExtractionParams {
     /// LLM Provider 池（必需）
     pub provider_pool: Arc<ProviderPool>,
-    /// 记忆类型
+    /// 璁板繂绫诲瀷
     pub memory_type: MemoryType,
-    /// 系统提示
+    /// 绯荤粺鎻愮ず
     pub system_prompt: Arc<String>,
-    /// 模型名称
+    /// 妯″瀷鍚嶇О
     pub model: String,
-    /// 消息历史
+    /// 娑堟伅鍘嗗彶
     pub messages: Vec<ChatMessage>,
-    /// 最后一条消息的 UUID
+    /// 鏈€鍚庝竴鏉℃秷鎭殑 UUID
     pub last_message_uuid: Uuid,
-    /// 当前消息总数
+    /// 褰撳墠娑堟伅鎬绘暟
     pub message_count: usize,
 }
 
 /// 自动记忆提取器
 pub struct AutoMemoryExtractor {
-    /// 配置目录
+    /// 閰嶇疆鐩綍
     config_dir: std::path::PathBuf,
     /// 游标管理器
     cursor_manager: ExtractionCursorManager,
-    /// 配置
+    /// 閰嶇疆
     config: AutoMemoryConfig,
 }
 
@@ -138,9 +137,9 @@ impl AutoMemoryExtractor {
             .collect()
     }
 
-    /// 执行提取
+    /// 鎵ц鎻愬彇
     ///
-    /// ## 参数
+    /// ## 鍙傛暟
     /// - `params`: 提取参数（参见 `ExtractionParams`）
     pub async fn extract(&mut self, params: ExtractionParams) -> ExtractionResult {
         let ExtractionParams {
@@ -155,19 +154,19 @@ impl AutoMemoryExtractor {
 
         let memory_path = get_memory_file_path(&self.config_dir, memory_type);
 
-        // 读取当前记忆内容
+        // 璇诲彇褰撳墠璁板繂鍐呭
         let current_content = tokio::fs::read_to_string(&memory_path)
             .await
             .unwrap_or_else(|_| memory_type.template().to_string());
 
-        // 构建提取 prompt
+        // 鏋勫缓鎻愬彇 prompt
         let extraction_prompt = build_extraction_prompt(
             memory_type,
             &current_content,
             self.config.max_memory_file_tokens,
         );
 
-        // 创建 CacheSafeParams
+        // 鍒涘缓 CacheSafeParams
         let cache_safe_params = CacheSafeParams {
             system_prompt: system_prompt.clone(),
             model: model.clone(),
@@ -187,7 +186,7 @@ impl AutoMemoryExtractor {
             .skip_transcript(true)
             .build();
 
-        // 如果 builder 失败（理论上不会，因为我们设置了 provider_pool）
+        // 如果 builder 失败（理论上不会，因为已经设置 provider_pool）
         let params = match params {
             Ok(p) => p,
             Err(e) => {
@@ -202,20 +201,18 @@ impl AutoMemoryExtractor {
             }
         };
 
-        // 运行 Forked Agent
+        // 杩愯 Forked Agent
         let result = run_forked_agent(params).await;
 
         match result {
             Ok(forked_result) => {
                 // 安全扫描: 检查写入后的记忆文件内容
                 if let Ok(updated_content) = tokio::fs::read_to_string(&memory_path).await {
-                    let scan_result =
-                        crate::auto_memory::scanner::scan_memory_content(&updated_content);
-                    if let Err(threats) = scan_result {
+                    if let Err(err) = scan_learned_memory_content(&updated_content) {
                         tracing::warn!(
                             memory_type = memory_type.name(),
-                            threat_count = threats.len(),
-                            "[auto_memory] 安全扫描发现威胁, 回滚记忆文件"
+                            error = %err,
+                            "[auto_memory] 瀹夊叏鎵弿鍙戠幇濞佽儊, 鍥炴粴璁板繂鏂囦欢"
                         );
                         // 回滚到提取前的内容
                         let _ = tokio::fs::write(&memory_path, &current_content).await;
@@ -225,16 +222,15 @@ impl AutoMemoryExtractor {
                             input_tokens: forked_result.total_usage.input_tokens as usize,
                             output_tokens: forked_result.total_usage.output_tokens as usize,
                             error: Some(format!(
-                                "安全扫描发现 {} 个威胁, 记忆文件已回滚: {}",
-                                threats.len(),
-                                crate::auto_memory::scanner::format_threats(&threats)
+                                "瀹夊叏鎵弿澶辫触, 璁板繂鏂囦欢宸插洖婊? {}",
+                                err
                             )),
                             cursor_save_failed: false,
                         };
                     }
                 }
 
-                // 更新游标
+                // 鏇存柊娓告爣
                 let mut cursor = self.cursor_manager.get_cursor(memory_type);
                 cursor.update(last_message_uuid, message_count);
                 self.cursor_manager.update_cursor(cursor);
@@ -256,7 +252,7 @@ impl AutoMemoryExtractor {
                     "[auto_memory] extraction completed"
                 );
 
-                // 记录 Layer 5 memory_written 事件
+                // 璁板綍 Layer 5 memory_written 浜嬩欢
                 // 读取写入后的文件内容来获取长度
                 if let Ok(updated_content) = tokio::fs::read_to_string(&memory_path).await {
                     memory_event!(
@@ -302,22 +298,22 @@ impl AutoMemoryExtractor {
     }
 }
 
-/// 收敛规则 + Memory/Skill 边界规则 (参考 Hermes MEMORY_GUIDANCE)
+/// 鏀舵暃瑙勫垯 + Memory/Skill 杈圭晫瑙勫垯 (鍙傝€?Hermes MEMORY_GUIDANCE)
 const EXTRACTION_ENHANCEMENT: &str = r#"
 ## Convergence Rules
-- If nothing has changed since the last extraction, do NOT modify the file — just stop.
+- If nothing has changed since the last extraction, do NOT modify the file 鈥?just stop.
 - Do not duplicate information already present in the file.
 - Do not add trivial or obvious information.
 
 ## Memory vs Skill Boundary
 - Memory stores declarative facts: preferences, environment, conventions, user background.
 - Skill stores procedural knowledge: steps, workflows, pitfalls, how-to guides.
-- "User prefers concise responses" → memory (save here)
-- "Deploy to K8s requires pushing image first" → skill (use `skill_manage action=create`)
-- If you've discovered a new way to do something that involves multiple steps, save it as a skill, NOT as memory.
+- "User prefers concise responses" 鈫?memory (save here)
+- "Deploy to K8s requires pushing image first" 鈫?skill-domain procedural knowledge (do not save here)
+- This extractor is memory-only: do not create, patch, or request skills, and do not write procedural workflows into memory.
 "#;
 
-/// 构建提取 prompt
+/// 鏋勫缓鎻愬彇 prompt
 fn build_extraction_prompt(
     memory_type: MemoryType,
     current_content: &str,
@@ -397,12 +393,10 @@ mod tests {
     fn test_should_extract_auto_memory() {
         let manager = ExtractionCursorManager::new(Path::new("/config"));
 
-        // 消息数不足
-        let types = should_extract_auto_memory(&manager, 5);
+        // 娑堟伅鏁颁笉瓒?        let types = should_extract_auto_memory(&manager, 5);
         assert!(types.is_empty());
 
-        // 消息数足够
-        let types = should_extract_auto_memory(&manager, 15);
+        // 娑堟伅鏁拌冻澶?        let types = should_extract_auto_memory(&manager, 15);
         assert!(!types.is_empty());
         assert!(types.contains(&MemoryType::User));
     }

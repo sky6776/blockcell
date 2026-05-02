@@ -13,6 +13,9 @@ pub mod ghost_recall;
 pub mod health;
 pub mod history_projector;
 pub mod intent;
+pub mod learning_coordinator;
+pub mod learning_dedup;
+pub mod learning_throttle;
 pub mod memory_adapter;
 pub mod memory_file_store;
 pub mod memory_system;
@@ -34,6 +37,8 @@ pub mod system_event_orchestrator;
 pub mod system_event_store;
 pub mod task_manager;
 pub(crate) mod token;
+pub mod unified_security_scanner;
+pub mod write_guard;
 
 pub use auto_memory::{
     get_memory_dir, get_memory_file_path, should_extract_auto_memory,
@@ -65,6 +70,11 @@ pub use ghost_metrics::{
 };
 pub use health::HealthChecker;
 pub use intent::{IntentCategory, IntentClassifier};
+pub use learning_coordinator::{
+    LearningAction, LearningCoordinator, MemoryTrigger, ReviewMode, SkillTrigger,
+};
+pub use learning_dedup::LearningDedup;
+pub use learning_throttle::LearningThrottle;
 pub use memory_adapter::MemoryStoreAdapter;
 pub use memory_file_store::{
     MemoryFileMutation, MemoryFileSnapshot, MemoryFileStore, MemoryFileTarget,
@@ -83,3 +93,8 @@ pub use session_memory::{
 };
 pub use skill_file_store::{SkillFileMutation, SkillFileStore};
 pub use task_manager::TaskManager;
+pub use unified_security_scanner::{
+    scan_learned_memory_content, scan_learned_skill_content, scan_learned_skill_dir,
+    UnifiedSecurityScanner,
+};
+pub use write_guard::{WriteGuard, WriteGuardError, WriteGuardRAII, WriteTarget};

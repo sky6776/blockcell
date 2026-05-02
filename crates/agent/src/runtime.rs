@@ -1784,10 +1784,13 @@ pub struct AgentRuntime {
     /// Flag to signal that memory injector cache needs refresh after Layer 5 extraction.
     /// Uses Arc<AtomicBool> because background tasks need to set this flag.
     memory_injector_needs_reload: Arc<std::sync::atomic::AtomicBool>,
-    /// Skill Nudge 引擎 — 跟踪工具使用次数并在阈值到达时触发 Skill Review
-    skill_nudge_engine: crate::skill_nudge::SkillNudgeEngine,
+    /// Unified learning coordinator — replaces scattered skill_nudge_engine + ghost_policy calls
+    learning_coordinator: Arc<crate::learning_coordinator::LearningCoordinator>,
     /// Skill 操作互斥锁 — 防止 Skill 并发修改冲突
+    #[allow(deprecated)]
     skill_mutex: crate::skill_mutex::SkillMutex,
+    /// Unified write guard for coordinated write protection across memory + skill files
+    write_guard: Arc<crate::write_guard::WriteGuard>,
 }
 
 impl AgentRuntime {
@@ -1845,6 +1848,14 @@ impl AgentRuntime {
         let response_cache_config =
             crate::response_cache::ResponseCacheConfig::from(&config.memory.memory_system.layer1);
 
+        // Extract config values before config is moved into Self
+        let ghost_learning_enabled = config.agents.ghost.learning.enabled;
+        let self_improve_review_enabled = config.self_improve.review.enabled;
+        let ghost_learning_config = config.agents.ghost.learning.clone();
+
+        // Create unified write guard for coordinated write protection
+        let write_guard = Arc::new(crate::write_guard::WriteGuard::new(paths.base.clone()));
+
         Ok(Self {
             config,
             paths,
@@ -1878,8 +1889,24 @@ impl AgentRuntime {
             ),
             memory_system: None,
             memory_injector_needs_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            skill_nudge_engine: crate::skill_nudge::SkillNudgeEngine::new(nudge_config),
+            learning_coordinator: Arc::new({
+                let nudge_engine = crate::skill_nudge::SkillNudgeEngine::new(nudge_config);
+                let ghost_policy =
+                    crate::ghost_learning::GhostLearningPolicy::from_config(&ghost_learning_config);
+                let throttle = crate::learning_throttle::LearningThrottle::new(2, 300);
+                let dedup = crate::learning_dedup::LearningDedup::new(600);
+                crate::learning_coordinator::LearningCoordinator::new(
+                    nudge_engine,
+                    ghost_policy,
+                    throttle,
+                    dedup,
+                    ghost_learning_enabled,
+                    self_improve_review_enabled,
+                )
+            }),
+            #[allow(deprecated)]
             skill_mutex: crate::skill_mutex::SkillMutex::new(),
+            write_guard,
         })
     }
 
@@ -2284,13 +2311,15 @@ impl AgentRuntime {
     }
 
     pub fn init_memory_file_store(&mut self) -> Result<()> {
-        let store = MemoryFileStore::open(&self.paths)?;
+        let mut store = MemoryFileStore::open(&self.paths)?;
+        store.set_write_guard(Arc::clone(&self.write_guard));
         self.memory_file_store = Some(Arc::new(store));
         Ok(())
     }
 
     pub fn init_skill_file_store(&mut self) -> Result<()> {
-        let store = SkillFileStore::open(&self.paths)?;
+        let mut store = SkillFileStore::open(&self.paths)?;
+        store.set_write_guard(Arc::clone(&self.write_guard));
         self.skill_file_store = Some(Arc::new(store));
         Ok(())
     }
@@ -2330,6 +2359,7 @@ impl AgentRuntime {
         let outbound_tx = self.outbound_tx.clone();
         // 共享 skill_index_summary Arc, 供后台 Review 完成后刷新
         let skill_index_cache = self.context_builder.skill_index_summary_arc();
+        let learning_coordinator = Arc::clone(&self.learning_coordinator);
 
         tokio::spawn(async move {
             // 构建 Skill 索引（仅在 Skill/Combined 模式下需要）
@@ -2474,6 +2504,8 @@ impl AgentRuntime {
                     tracing::warn!(mode = ?mode_clone, error = %e, "[Nudge] Review 失败");
                 }
             }
+            // Mark review as completed for throttle tracking
+            learning_coordinator.review_completed();
         });
     }
 
@@ -2753,7 +2785,17 @@ impl AgentRuntime {
         boundary: GhostLearningBoundary,
         sources: Vec<GhostEpisodeSource>,
     ) -> Result<Option<String>> {
-        persist_ghost_learning_boundary_with_config(&self.config, &self.paths, boundary, sources)
+        if !self.ghost_learning_enabled() {
+            return Ok(None);
+        }
+        let decision = self.learning_coordinator.ghost_decide(&boundary);
+        persist_ghost_learning_boundary_with_decision(
+            &self.config,
+            &self.paths,
+            boundary,
+            sources,
+            decision,
+        )
     }
 
     fn detect_correction_signal_count(user_text: &str) -> u32 {
@@ -3189,7 +3231,11 @@ impl AgentRuntime {
             permissions: blockcell_core::types::PermissionSet::new(),
             task_manager: None,
             memory_store: None,
-            memory_file_store: Some(Arc::new(MemoryFileStore::open(&self.paths)?)),
+            memory_file_store: Some({
+                let mut mfs = MemoryFileStore::open(&self.paths)?;
+                mfs.set_write_guard(Arc::clone(&self.write_guard));
+                Arc::new(mfs)
+            }),
             ghost_memory_lifecycle: self.ghost_memory_lifecycle.clone().map(|manager| {
                 manager as Arc<dyn blockcell_tools::GhostMemoryLifecycleOps + Send + Sync>
             }),
@@ -4345,10 +4391,10 @@ impl AgentRuntime {
             manager.on_turn_start(turn_number, &msg.content, &session_key);
         }
 
-        // Skill Nudge: 记录一次用户轮次 (Memory nudge 基于用户轮次, 不是工具迭代)
-        // 与 Hermes 一致: 仅真实用户消息递增计数器, cron/system/heartbeat 等内部消息不计
+        // Learning Coordinator: record user turn (replaces skill_nudge_engine.record_user_turn)
+        // Only real user messages increment counters (not cron/system/heartbeat)
         if msg.channel != "system" && msg.channel != "cron" {
-            self.skill_nudge_engine.record_user_turn();
+            self.learning_coordinator.on_turn_start(true);
         }
 
         // ── Refresh memory injector cache if Layer 5 extraction completed ──
@@ -5024,25 +5070,23 @@ impl AgentRuntime {
         let mut deferred_review_mode: Option<ReviewMode> = None;
         let mut deferred_review_snapshot: Vec<ChatMessage> = Vec::new();
 
-        // Memory Nudge: 在 LLM 循环前检查 (与 Hermes 一致: 在 run_conversation 开头检查)
-        // Memory nudge 基于用户轮次，不应在工具迭代中重复触发
+        // Memory Nudge: check before LLM loop (replaces skill_nudge_engine.check_memory_nudge)
+        // Memory nudge is based on user turns, not tool iterations
         {
-            let memory_nudge = self.skill_nudge_engine.check_memory_nudge();
             let has_memory_store = self.memory_store.is_some();
-            let memory_due =
-                memory_nudge != crate::skill_nudge::NudgeResult::NoNudge && has_memory_store;
-            if memory_due {
+            if let Some(_memory_trigger) = self
+                .learning_coordinator
+                .check_memory_nudge(has_memory_store)
+            {
                 deferred_review_mode = Some(ReviewMode::Memory);
                 deferred_review_snapshot = current_messages.clone();
-                self.skill_nudge_engine.reset_memory();
             }
         }
 
         loop {
             debug!(iteration = ?tool_call_counts, "LLM call iteration");
-            // Skill Nudge: 每次迭代 (一次 LLM 调用 + 工具执行) 递增计数器
-            // 参考 Hermes _iters_since_skill 语义: 每轮 iteration 递增 1, 不是每次 tool call
-            self.skill_nudge_engine.record_iteration();
+            // Learning Coordinator: record iteration (replaces skill_nudge_engine.record_iteration)
+            self.learning_coordinator.record_iteration();
 
             debug!(
                 iteration = ?tool_call_counts,
@@ -5561,24 +5605,22 @@ impl AgentRuntime {
                     }
                 }
 
-                // Nudge: 每次迭代结束后检查 Skill nudge (与 Hermes 一致: 每轮迭代检查一次)
-                // Memory nudge 已在 LLM 循环前检查 (与 Hermes 一致: 在 run_conversation 开头)
-                let skill_nudge = self.skill_nudge_engine.check_skill_nudge();
+                // Skill Nudge: check after each iteration (replaces skill_nudge_engine.check_skill_nudge)
+                // If memory nudge already triggered, upgrade to Combined
                 let has_skill_tool = self.tool_registry.get("skill_manage").is_some();
-                let skill_due =
-                    skill_nudge != crate::skill_nudge::NudgeResult::NoNudge && has_skill_tool;
-
-                if skill_due {
-                    // 如果 Memory nudge 也已触发，升级为 Combined (与 Hermes 一致)
+                let existing_memory = matches!(deferred_review_mode, Some(ReviewMode::Memory));
+                if let Some(_skill_trigger) = self
+                    .learning_coordinator
+                    .check_skill_nudge(has_skill_tool, existing_memory)
+                {
                     if matches!(deferred_review_mode, Some(ReviewMode::Memory)) {
                         deferred_review_mode = Some(ReviewMode::Combined);
-                        // 使用最新的 messages snapshot (迭代中的消息更新)
+                        // Use latest messages snapshot (updated during iteration)
                         deferred_review_snapshot = current_messages.clone();
                     } else if deferred_review_mode.is_none() {
                         deferred_review_mode = Some(ReviewMode::Skill);
                         deferred_review_snapshot = current_messages.clone();
                     }
-                    self.skill_nudge_engine.reset_skill();
                 }
 
                 if !over_iteration && !short_circuit_after_tools {
@@ -5651,12 +5693,12 @@ impl AgentRuntime {
             }
         }
 
-        // ── 延迟后台 Review (与 Hermes 一致: 在响应发送后触发) ──
-        // 与 Hermes 一致: 只在有完整响应时才触发后台审查
-        // Hermes: `if final_response and not interrupted`
+        // Deferred background Review (after response sent)
+        // Only trigger when there's a complete response
         if !final_response.is_empty() {
             if let Some(mode) = deferred_review_mode.take() {
-                if self.config.self_improve.review.enabled {
+                if self.learning_coordinator.is_self_improve_enabled() {
+                    self.learning_coordinator.review_started();
                     let notify = Some((msg.channel.clone(), msg.chat_id.clone()));
                     self.spawn_review(mode, deferred_review_snapshot, notify);
                 }
@@ -6596,12 +6638,12 @@ impl AgentRuntime {
             "memory_upsert" | "memory_forget" | "auto_memory"
         );
 
-        // Skill/Memory 写操作工具使用时重置对应计数器
+        // Skill/Memory write tools reset corresponding counters via learning coordinator
         if is_skill_write_tool {
-            self.skill_nudge_engine.reset_skill();
+            self.learning_coordinator.reset_skill();
         }
         if is_memory_write_tool {
-            self.skill_nudge_engine.reset_memory();
+            self.learning_coordinator.reset_memory();
         }
 
         // Layer 4: Track file reads for Post-Compact recovery
@@ -8599,17 +8641,6 @@ mod tests {
                             }),
                             thought_signature: None,
                         },
-                        ToolCallRequest {
-                            id: "review-release-skill".to_string(),
-                            name: "skill_manage".to_string(),
-                            arguments: serde_json::json!({
-                                "action": "create",
-                                "name": "release_verification",
-                                "description": "Release verification workflow",
-                                "content": "Confirm rollback plan before release verification. Prefer canary-first rollout when applicable."
-                            }),
-                            thought_signature: None,
-                        },
                     ]
                 } else {
                     Vec::new()
@@ -8949,6 +8980,7 @@ mod tests {
             event_emitter: Some(Arc::new(NoopEmitter)),
             channel_contacts_file: None,
             response_cache: None,
+            #[allow(deprecated)]
             skill_mutex: Some(Arc::new(crate::skill_mutex::SkillMutex::new())
                 as blockcell_tools::SkillMutexHandle),
         };
@@ -10654,7 +10686,7 @@ description: local demo
     }
 
     #[tokio::test]
-    async fn ghost_learning_closes_loop_from_experience_to_file_memory() {
+    async fn ghost_learning_closes_loop_from_experience_to_file_memory_only() {
         let provider = Arc::new(ReviewAndCaptureProvider {
             calls: Mutex::new(Vec::new()),
             review_calls: AtomicUsize::new(0),
@@ -10682,38 +10714,16 @@ description: local demo
         let durable_memory = std::fs::read_to_string(paths.memory_md()).expect("read MEMORY.md");
         assert!(user_memory.contains("canary-first rollout"));
         assert!(durable_memory.contains("Confirm rollback plan before release verification"));
-        let learned_skill = std::fs::read_to_string(
-            paths
-                .skills_dir()
-                .join("release_verification")
-                .join("SKILL.md"),
-        )
-        .expect("read learned skill");
-        assert!(learned_skill.contains("Prefer canary-first rollout"));
+        assert!(!paths
+            .skills_dir()
+            .join("release_verification")
+            .join("SKILL.md")
+            .exists());
 
         let ledger = GhostLedger::open(&paths.ghost_ledger_db()).expect("open ghost ledger");
         assert_eq!(ledger.review_run_count().unwrap(), 1);
 
-        runtime
-            .process_message(InboundMessage {
-                channel: "cli".to_string(),
-                account_id: None,
-                sender_id: "user".to_string(),
-                chat_id: "ghost-closure".to_string(),
-                content: "run release verification again".to_string(),
-                media: vec![],
-                metadata: serde_json::Value::Null,
-                timestamp_ms: chrono::Utc::now().timestamp_millis(),
-            })
-            .await
-            .unwrap();
-
-        let calls = provider.calls.lock().unwrap().clone();
-        let next_turn = calls.last().expect("next turn LLM call");
-        let system_prompt = next_turn.first().map(chat_message_text).unwrap_or_default();
-        assert!(system_prompt.contains("## Installed Skills"));
-        assert!(system_prompt.contains("release_verification"));
-        assert!(system_prompt.contains("skill_view"));
+        assert_eq!(provider.review_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

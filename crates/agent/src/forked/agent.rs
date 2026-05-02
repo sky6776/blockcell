@@ -14,6 +14,7 @@ use super::{
     create_subagent_context, CacheSafeParams, CanUseToolFn, SubagentOverrides, ToolPermission,
 };
 use crate::memory_event;
+#[allow(deprecated)]
 use crate::skill_mutex::SkillMutex;
 use blockcell_core::types::ChatMessage;
 use blockcell_providers::ProviderPool;
@@ -58,6 +59,7 @@ const PROVIDER_RETRY_MAX_DELAY_MS: u64 = 2000;
 /// ```
 ///
 /// **警告**: 如果 `provider_pool` 为 `None`，`run_forked_agent` 会返回 `NoProviderAvailable` 错误。
+#[allow(deprecated)]
 pub struct ForkedAgentParams {
     /// 子代理查询循环的初始消息
     pub prompt_messages: Vec<ChatMessage>,
@@ -149,6 +151,7 @@ impl ForkedAgentParams {
     }
 
     /// 设置 skill_mutex（共享父代理的 SkillMutex，防止并发修改）
+    #[allow(deprecated)]
     pub fn with_skill_mutex(mut self, mutex: Arc<SkillMutex>) -> Self {
         self.skill_mutex = Some(mutex);
         self
@@ -229,6 +232,7 @@ impl ForkedAgentParams {
 /// ForkedAgentParams Builder
 ///
 /// 用于链式构建 ForkedAgentParams，`build()` 会验证必需参数。
+#[allow(deprecated)]
 #[derive(Default)]
 pub struct ForkedAgentParamsBuilder {
     prompt_messages: Vec<ChatMessage>,
@@ -598,7 +602,7 @@ fn find_skill_dir_forked(
 /// - memory_forget: 删除记忆项（需要 memory_store）
 ///
 /// 其他工具会返回错误。
-#[allow(clippy::too_many_arguments)]
+#[allow(deprecated, clippy::too_many_arguments)]
 async fn execute_forked_tool(
     tool_name: &str,
     input: &serde_json::Value,

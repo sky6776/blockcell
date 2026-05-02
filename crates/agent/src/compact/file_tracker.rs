@@ -1,20 +1,18 @@
-//! 文件追踪器
-//!
-//! 追踪会话中读取的文件，用于 Post-Compact 恢复。
-
+﻿//! 鏂囦欢杩借釜鍣?//!
+//! 杩借釜浼氳瘽涓鍙栫殑鏂囦欢锛岀敤浜?Post-Compact 鎭㈠銆?
 use crate::token::estimate_tokens;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
-/// 文件追踪记录
+/// 鏂囦欢杩借釜璁板綍
 #[derive(Debug, Clone)]
 pub struct FileRecord {
-    /// 文件路径
+    /// 鏂囦欢璺緞
     pub path: PathBuf,
-    /// 读取时间
+    /// 璇诲彇鏃堕棿
     pub read_at: Instant,
-    /// 内容摘要（前 N 个字符）
+    /// 鍐呭鎽樿锛堝墠 N 涓瓧绗︼級
     pub summary: String,
     /// 估算 token 数
     pub estimated_tokens: usize,
@@ -34,11 +32,11 @@ impl FileTracker {
     pub fn new() -> Self {
         Self {
             records: HashMap::new(),
-            max_summary_chars: 2000, // 约 500 tokens
+            max_summary_chars: 2000, // 绾?500 tokens
         }
     }
 
-    /// 创建带自定义摘要长度限制的文件追踪器
+    /// 鍒涘缓甯﹁嚜瀹氫箟鎽樿闀垮害闄愬埗鐨勬枃浠惰拷韪櫒
     pub fn with_config(max_summary_chars: usize) -> Self {
         Self {
             records: HashMap::new(),
@@ -46,10 +44,9 @@ impl FileTracker {
         }
     }
 
-    /// 记录文件读取
+    /// 璁板綍鏂囦欢璇诲彇
     pub fn record_read(&mut self, path: PathBuf, content: &str) {
         let summary = self.truncate_summary(content);
-
         let estimated_tokens = estimate_tokens(content);
 
         self.records.insert(
@@ -69,19 +66,19 @@ impl FileTracker {
             return content.to_string();
         }
 
-        // 找到安全的 UTF-8 字符边界，避免在多字节字符中间截断导致 panic
+        // 鎵惧埌瀹夊叏鐨?UTF-8 瀛楃杈圭晫锛岄伩鍏嶅湪澶氬瓧鑺傚瓧绗︿腑闂存埅鏂鑷?panic
         let mut boundary = self.max_summary_chars;
         while boundary > 0 && !content.is_char_boundary(boundary) {
             boundary -= 1;
         }
 
-        // 边界情况：如果 boundary 为 0，找到第一个有效字符
-        // 这确保至少保留第一个字符，避免返回空前缀
+        // 边界情况：如果 boundary 为 0，找到第一个有效字符。
+        // 这确保至少保留第一个字符，避免返回空前缀。
         if boundary == 0 {
             if let Some(first_char) = content.chars().next() {
                 boundary = first_char.len_utf8();
             } else {
-                // 内容为空（不应该发生，因为前面已检查长度）
+                // 鍐呭涓虹┖锛堜笉搴旇鍙戠敓锛屽洜涓哄墠闈㈠凡妫€鏌ラ暱搴︼級
                 return content.to_string();
             }
         }
@@ -111,17 +108,17 @@ impl FileTracker {
         &self.records
     }
 
-    /// 清空记录
+    /// 娓呯┖璁板綍
     pub fn clear(&mut self) {
         self.records.clear();
     }
 
-    /// 记录数量
+    /// 璁板綍鏁伴噺
     pub fn len(&self) -> usize {
         self.records.len()
     }
 
-    /// 是否为空
+    /// 鏄惁涓虹┖
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
@@ -169,15 +166,14 @@ mod tests {
     fn test_file_tracker_summary_truncation() {
         let mut tracker = FileTracker::new();
 
-        // 创建超长内容
+        // 鍒涘缓瓒呴暱鍐呭
         let long_content = "x".repeat(5000);
         tracker.record_read(PathBuf::from("/long_file.rs"), &long_content);
 
         let records = tracker.all_records();
         let record = records.get(&PathBuf::from("/long_file.rs")).unwrap();
 
-        // 摘要应该被截断
-        assert!(record.summary.len() <= 2100); // 2000 + "...[content truncated]"
+        // 鎽樿搴旇琚埅鏂?        assert!(record.summary.len() <= 2100); // 2000 + "...[content truncated]"
         assert!(record.summary.contains("[content truncated]"));
     }
 
@@ -185,12 +181,11 @@ mod tests {
     fn test_file_tracker_update_existing() {
         let mut tracker = FileTracker::new();
 
-        // 记录同一文件两次
+        // 璁板綍鍚屼竴鏂囦欢涓ゆ
         tracker.record_read(PathBuf::from("/file.rs"), "content 1");
         tracker.record_read(PathBuf::from("/file.rs"), "content 2 updated");
 
-        // 应该只有一条记录
-        assert_eq!(tracker.len(), 1);
+        // 搴旇鍙湁涓€鏉¤褰?        assert_eq!(tracker.len(), 1);
 
         let records = tracker.all_records();
         let record = records.get(&PathBuf::from("/file.rs")).unwrap();
@@ -231,8 +226,7 @@ mod tests {
     fn test_file_tracker_recent_order() {
         let mut tracker = FileTracker::new();
 
-        // 按顺序记录文件
-        tracker.record_read(PathBuf::from("/first.rs"), "first");
+        // 鎸夐『搴忚褰曟枃浠?        tracker.record_read(PathBuf::from("/first.rs"), "first");
         std::thread::sleep(std::time::Duration::from_millis(10));
         tracker.record_read(PathBuf::from("/second.rs"), "second");
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -240,43 +234,37 @@ mod tests {
 
         let recent = tracker.get_recent_files(10, 5000);
 
-        // 最近记录的应该在前面
-        assert_eq!(recent[0].path, PathBuf::from("/third.rs"));
+        // 鏈€杩戣褰曠殑搴旇鍦ㄥ墠闈?        assert_eq!(recent[0].path, PathBuf::from("/third.rs"));
         assert_eq!(recent[1].path, PathBuf::from("/second.rs"));
         assert_eq!(recent[2].path, PathBuf::from("/first.rs"));
     }
 
     #[test]
     fn test_file_tracker_chinese_text_truncation() {
-        // Bug #70: 中文字符在 UTF-8 中占 3 字节，字节索引 2000 可能落在字符中间导致 panic
+        // Bug #70: 涓枃瀛楃鍦?UTF-8 涓崰 3 瀛楄妭锛屽瓧鑺傜储寮?2000 鍙兘钀藉湪瀛楃涓棿瀵艰嚧 panic
         let mut tracker = FileTracker::new();
 
-        // 构造超过 2000 字节的中文内容（每个中文字符 3 字节）
-        let chinese_content = "你好世界".repeat(200); // 4*3*200 = 2400 字节
+        // 鏋勯€犺秴杩?2000 瀛楄妭鐨勪腑鏂囧唴瀹癸紙姣忎釜涓枃瀛楃 3 瀛楄妭锛?        let chinese_content = "浣犲ソ涓栫晫".repeat(200); // 4*3*200 = 2400 瀛楄妭
         assert!(chinese_content.len() > 2000);
 
-        // 不应 panic
+        // 涓嶅簲 panic
         tracker.record_read(PathBuf::from("/chinese.md"), &chinese_content);
 
         let records = tracker.all_records();
         let record = records.get(&PathBuf::from("/chinese.md")).unwrap();
 
-        // 摘要应被截断且包含截断标记
-        assert!(record.summary.contains("[content truncated]"));
-        // 截断后的内容必须是有效的 UTF-8（不会 panic 说明已通过）
-        let _ = record.summary.chars().count();
+        // 鎽樿搴旇鎴柇涓斿寘鍚埅鏂爣璁?        assert!(record.summary.contains("[content truncated]"));
+        // 鎴柇鍚庣殑鍐呭蹇呴』鏄湁鏁堢殑 UTF-8锛堜笉浼?panic 璇存槑宸查€氳繃锛?        let _ = record.summary.chars().count();
     }
 
     #[test]
     fn test_file_tracker_mixed_text_truncation() {
-        // 混合 ASCII + 中文 + emoji 的截断测试
-        let mut tracker = FileTracker::new();
+        // 娣峰悎 ASCII + 涓枃 + emoji 鐨勬埅鏂祴璇?        let mut tracker = FileTracker::new();
 
         let mut mixed = String::new();
-        // 构造恰好使字节 2000 落在多字节字符中间的内容
-        mixed.push_str(&"a".repeat(1999)); // 1999 字节 ASCII
+        // 鏋勯€犳伆濂戒娇瀛楄妭 2000 钀藉湪澶氬瓧鑺傚瓧绗︿腑闂寸殑鍐呭
+        mixed.push_str(&"a".repeat(1999)); // 1999 瀛楄妭 ASCII
         mixed.push('假'); // 3 字节中文，总 2002 字节
-        mixed.push_str(&"b".repeat(100)); // 追加更多
 
         tracker.record_read(PathBuf::from("/mixed.txt"), &mixed);
 
