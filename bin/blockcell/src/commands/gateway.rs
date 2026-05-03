@@ -1,8 +1,8 @@
 use anyhow::Context;
 use blockcell_agent::{
     AgentRuntime, CapabilityRegistryAdapter, CheckpointManager, ConfirmRequest,
-    MemoryStoreAdapter, MessageBus, ProviderLLMBridge, ResponseCacheConfig, TaskManager,
-    CoreEvolutionAdapter,
+    CoreEvolutionAdapter, MemoryStoreAdapter, MessageBus, ProviderLLMBridge, ResponseCacheConfig,
+    TaskManager,
 };
 #[cfg(feature = "dingtalk")]
 use blockcell_channels::dingtalk::DingTalkChannel;

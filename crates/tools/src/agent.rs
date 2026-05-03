@@ -154,7 +154,7 @@ Run in background, return task_id for progress tracking via /tasks command.",
         // 实际查询 TaskManager 获取真实状态
         if !parsed.force {
             if let Some(ref tm) = ctx.task_manager {
-                let running_tasks = tm.list_tasks_json(Some("Running".to_string())).await;
+                let running_tasks = tm.list_tasks_json(Some("running".to_string())).await;
                 if let Some(tasks_array) = running_tasks.as_array() {
                     // 查找同 agent_type 的 Running 任务
                     let same_type_running: Vec<_> = tasks_array

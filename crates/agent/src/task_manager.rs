@@ -1180,6 +1180,8 @@ impl TaskManagerOps for TaskManager {
                     "result": t.result,
                     "error": t.error,
                     "agent_id": t.agent_id,
+                    "agent_type": t.agent_type,
+                    "one_shot": t.one_shot,
                 })
             })
             .collect();
@@ -1202,6 +1204,8 @@ impl TaskManagerOps for TaskManager {
                 "origin_channel": t.origin_channel,
                 "origin_chat_id": t.origin_chat_id,
                 "agent_id": t.agent_id,
+                "agent_type": t.agent_type,
+                "one_shot": t.one_shot,
             })
         })
     }
@@ -1250,6 +1254,36 @@ mod tests {
         let tasks = manager.list_tasks(None).await;
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].agent_id.as_deref(), Some("ops"));
+    }
+
+    #[tokio::test]
+    async fn test_task_manager_json_exposes_agent_type_for_duplicate_checks() {
+        let manager = TaskManager::new();
+        manager
+            .create_and_start_task(
+                "task-typed",
+                "explore",
+                "inspect code",
+                "cli",
+                "chat-1",
+                Some("ops"),
+                false,
+                Some("explore"),
+                true,
+            )
+            .await;
+
+        let json = TaskManagerOps::list_tasks_json(&manager, Some("running".to_string())).await;
+        let items = json.as_array().expect("task json array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].get("agent_type").and_then(|v| v.as_str()),
+            Some("explore")
+        );
+        assert_eq!(
+            items[0].get("one_shot").and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     #[derive(Clone, Default)]

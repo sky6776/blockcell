@@ -441,11 +441,8 @@ pub async fn extract_auto_memory(
         .unwrap_or_else(|_| memory_type.template().to_string());
 
     // 构建 prompt
-    let extraction_prompt = build_extraction_prompt(
-        memory_type,
-        &current_content,
-        MAX_MEMORY_FILE_TOKENS,
-    );
+    let extraction_prompt =
+        build_extraction_prompt(memory_type, &current_content, MAX_MEMORY_FILE_TOKENS);
 
     // 创建 CacheSafeParams
     let cache_safe_params = CacheSafeParams {

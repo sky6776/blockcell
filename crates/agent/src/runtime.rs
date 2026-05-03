@@ -10927,6 +10927,8 @@ mod tests {
             event_emitter: Some(Arc::new(NoopEmitter)),
             channel_contacts_file: None,
             response_cache: None,
+            runtime_handle: None,
+            agent_identity: None,
             #[allow(deprecated)]
             skill_mutex: Some(Arc::new(crate::skill_mutex::SkillMutex::new())
                 as blockcell_tools::SkillMutexHandle),

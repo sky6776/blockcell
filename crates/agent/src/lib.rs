@@ -110,8 +110,8 @@ pub use session_memory::{
     wait_for_session_memory_extraction_with_timeout, Section, SectionPriority, SessionMemoryConfig,
     SessionMemoryState, DEFAULT_SESSION_MEMORY_TEMPLATE,
 };
-pub use task_manager::{TaskManager, TaskStatus};
 pub use skill_file_store::{SkillFileMutation, SkillFileStore};
+pub use task_manager::{TaskManager, TaskStatus};
 pub use unified_security_scanner::{
     scan_learned_memory_content, scan_learned_skill_content, scan_learned_skill_dir,
     UnifiedSecurityScanner,

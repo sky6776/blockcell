@@ -601,6 +601,51 @@ fn validate_path_safety(path: &str) -> Result<(), ForkedAgentError> {
     Ok(())
 }
 
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn resolve_forked_path(
+    input_path: &str,
+    working_dir: &Option<PathBuf>,
+) -> Result<PathBuf, ForkedAgentError> {
+    validate_path_safety(input_path)?;
+
+    let path = Path::new(input_path);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(base) = working_dir {
+        base.join(path)
+    } else {
+        path.to_path_buf()
+    };
+
+    if let Some(base) = working_dir {
+        let base = normalize_path_lexically(base);
+        let resolved = normalize_path_lexically(&resolved);
+        if !resolved.starts_with(&base) {
+            return Err(ForkedAgentError::ToolError(format!(
+                "Path '{}' is outside isolated working directory '{}'",
+                input_path,
+                base.display()
+            )));
+        }
+        return Ok(resolved);
+    }
+
+    Ok(resolved)
+}
+
 /// 验证编辑内容安全性
 ///
 /// 检查：
@@ -719,17 +764,6 @@ async fn execute_forked_tool(
     }
 
     // 辅助函数: 解析文件路径 (相对于 working_dir，用于 worktree 隔离)
-    let resolve_path = |p: &str| -> PathBuf {
-        let path = Path::new(p);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else if let Some(ref base) = working_dir {
-            base.join(p)
-        } else {
-            path.to_path_buf()
-        }
-    };
-
     // 首先检查权限
     match can_use_tool(tool_name, input) {
         ToolPermission::Allow => {}
@@ -781,10 +815,7 @@ async fn execute_forked_tool(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| ForkedAgentError::ToolError("Missing file_path parameter".to_string()))?;
 
-            // 二次路径验证（fail-safe）
-            validate_path_safety(file_path)?;
-
-            let resolved = resolve_path(file_path);
+            let resolved = resolve_forked_path(file_path, working_dir)?;
 
             // 检查文件大小
             let metadata = tokio::fs::metadata(&resolved).await
@@ -822,10 +853,7 @@ async fn execute_forked_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or(".");
 
-            // 二次路径验证（fail-safe）
-            validate_path_safety(dir_path)?;
-
-            let base_path = resolve_path(dir_path);
+            let base_path = resolve_forked_path(dir_path, working_dir)?;
             let mut entries = Vec::new();
 
             match tokio::fs::read_dir(&base_path).await {
@@ -869,13 +897,10 @@ async fn execute_forked_tool(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| ForkedAgentError::ToolError("Missing new_string parameter".to_string()))?;
 
-            // 二次路径验证（fail-safe）
-            validate_path_safety(file_path)?;
-
             // 验证编辑内容安全性
             validate_edit_content(old_string, new_string, MAX_EDIT_SIZE)?;
 
-            let resolved = resolve_path(file_path);
+            let resolved = resolve_forked_path(file_path, working_dir)?;
 
             // 读取文件
             let content = tokio::fs::read_to_string(&resolved)
@@ -923,9 +948,6 @@ async fn execute_forked_tool(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| ForkedAgentError::ToolError("Missing content parameter".to_string()))?;
 
-            // 二次路径验证（fail-safe）
-            validate_path_safety(file_path)?;
-
             // 检查内容大小
             if content.len() > MAX_FILE_SIZE {
                 return Err(ForkedAgentError::ToolError(format!(
@@ -934,7 +956,7 @@ async fn execute_forked_tool(
                 )));
             }
 
-            let resolved = resolve_path(file_path);
+            let resolved = resolve_forked_path(file_path, working_dir)?;
 
             // 确保父目录存在（create_dir_all 会处理已存在的情况）
             if let Some(parent) = resolved.parent() {
@@ -960,10 +982,7 @@ async fn execute_forked_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or(".");
 
-            // 二次路径验证（fail-safe）
-            validate_path_safety(path)?;
-
-            let resolved = resolve_path(path);
+            let resolved = resolve_forked_path(path, working_dir)?;
 
             // 简化版 grep - 只搜索单个文件
             let content = tokio::fs::read_to_string(&resolved)
@@ -992,11 +1011,8 @@ async fn execute_forked_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or(".");
 
-            // 二次路径验证（fail-safe）
-            validate_path_safety(path)?;
-
             // 简化版 glob - 只支持基本模式
-            let base_path = resolve_path(path);
+            let base_path = resolve_forked_path(path, working_dir)?;
             let mut results = Vec::new();
 
             // 使用 tokio 异步读取目录
@@ -2884,5 +2900,28 @@ mod tests {
         assert!(simple_glob_match("test*", "testing"));
         assert!(!simple_glob_match("*.rs", "main.txt"));
         assert!(simple_glob_match("exact", "exact"));
+    }
+
+    #[test]
+    fn test_resolve_forked_path_keeps_relative_paths_inside_worktree() {
+        let base = std::env::temp_dir().join("blockcell-agent-wt");
+        let worktree = Some(base.clone());
+        let resolved = resolve_forked_path("src/main.rs", &worktree).unwrap();
+        assert_eq!(resolved, base.join("src").join("main.rs"));
+    }
+
+    #[test]
+    fn test_resolve_forked_path_rejects_absolute_path_outside_worktree() {
+        let temp = std::env::temp_dir();
+        let worktree = Some(temp.join("blockcell-agent-wt"));
+        let outside = temp
+            .join("blockcell-original-workspace")
+            .join("src")
+            .join("main.rs");
+        let err = resolve_forked_path(&outside.to_string_lossy(), &worktree)
+            .expect_err("absolute path outside worktree must be rejected");
+        assert!(err
+            .to_string()
+            .contains("outside isolated working directory"));
     }
 }
