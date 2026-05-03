@@ -77,10 +77,24 @@ impl MemoryInjector {
     pub async fn load_memories(&mut self, memory_dir: &Path) -> std::io::Result<()> {
         for memory_type in MemoryType::all() {
             let path = memory_dir.join(memory_type.filename());
-            if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                // 只缓存非空内容
-                if !content.trim().is_empty() {
-                    self.cache.insert(memory_type, content);
+            match tokio::fs::read_to_string(&path).await {
+                Ok(content) => {
+                    // 只缓存非空内容
+                    if !content.trim().is_empty() {
+                        self.cache.insert(memory_type, content);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // 新安装时文件不存在是正常的，不需要警告
+                }
+                Err(e) => {
+                    // 权限错误、磁盘错误等需要警告
+                    tracing::warn!(
+                        memory_type = memory_type.name(),
+                        path = %path.display(),
+                        error = %e,
+                        "[MemoryInjector] Failed to load memory file"
+                    );
                 }
             }
         }

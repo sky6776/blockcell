@@ -212,7 +212,8 @@ where
     }
 }
 
-/// 消息访问器
+/// 消息访问器 — captures the "message" field as the primary text,
+/// and all other structured fields as key=value pairs appended after it.
 struct MessageVisitor {
     message: String,
     /// 非消息字段，格式: key1=val1, key2=val2
@@ -239,6 +240,56 @@ impl tracing::field::Visit for MessageVisitor {
             self.fields
                 .push_str(&format!("{}={:?}", field.name(), value));
         }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            if !self.fields.is_empty() {
+                self.fields.push_str(", ");
+            }
+            self.fields.push_str(&format!("{}={}", field.name(), value));
+        }
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if !self.fields.is_empty() {
+            self.fields.push_str(", ");
+        }
+        self.fields.push_str(&format!("{}={}", field.name(), value));
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        if !self.fields.is_empty() {
+            self.fields.push_str(", ");
+        }
+        self.fields.push_str(&format!("{}={}", field.name(), value));
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        if !self.fields.is_empty() {
+            self.fields.push_str(", ");
+        }
+        self.fields.push_str(&format!("{}={}", field.name(), value));
+    }
+
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        if !self.fields.is_empty() {
+            self.fields.push_str(", ");
+        }
+        self.fields.push_str(&format!("{}={}", field.name(), value));
+    }
+
+    fn record_error(
+        &mut self,
+        field: &tracing::field::Field,
+        value: &(dyn std::error::Error + 'static),
+    ) {
+        if !self.fields.is_empty() {
+            self.fields.push_str(", ");
+        }
+        self.fields.push_str(&format!("{}={}", field.name(), value));
     }
 }
 

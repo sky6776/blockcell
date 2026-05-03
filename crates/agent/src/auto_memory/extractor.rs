@@ -1,7 +1,9 @@
 //! 鑷姩璁板繂鎻愬彇鍣?//!
 //! 鍚庡彴鎻愬彇鍥涚绫诲瀷璁板繂鐨勬牳蹇冮€昏緫銆?
-use super::cursor::ExtractionCursorManager;
-use super::{get_memory_file_path, MemoryType};
+use super::cursor::{ExtractionCursor, ExtractionCursorManager};
+use super::{
+    get_memory_file_path, MemoryType, EXTRACTION_COOLDOWN_MESSAGES, MAX_MEMORY_FILE_TOKENS,
+};
 use crate::forked::{
     create_auto_mem_can_use_tool, run_forked_agent, CacheSafeParams, ForkedAgentParams,
 };
@@ -13,6 +15,25 @@ use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// 原子回滚写入: 先写入唯一临时文件, 再 rename 替换目标文件
+///
+/// 与 `tokio::fs::write` 不同，此函数使用原子写入模式，
+/// 避免进程崩溃时留下半写文件导致数据丢失。
+async fn atomic_rollback_write(path: &Path, content: &str) -> std::io::Result<()> {
+    let pid = std::process::id();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let temp_path = path.with_extension(format!("rollback.{}.{}", pid, timestamp));
+
+    tokio::fs::write(&temp_path, content).await?;
+    tokio::fs::rename(&temp_path, path).await?;
+
+    Ok(())
+}
+
+/// 提取结果
 /// Auto Memory 配置（从 Layer5Config 派生）
 #[derive(Debug, Clone)]
 pub struct AutoMemoryConfig {
@@ -214,8 +235,16 @@ impl AutoMemoryExtractor {
                             error = %err,
                             "[auto_memory] 瀹夊叏鎵弿鍙戠幇濞佽儊, 鍥炴粴璁板繂鏂囦欢"
                         );
-                        // 回滚到提取前的内容
-                        let _ = tokio::fs::write(&memory_path, &current_content).await;
+                        // 回滚到提取前的内容（使用原子写入避免崩溃导致数据丢失）
+                        if let Err(rollback_err) =
+                            atomic_rollback_write(&memory_path, &current_content).await
+                        {
+                            tracing::error!(
+                                memory_type = memory_type.name(),
+                                error = %rollback_err,
+                                "[auto_memory] 回滚记忆文件失败！数据可能已损坏"
+                            );
+                        }
                         return ExtractionResult {
                             memory_type,
                             success: false,
@@ -365,6 +394,155 @@ pub fn should_extract_auto_memory_with_config(
         .collect()
 }
 
+/// 执行单次自动记忆提取
+///
+/// ## 参数
+/// - `provider_pool`: LLM Provider 池（必需）
+/// - `config_dir`: 配置目录
+/// - `memory_type`: 记忆类型
+/// - `system_prompt`: 系统提示
+/// - `model`: 模型名称
+/// - `messages`: 消息历史
+/// - `cursor`: 用于验证提取条件的游标
+#[allow(dead_code)]
+pub async fn extract_auto_memory(
+    provider_pool: Arc<ProviderPool>,
+    config_dir: &Path,
+    memory_type: MemoryType,
+    system_prompt: Arc<String>,
+    model: &str,
+    messages: Vec<ChatMessage>,
+    cursor: ExtractionCursor, // 用于验证提取条件
+) -> ExtractionResult {
+    // 使用 cursor 验证是否满足提取条件
+    let current_message_count = messages.len();
+    if !cursor.should_extract(current_message_count, EXTRACTION_COOLDOWN_MESSAGES) {
+        tracing::debug!(
+            memory_type = memory_type.name(),
+            last_count = cursor.last_message_count,
+            current_count = current_message_count,
+            "[auto_memory] extraction skipped - cooldown not met"
+        );
+        return ExtractionResult {
+            memory_type,
+            success: false,
+            input_tokens: 0,
+            output_tokens: 0,
+            error: Some("Extraction cooldown not met".to_string()),
+            cursor_save_failed: false,
+        };
+    }
+
+    let memory_path = get_memory_file_path(config_dir, memory_type);
+
+    // 读取当前内容
+    let current_content = tokio::fs::read_to_string(&memory_path)
+        .await
+        .unwrap_or_else(|_| memory_type.template().to_string());
+
+    // 构建 prompt
+    let extraction_prompt = build_extraction_prompt(
+        memory_type,
+        &current_content,
+        MAX_MEMORY_FILE_TOKENS,
+    );
+
+    // 创建 CacheSafeParams
+    let cache_safe_params = CacheSafeParams {
+        system_prompt,
+        model: model.to_string(),
+        fork_context_messages: messages,
+        ..Default::default()
+    };
+
+    // 使用 Builder 模式构建 ForkedAgentParams
+    // 这确保必需参数（provider_pool）在编译时被验证
+    let params = match ForkedAgentParams::builder()
+        .provider_pool(provider_pool)
+        .prompt_messages(vec![ChatMessage::user(&extraction_prompt)])
+        .cache_safe_params(cache_safe_params)
+        .can_use_tool(create_auto_mem_can_use_tool(config_dir))
+        .query_source("auto_memory")
+        .fork_label(memory_type.name())
+        .max_turns(1)
+        .skip_transcript(true)
+        .build()
+    {
+        Ok(p) => p,
+        Err(e) => {
+            return ExtractionResult {
+                memory_type,
+                success: false,
+                input_tokens: 0,
+                output_tokens: 0,
+                error: Some(e.to_string()),
+                cursor_save_failed: false,
+            };
+        }
+    };
+
+    // 运行 Forked Agent
+    let result = run_forked_agent(params).await;
+
+    match result {
+        Ok(forked_result) => {
+            // 安全扫描: 检查写入后的记忆文件内容
+            if let Ok(updated_content) = tokio::fs::read_to_string(&memory_path).await {
+                if let Err(err) = scan_learned_memory_content(&updated_content) {
+                    tracing::warn!(
+                        memory_type = memory_type.name(),
+                        error = %err,
+                        "[auto_memory] security scan found threats, rolling back memory file"
+                    );
+                    if let Err(rollback_err) =
+                        atomic_rollback_write(&memory_path, &current_content).await
+                    {
+                        tracing::error!(
+                            memory_type = memory_type.name(),
+                            error = %rollback_err,
+                            "[auto_memory] memory file rollback failed; data may be corrupted"
+                        );
+                    }
+                    return ExtractionResult {
+                        memory_type,
+                        success: false,
+                        input_tokens: forked_result.total_usage.input_tokens as usize,
+                        output_tokens: forked_result.total_usage.output_tokens as usize,
+                        error: Some(format!(
+                            "Security scan failed; memory file rolled back: {}",
+                            err
+                        )),
+                        cursor_save_failed: false,
+                    };
+                }
+            }
+
+            tracing::info!(
+                memory_type = memory_type.name(),
+                input_tokens = forked_result.total_usage.input_tokens,
+                output_tokens = forked_result.total_usage.output_tokens,
+                "[auto_memory] extraction completed"
+            );
+
+            ExtractionResult {
+                memory_type,
+                success: true,
+                input_tokens: forked_result.total_usage.input_tokens as usize,
+                output_tokens: forked_result.total_usage.output_tokens as usize,
+                error: None,
+                cursor_save_failed: false,
+            }
+        }
+        Err(e) => ExtractionResult {
+            memory_type,
+            success: false,
+            input_tokens: 0,
+            output_tokens: 0,
+            error: Some(e.to_string()),
+            cursor_save_failed: false,
+        },
+    }
+}
 /// 检查是否应该提取自动记忆（使用默认常量）
 pub fn should_extract_auto_memory(
     cursor_manager: &ExtractionCursorManager,

@@ -93,14 +93,14 @@ impl Tool for SpawnTool {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let task = format!("__SKILL_EXEC__:{}:{}", skill, user_query);
-            spawn_handle.spawn(&task, label, &ctx.channel, &ctx.chat_id)
+            spawn_handle.spawn(&task, label, &ctx.channel, &ctx.chat_id, None)
         } else {
             let task = params["task"].as_str().unwrap_or("");
             let label = params
                 .get("label")
                 .and_then(|v| v.as_str())
                 .unwrap_or("subagent");
-            spawn_handle.spawn(task, label, &ctx.channel, &ctx.chat_id)
+            spawn_handle.spawn(task, label, &ctx.channel, &ctx.chat_id, None)
         }
     }
 }
@@ -125,6 +125,7 @@ mod tests {
             _label: &str,
             _origin_channel: &str,
             _origin_chat_id: &str,
+            _agent_type: Option<&str>,
         ) -> Result<Value> {
             *self.captured_task.lock().expect("capture lock") = Some(task.to_string());
             Ok(json!({ "ok": true }))
@@ -189,6 +190,8 @@ mod tests {
             event_emitter: None,
             channel_contacts_file: None,
             response_cache: None,
+            runtime_handle: None,
+            agent_identity: None,
             skill_mutex: None,
         };
 

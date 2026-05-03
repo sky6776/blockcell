@@ -16,8 +16,10 @@ pub(super) async fn outbound_to_ws_bridge(
                 let Some(msg) = msg else { break };
                 // Forward to WebSocket clients as a message_done event.
                 // Skip "ws" channel — the runtime already emits events directly via event_tx.
+                // Also skip messages marked skip_ws_echo (e.g. from persist_and_deliver_final_response)
+                // to prevent duplicate message_done events.
                 // Still forward cron, subagent, and other internal channel results to WS clients.
-                if msg.channel != "ws" {
+                if msg.channel != "ws" && !msg.skip_ws_echo {
                     let event = WsEvent::MessageDone {
                         chat_id: msg.chat_id.clone(),
                         task_id: String::new(),

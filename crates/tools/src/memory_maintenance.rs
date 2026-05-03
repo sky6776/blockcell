@@ -6,6 +6,10 @@ use tracing::{debug, info};
 
 use crate::{Tool, ToolContext, ToolSchema};
 
+/// 判断文本是否像 Ghost Agent 维护日志
+///
+/// 用于阻止 Ghost Agent 将自己的维护日志写入记忆存储。
+/// 使用精确匹配模式避免误判用户正常内容（如健康话题、数据 feed 等）。
 fn looks_like_ghost_maintenance_log(text: &str) -> bool {
     let t = text.to_lowercase();
     t.contains("ghost agent")
@@ -15,9 +19,10 @@ fn looks_like_ghost_maintenance_log(text: &str) -> bool {
         || t.contains("记忆整理")
         || t.contains("文件清理")
         || t.contains("社区互动")
-        || t.contains("heart")
-        || t.contains("heartbeat")
-        || t.contains("feed")
+        || t.contains("heartbeat check")  // 精确匹配，避免误判健康话题
+        || t.contains("heartbeat report")
+        || t.contains("feed cycle")       // 精确匹配，避免误判数据 feed
+        || t.contains("feed routine")
 }
 
 fn extract_result_ids(results: &Value) -> Vec<String> {
@@ -605,6 +610,8 @@ mod tests {
             event_emitter: None,
             channel_contacts_file: None,
             response_cache: None,
+            runtime_handle: None,
+            agent_identity: None,
             skill_mutex: None,
         }
     }

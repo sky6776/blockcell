@@ -17,11 +17,12 @@ use crate::memory_event;
 #[allow(deprecated)]
 use crate::skill_mutex::SkillMutex;
 use blockcell_core::types::ChatMessage;
+use blockcell_core::UsageMetrics;
 use blockcell_providers::ProviderPool;
 use blockcell_tools::fuzzy_match::fuzzy_find_and_replace;
 use blockcell_tools::security_scan::{scan_skill_content, scan_skill_dir_with_trust};
 use blockcell_tools::skill_manage::{atomic_write_text, extract_frontmatter};
-use blockcell_tools::MemoryStoreHandle;
+use blockcell_tools::{MemoryFileStoreHandle, MemoryStoreHandle, SkillFileStoreHandle};
 use regex::Regex;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -85,16 +86,34 @@ pub struct ForkedAgentParams {
     pub skip_cache_write: bool,
     /// 系统提示（可选，覆盖 cache_safe_params）
     pub system_prompt: Option<String>,
+    /// Agent 类型（Fork 模式为 None）
+    pub agent_type: Option<String>,
+    /// 禁用工具列表
+    pub disallowed_tools: Vec<String>,
+    /// ONE_SHOT 标记
+    pub one_shot: bool,
+    /// 工作目录（用于 worktree 隔离）
+    pub working_dir: Option<PathBuf>,
+    /// 事件发送通道（可选，用于向父级转发进度事件如 tool_call_start、token 等）
+    pub event_tx: Option<tokio::sync::broadcast::Sender<String>>,
+    /// 进度通道（可选，用于通过 TaskManager 转发工具调用事件到外部渠道）
+    pub progress_tx: Option<tokio::sync::mpsc::Sender<crate::agent_progress::AgentProgress>>,
+    /// 工具 schema 定义（发送给 LLM，让它知道可以调用哪些工具）
+    pub tool_schemas: Vec<serde_json::Value>,
+    /// 任务 ID（用于在事件中区分同类型多个子agent）
+    pub task_id: Option<String>,
     /// Memory store handle (shared from parent agent via Arc)
     pub memory_store: Option<MemoryStoreHandle>,
+    /// File-backed memory store handle (USER.md / MEMORY.md).
+    pub memory_file_store: Option<MemoryFileStoreHandle>,
+    /// File-backed skill store handle.
+    pub skill_file_store: Option<SkillFileStoreHandle>,
     /// Skills directory (for skill_manage/list_skills in review mode)
     pub skills_dir: Option<PathBuf>,
     /// External skills directories (builtin_skills_dir etc., for skill search)
     pub external_skills_dirs: Vec<PathBuf>,
     /// Skill mutex (shared with parent agent to prevent concurrent skill modifications)
     pub skill_mutex: Option<Arc<SkillMutex>>,
-    /// 工具 JSON Schema 列表 (传给 provider.chat() 让 LLM 知道可用工具)
-    pub tool_schemas: Vec<serde_json::Value>,
 }
 
 impl ForkedAgentParams {
@@ -124,17 +143,38 @@ impl ForkedAgentParams {
             skip_transcript: true,
             skip_cache_write: false,
             system_prompt: None,
+            agent_type: None,
+            disallowed_tools: Vec::new(),
+            one_shot: false,
+            working_dir: None,
+            event_tx: None,
+            progress_tx: None,
+            tool_schemas: Vec::new(),
+            task_id: None,
             memory_store: None,
+            memory_file_store: None,
+            skill_file_store: None,
             skills_dir: None,
             external_skills_dirs: Vec::new(),
             skill_mutex: None,
-            tool_schemas: Vec::new(),
         }
     }
 
     /// 设置 memory_store（共享父代理的 Memory Store）
     pub fn with_memory_store(mut self, store: MemoryStoreHandle) -> Self {
         self.memory_store = Some(store);
+        self
+    }
+
+    /// Set file-backed memory store.
+    pub fn with_memory_file_store(mut self, store: MemoryFileStoreHandle) -> Self {
+        self.memory_file_store = Some(store);
+        self
+    }
+
+    /// Set file-backed skill store.
+    pub fn with_skill_file_store(mut self, store: SkillFileStoreHandle) -> Self {
+        self.skill_file_store = Some(store);
         self
     }
 
@@ -247,11 +287,20 @@ pub struct ForkedAgentParamsBuilder {
     skip_transcript: bool,
     skip_cache_write: bool,
     system_prompt: Option<String>,
+    agent_type: Option<String>,
+    disallowed_tools: Option<Vec<String>>,
+    one_shot: bool,
+    working_dir: Option<PathBuf>,
+    event_tx: Option<tokio::sync::broadcast::Sender<String>>,
+    progress_tx: Option<tokio::sync::mpsc::Sender<crate::agent_progress::AgentProgress>>,
+    tool_schemas: Option<Vec<serde_json::Value>>,
+    task_id: Option<String>,
     memory_store: Option<MemoryStoreHandle>,
+    memory_file_store: Option<MemoryFileStoreHandle>,
+    skill_file_store: Option<SkillFileStoreHandle>,
     skills_dir: Option<PathBuf>,
     external_skills_dirs: Vec<PathBuf>,
     skill_mutex: Option<Arc<SkillMutex>>,
-    tool_schemas: Vec<serde_json::Value>,
 }
 
 impl ForkedAgentParamsBuilder {
@@ -327,15 +376,91 @@ impl ForkedAgentParamsBuilder {
         self
     }
 
+    /// 设置 Agent 类型
+    pub fn agent_type(mut self, agent_type: Option<String>) -> Self {
+        self.agent_type = agent_type;
+        self
+    }
+
+    /// 设置禁用工具列表
+    pub fn disallowed_tools(mut self, tools: Vec<String>) -> Self {
+        self.disallowed_tools = Some(tools);
+        self
+    }
+
+    /// 设置 ONE_SHOT 标记
+    pub fn one_shot(mut self, one_shot: bool) -> Self {
+        self.one_shot = one_shot;
+        self
+    }
+
+    /// 设置工作目录（用于 worktree 隔离）
+    pub fn working_dir(mut self, dir: PathBuf) -> Self {
+        self.working_dir = Some(dir);
+        self
+    }
+
+    /// 设置事件发送通道（用于向父级转发进度事件）
+    pub fn event_tx(mut self, tx: tokio::sync::broadcast::Sender<String>) -> Self {
+        self.event_tx = Some(tx);
+        self
+    }
+
+    /// 设置进度通道（用于通过 TaskManager 转发工具调用事件到外部渠道）
+    pub fn progress_tx(
+        mut self,
+        tx: tokio::sync::mpsc::Sender<crate::agent_progress::AgentProgress>,
+    ) -> Self {
+        self.progress_tx = Some(tx);
+        self
+    }
+
+    /// 设置工具 schema 定义（发送给 LLM，让它知道可以调用哪些工具）
+    pub fn tool_schemas(mut self, schemas: Vec<serde_json::Value>) -> Self {
+        self.tool_schemas = Some(schemas);
+        self
+    }
+
+    /// 设置任务 ID（用于在事件中区分同类型多个子agent）
+    pub fn task_id(mut self, task_id: Option<String>) -> Self {
+        self.task_id = task_id;
+        self
+    }
+
     /// 设置 memory_store（共享父代理的 Memory Store）
     pub fn memory_store(mut self, store: MemoryStoreHandle) -> Self {
         self.memory_store = Some(store);
         self
     }
 
-    /// 设置工具 schema 列表
-    pub fn tool_schemas(mut self, schemas: Vec<serde_json::Value>) -> Self {
-        self.tool_schemas = schemas;
+    /// Set file-backed memory store.
+    pub fn memory_file_store(mut self, store: MemoryFileStoreHandle) -> Self {
+        self.memory_file_store = Some(store);
+        self
+    }
+
+    /// Set file-backed skill store.
+    pub fn skill_file_store(mut self, store: SkillFileStoreHandle) -> Self {
+        self.skill_file_store = Some(store);
+        self
+    }
+
+    /// 设置 skills_dir（用于 skill_manage/list_skills 工具）
+    pub fn skills_dir(mut self, dir: PathBuf) -> Self {
+        self.skills_dir = Some(dir);
+        self
+    }
+
+    /// 设置 external_skills_dirs（用于跨目录搜索 Skill）
+    pub fn external_skills_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.external_skills_dirs = dirs;
+        self
+    }
+
+    /// 设置 skill_mutex（共享父代理的 SkillMutex，防止并发修改）
+    #[allow(deprecated)]
+    pub fn skill_mutex(mut self, mutex: Arc<SkillMutex>) -> Self {
+        self.skill_mutex = Some(mutex);
         self
     }
 
@@ -362,11 +487,20 @@ impl ForkedAgentParamsBuilder {
             skip_transcript: self.skip_transcript,
             skip_cache_write: self.skip_cache_write,
             system_prompt: self.system_prompt,
+            agent_type: self.agent_type,
+            disallowed_tools: self.disallowed_tools.unwrap_or_default(),
+            one_shot: self.one_shot,
+            working_dir: self.working_dir,
+            event_tx: self.event_tx,
+            progress_tx: self.progress_tx,
+            tool_schemas: self.tool_schemas.unwrap_or_default(),
+            task_id: self.task_id,
             memory_store: self.memory_store,
+            memory_file_store: self.memory_file_store,
+            skill_file_store: self.skill_file_store,
             skills_dir: self.skills_dir,
             external_skills_dirs: self.external_skills_dirs,
             skill_mutex: self.skill_mutex,
-            tool_schemas: self.tool_schemas,
         })
     }
 }
@@ -386,48 +520,6 @@ pub struct ForkedAgentResult {
     pub files_modified: Vec<String>,
     /// 最终响应内容
     pub final_content: Option<String>,
-}
-
-/// 用量指标
-#[derive(Debug, Clone, Default)]
-pub struct UsageMetrics {
-    /// 输入 tokens
-    pub input_tokens: u64,
-    /// 输出 tokens
-    pub output_tokens: u64,
-    /// 缓存读取的 tokens
-    pub cache_read_input_tokens: u64,
-    /// 缓存创建的 tokens
-    pub cache_creation_input_tokens: u64,
-}
-
-impl UsageMetrics {
-    /// 累加用量
-    pub fn accumulate(&mut self, input: u64, output: u64, cache_read: u64, cache_creation: u64) {
-        self.input_tokens += input;
-        self.output_tokens += output;
-        self.cache_read_input_tokens += cache_read;
-        self.cache_creation_input_tokens += cache_creation;
-    }
-
-    /// 计算缓存命中率
-    pub fn cache_hit_rate(&self) -> f64 {
-        let total =
-            self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens;
-        if total > 0 {
-            self.cache_read_input_tokens as f64 / total as f64
-        } else {
-            0.0
-        }
-    }
-
-    /// 合并另一个用量指标
-    pub fn merge(&mut self, other: &UsageMetrics) {
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.cache_read_input_tokens += other.cache_read_input_tokens;
-        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
-    }
 }
 
 /// Forked Agent 错误
@@ -592,6 +684,7 @@ fn find_skill_dir_forked(
 
 /// Forked Agent 支持的工具：
 /// - read_file: 读取文件内容
+/// - list_dir: 列出目录内容
 /// - file_edit / edit_file: 编辑文件（字符串替换）
 /// - file_write / write_file: 写入文件
 /// - grep: 在文件中搜索模式（简化版）
@@ -607,11 +700,36 @@ async fn execute_forked_tool(
     tool_name: &str,
     input: &serde_json::Value,
     can_use_tool: &CanUseToolFn,
+    disallowed_tools: &[String],
     memory_store: &Option<MemoryStoreHandle>,
+    memory_file_store: &Option<MemoryFileStoreHandle>,
+    skill_file_store: &Option<SkillFileStoreHandle>,
     skills_dir: &Option<PathBuf>,
     external_skills_dirs: &[PathBuf],
     skill_mutex: &Option<Arc<SkillMutex>>,
+    working_dir: &Option<PathBuf>,
 ) -> Result<String, ForkedAgentError> {
+    // Check disallowed tools list
+    if disallowed_tools.iter().any(|d| d == tool_name) {
+        return Ok(format!(
+            "Tool '{}' is not allowed in this agent. Disallowed tools: {}",
+            tool_name,
+            disallowed_tools.join(", ")
+        ));
+    }
+
+    // 辅助函数: 解析文件路径 (相对于 working_dir，用于 worktree 隔离)
+    let resolve_path = |p: &str| -> PathBuf {
+        let path = Path::new(p);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else if let Some(ref base) = working_dir {
+            base.join(p)
+        } else {
+            path.to_path_buf()
+        }
+    };
+
     // 首先检查权限
     match can_use_tool(tool_name, input) {
         ToolPermission::Allow => {}
@@ -622,7 +740,7 @@ async fn execute_forked_tool(
         }
     }
 
-    // SkillMutex 检查: 写入操作前检查是否已有并发修改
+    // SkillMutex 检查: 写入操作前获取互斥锁
     // 注意: _skill_guard 必须在整个 match 块中存活, 才能保护操作期间不被并发修改
     let _skill_guard = if tool_name == "skill_manage" {
         let is_write_action = matches!(
@@ -632,13 +750,8 @@ async fn execute_forked_tool(
         if is_write_action {
             if let Some(name) = input.get("name").and_then(|v| v.as_str()) {
                 if let Some(ref mutex) = skill_mutex {
-                    if !mutex.can_modify(name) {
-                        return Ok(json!({
-                            "success": false,
-                            "message": format!("Skill '{}' is currently being modified by another process. Please try again later.", name)
-                        }).to_string());
-                    }
-                    // 获取锁（guard 存活到函数结束, 操作完成后自动释放）
+                    // 直接获取写锁（acquire 内部已包含活跃检查）
+                    // 不再先调用 can_modify() 再 acquire()，避免 TOCTOU 竞态
                     match mutex.acquire(name) {
                         Ok(guard) => Some(guard),
                         Err(e) => {
@@ -671,8 +784,10 @@ async fn execute_forked_tool(
             // 二次路径验证（fail-safe）
             validate_path_safety(file_path)?;
 
+            let resolved = resolve_path(file_path);
+
             // 检查文件大小
-            let metadata = tokio::fs::metadata(Path::new(file_path)).await
+            let metadata = tokio::fs::metadata(&resolved).await
                 .map_err(ForkedAgentError::Io)?;
             if metadata.len() as usize > MAX_FILE_SIZE {
                 return Err(ForkedAgentError::ToolError(format!(
@@ -681,7 +796,7 @@ async fn execute_forked_tool(
                 )));
             }
 
-            let content = tokio::fs::read_to_string(Path::new(file_path))
+            let content = tokio::fs::read_to_string(&resolved)
                 .await
                 .map_err(ForkedAgentError::Io)?;
 
@@ -699,6 +814,46 @@ async fn execute_forked_tool(
             };
 
             Ok(truncated)
+        },
+
+        "list_dir" => {
+            let dir_path = input.get("path")
+                .or_else(|| input.get("dir_path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
+
+            // 二次路径验证（fail-safe）
+            validate_path_safety(dir_path)?;
+
+            let base_path = resolve_path(dir_path);
+            let mut entries = Vec::new();
+
+            match tokio::fs::read_dir(&base_path).await {
+                Ok(mut dir_entries) => {
+                    while let Ok(Some(entry)) = dir_entries.next_entry().await {
+                        let file_name = entry.file_name().to_string_lossy().to_string();
+                        let metadata = entry.metadata().await;
+                        let type_indicator = match &metadata {
+                            Ok(m) if m.is_dir() => "/",
+                            _ => "",
+                        };
+                        entries.push(format!("{}{}", file_name, type_indicator));
+                        if entries.len() >= 500 {
+                            entries.push("... [truncated, max 500 entries]".to_string());
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(ForkedAgentError::Io(e));
+                }
+            }
+
+            if entries.is_empty() {
+                Ok(format!("Empty directory: {}", dir_path))
+            } else {
+                Ok(entries.join("\n"))
+            }
         },
 
         "file_edit" | "edit_file" => {
@@ -720,8 +875,10 @@ async fn execute_forked_tool(
             // 验证编辑内容安全性
             validate_edit_content(old_string, new_string, MAX_EDIT_SIZE)?;
 
+            let resolved = resolve_path(file_path);
+
             // 读取文件
-            let content = tokio::fs::read_to_string(Path::new(file_path))
+            let content = tokio::fs::read_to_string(&resolved)
                 .await
                 .map_err(ForkedAgentError::Io)?;
 
@@ -750,7 +907,7 @@ async fn execute_forked_tool(
             };
 
             // 原子写回文件 (temp file + rename, 防止崩溃时损坏)
-            atomic_write_text(Path::new(file_path), &new_content)
+            atomic_write_text(&resolved, &new_content)
                 .await
                 .map_err(|e| ForkedAgentError::ToolError(format!("Failed to write file: {}", e)))?;
 
@@ -777,16 +934,17 @@ async fn execute_forked_tool(
                 )));
             }
 
-            // 确保父目录存在（create_dir_all 会处理已存在的情况）
-            let parent = Path::new(file_path).parent()
-                .ok_or_else(|| ForkedAgentError::ToolError("Invalid file path".to_string()))?;
+            let resolved = resolve_path(file_path);
 
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(ForkedAgentError::Io)?;
+            // 确保父目录存在（create_dir_all 会处理已存在的情况）
+            if let Some(parent) = resolved.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(ForkedAgentError::Io)?;
+            }
 
             // 原子写入文件 (temp file + rename, 防止崩溃时损坏)
-            atomic_write_text(Path::new(file_path), content)
+            atomic_write_text(&resolved, content)
                 .await
                 .map_err(|e| ForkedAgentError::ToolError(format!("Failed to write file: {}", e)))?;
 
@@ -805,8 +963,10 @@ async fn execute_forked_tool(
             // 二次路径验证（fail-safe）
             validate_path_safety(path)?;
 
+            let resolved = resolve_path(path);
+
             // 简化版 grep - 只搜索单个文件
-            let content = tokio::fs::read_to_string(Path::new(path))
+            let content = tokio::fs::read_to_string(&resolved)
                 .await
                 .map_err(ForkedAgentError::Io)?;
 
@@ -836,11 +996,11 @@ async fn execute_forked_tool(
             validate_path_safety(path)?;
 
             // 简化版 glob - 只支持基本模式
-            let base_path = Path::new(path);
+            let base_path = resolve_path(path);
             let mut results = Vec::new();
 
             // 使用 tokio 异步读取目录
-            match tokio::fs::read_dir(base_path).await {
+            match tokio::fs::read_dir(&base_path).await {
                 Ok(mut entries) => {
                     while let Ok(Some(entry)) = entries.next_entry().await {
                         let file_name = entry.file_name().to_string_lossy().to_string();
@@ -866,6 +1026,47 @@ async fn execute_forked_tool(
         },
 
         // 记忆工具: memory_upsert
+        "memory_manage" => {
+            match memory_file_store {
+                Some(store) => {
+                    let action = input
+                        .get("action")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let target = input
+                        .get("target")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let result = match action {
+                        "add" => store.add_file_memory_json(
+                            target,
+                            input.get("content").and_then(|v| v.as_str()).unwrap_or(""),
+                        ),
+                        "replace" => store.replace_file_memory_json(
+                            target,
+                            input.get("old_text").and_then(|v| v.as_str()).unwrap_or(""),
+                            input.get("content").and_then(|v| v.as_str()).unwrap_or(""),
+                        ),
+                        "remove" => store.remove_file_memory_json(
+                            target,
+                            input.get("old_text").and_then(|v| v.as_str()).unwrap_or(""),
+                        ),
+                        "undo_latest" => store.restore_latest_file_memory_json(target),
+                        _ => Err(blockcell_core::Error::Validation(
+                            "memory_manage action must be add, replace, remove, or undo_latest"
+                                .to_string(),
+                        )),
+                    }
+                    .map_err(|e| {
+                        ForkedAgentError::ToolError(format!("memory_manage error: {}", e))
+                    })?;
+                    Ok(serde_json::to_string(&result)
+                        .unwrap_or_else(|_| "memory_manage completed".to_string()))
+                }
+                None => Ok("Memory file store not available".to_string()),
+            }
+        },
+
         "memory_upsert" => {
             match memory_store {
                 Some(store) => {
@@ -982,6 +1183,68 @@ async fn execute_forked_tool(
         // - create 验证 YAML frontmatter (name + description)
         // - 支持 category 参数
         "skill_manage" => {
+            if let Some(store) = skill_file_store {
+                let action = input
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let name = input.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let content = input
+                    .get("content")
+                    .or_else(|| input.get("new_string"))
+                    .or_else(|| input.get("file_content"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let result = match action {
+                    "view" => store.view_skill_json(name),
+                    "create" => {
+                        let meta = extract_frontmatter(content);
+                        let description = input
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| meta.get("description").and_then(|v| v.as_str()))
+                            .unwrap_or("Learned reusable procedure");
+                        store.create_skill_json(name, description, content)
+                    }
+                    "edit" => store.edit_skill_json(name, content),
+                    "patch" => store.patch_skill_json(
+                        name,
+                        input
+                            .get("old_text")
+                            .or_else(|| input.get("old_string"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                        content,
+                    ),
+                    "delete" => store.delete_skill_json(name),
+                    "write_file" => store.write_skill_file_json(
+                        name,
+                        input
+                            .get("path")
+                            .or_else(|| input.get("file_path"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                        content,
+                    ),
+                    "remove_file" => store.remove_skill_file_json(
+                        name,
+                        input
+                            .get("path")
+                            .or_else(|| input.get("file_path"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                    ),
+                    "undo_latest" => store.restore_latest_skill_json(name),
+                    _ => Err(blockcell_core::Error::Validation(
+                        "skill_manage action must be create, patch, view, delete, edit, write_file, remove_file, or undo_latest"
+                            .to_string(),
+                    )),
+                }
+                .map_err(|e| ForkedAgentError::ToolError(format!("skill_manage error: {}", e)))?;
+                return Ok(serde_json::to_string(&result)
+                    .unwrap_or_else(|_| "skill_manage completed".to_string()));
+            }
+
             match &skills_dir {
                 Some(dir) => {
                     let action = input.get("action")
@@ -1610,15 +1873,30 @@ pub async fn run_forked_agent(
     let mut total_usage = UsageMetrics::default();
     let mut files_modified = Vec::new();
 
+    // 准备子代理上下文覆盖（包含 working_dir）
+    let mut overrides = params.overrides.unwrap_or_default();
+    if let Some(ref working_dir) = params.working_dir {
+        overrides.working_dir = Some(working_dir.clone());
+    }
+
+    // Get the current AbortToken from task-local context for chain propagation
+    let parent_abort_token = blockcell_core::current_abort_token();
+
     // 创建子代理上下文
     let context = create_subagent_context(
-        None, // parent_file_state - 在实际集成时从 runtime 获取
-        None, // parent_replacement_state
-        None, // parent_abort_controller
-        params.overrides.unwrap_or_default(),
+        None,                        // parent_file_state - 在实际集成时从 runtime 获取
+        None,                        // parent_replacement_state
+        None,                        // parent_abort_controller (legacy)
+        parent_abort_token.as_ref(), // Wire parent abort token for chain cancellation
+        overrides,
     );
 
-    // 检查是否已中止
+    // 检查是否已取消（使用新的 AbortToken）
+    if let Err(e) = context.abort_token.check() {
+        return Err(ForkedAgentError::Aborted(e.message));
+    }
+
+    // 同时检查 legacy AbortController
     if context.abort_controller.is_aborted() {
         return Err(ForkedAgentError::Aborted(
             context
@@ -1653,6 +1931,9 @@ pub async fn run_forked_agent(
         query_source = params.query_source,
         message_count = messages.len(),
         max_turns = ?params.max_turns,
+        agent_type = ?params.agent_type,
+        one_shot = params.one_shot,
+        disallowed_tools = ?params.disallowed_tools,
         "[forked_agent] starting"
     );
 
@@ -1680,6 +1961,7 @@ pub async fn run_forked_agent(
         PROVIDER_RETRY_MAX_ATTEMPTS,
         PROVIDER_RETRY_INITIAL_DELAY_MS,
         PROVIDER_RETRY_MAX_DELAY_MS,
+        &context.abort_token,
     )
     .await
     {
@@ -1702,7 +1984,20 @@ pub async fn run_forked_agent(
     let mut final_content = None;
 
     for turn in 0..max_turns {
-        // 检查中止
+        // 检查取消（使用新的 AbortToken）
+        if context.abort_token.is_cancelled() {
+            tracing::warn!(
+                fork_label = params.fork_label,
+                turn,
+                "[forked_agent] cancelled via AbortToken"
+            );
+            memory_event!(layer7, agent_failed, params.fork_label, "cancelled", turn);
+            return Err(ForkedAgentError::Aborted(
+                "Cancelled via AbortToken".to_string(),
+            ));
+        }
+
+        // 检查中止（legacy AbortController）
         if context.abort_controller.is_aborted() {
             tracing::warn!(
                 fork_label = params.fork_label,
@@ -1719,7 +2014,27 @@ pub async fn run_forked_agent(
             ));
         }
 
-        // 调用 LLM (传入工具 schema 让 LLM 知道可用工具)
+        // 调用 LLM 前：发送进度事件，让用户知道子 agent 正在工作
+        if let Some(ref event_tx) = params.event_tx {
+            let agent_type_str = params.agent_type.as_deref().unwrap_or("fork");
+            let percent = if max_turns > 0 {
+                (turn * 100 / max_turns).min(100) as u8
+            } else {
+                0
+            };
+            let event = serde_json::json!({
+                "type": "agent_progress",
+                "agent_type": agent_type_str,
+                "task_id": params.task_id,
+                "turn": turn,
+                "max_turns": max_turns,
+                "stage": "Thinking...",
+                "percent": percent,
+            });
+            let _ = event_tx.send(event.to_string());
+        }
+
+        // 调用 LLM（传入工具 schema，让 LLM 知道可以调用哪些工具）
         let response = match provider.chat(&current_messages, &params.tool_schemas).await {
             Ok(r) => r,
             Err(e) => {
@@ -1761,20 +2076,61 @@ pub async fn run_forked_agent(
         let content = response.content.clone();
         final_content = content.clone();
 
-        // 创建 assistant 消息
+        // 通过 event_tx 通知父级：子agent完成了一个 turn（进度反馈）
+        if let Some(ref event_tx) = params.event_tx {
+            let agent_type_str = params.agent_type.as_deref().unwrap_or("fork");
+            let stage = if response.tool_calls.is_empty() {
+                "Generating response".to_string()
+            } else {
+                let tools: Vec<&str> = response
+                    .tool_calls
+                    .iter()
+                    .map(|tc| tc.name.as_str())
+                    .collect();
+                format!("Calling: {}", tools.join(", "))
+            };
+            // 计算百分比：基于当前 turn / max_turns
+            let percent = if max_turns > 0 {
+                ((turn + 1) * 100 / max_turns).min(100) as u8
+            } else {
+                0
+            };
+            let event = serde_json::json!({
+                "type": "agent_progress",
+                "agent_type": agent_type_str,
+                "task_id": params.task_id,
+                "turn": turn + 1,
+                "max_turns": max_turns,
+                "stage": stage,
+                "percent": percent,
+            });
+            match event_tx.send(event.to_string()) {
+                Ok(n) => tracing::debug!(receivers = n, "[forked_agent] sent agent_progress event"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "[forked_agent] failed to send agent_progress event (no receivers?)")
+                }
+            }
+        } else {
+            tracing::debug!("[forked_agent] event_tx is None, skipping agent_progress event");
+        }
+
+        // 创建 assistant 消息 — preserve reasoning_content to avoid DeepSeek 400 errors
         let assistant_msg = if !response.tool_calls.is_empty() {
             // 有工具调用
             ChatMessage {
                 id: None,
                 role: "assistant".to_string(),
                 content: serde_json::Value::String(content.clone().unwrap_or_default()),
-                reasoning_content: None,
+                reasoning_content: response.reasoning_content.clone(),
                 tool_calls: Some(response.tool_calls.clone()),
                 tool_call_id: None,
                 name: None,
             }
         } else {
-            ChatMessage::assistant(content.as_deref().unwrap_or(""))
+            ChatMessage::assistant_with_reasoning(
+                content.as_deref().unwrap_or(""),
+                response.reasoning_content.clone(),
+            )
         };
 
         current_messages.push(assistant_msg.clone());
@@ -1801,15 +2157,53 @@ pub async fn run_forked_agent(
                     "[forked_agent] executing tool"
                 );
 
+                // 通过 event_tx 通知父级：子agent正在调用工具
+                if let Some(ref event_tx) = params.event_tx {
+                    let agent_type_str = params.agent_type.as_deref().unwrap_or("fork");
+                    // 从工具参数中提取摘要信息（文件路径、搜索模式等）
+                    let tool_summary = extract_tool_summary(tool_name, tool_input);
+                    let event = serde_json::json!({
+                        "type": "tool_call_start",
+                        "tool": tool_name,
+                        "call_id": tool_call.id,
+                        "agent_type": agent_type_str,
+                        "task_id": params.task_id,
+                        "summary": tool_summary,
+                        "params": tool_input,
+                    });
+                    if let Err(e) = event_tx.send(event.to_string()) {
+                        tracing::warn!(error = %e, tool = tool_name, "[forked_agent] failed to send tool_call_start event");
+                    }
+                }
+
+                // 通过 progress_tx 转发工具调用事件到外部渠道
+                if let Some(ref progress_tx) = params.progress_tx {
+                    let agent_type_str = params.agent_type.as_deref().unwrap_or("fork");
+                    let tool_summary = extract_tool_summary(tool_name, tool_input);
+                    let _ = progress_tx
+                        .send(crate::agent_progress::AgentProgress::ToolCallStart {
+                            task_id: params.task_id.clone().unwrap_or_default(),
+                            tool: tool_name.clone(),
+                            call_id: tool_call.id.clone(),
+                            agent_type: agent_type_str.to_string(),
+                            summary: tool_summary,
+                        })
+                        .await;
+                }
+
                 // 执行工具
                 let tool_result = execute_forked_tool(
                     tool_name,
                     tool_input,
                     &params.can_use_tool,
+                    &params.disallowed_tools,
                     &params.memory_store,
+                    &params.memory_file_store,
+                    &params.skill_file_store,
                     &params.skills_dir,
                     &params.external_skills_dirs,
                     &params.skill_mutex,
+                    &params.working_dir,
                 )
                 .await;
 
@@ -1852,8 +2246,26 @@ pub async fn run_forked_agent(
                 }
 
                 // 构建工具结果消息，包含详细的错误上下文
+                let tool_success = tool_result.is_ok();
                 let result_content = match tool_result {
-                    Ok(result) => result,
+                    Ok(result) => {
+                        // 跟踪修改的文件（edit_file / write_file）
+                        if matches!(
+                            tool_name.as_str(),
+                            "edit_file" | "write_file" | "file_edit" | "file_write"
+                        ) {
+                            let file_path = tool_input
+                                .get("file_path")
+                                .or_else(|| tool_input.get("path"))
+                                .and_then(|v| v.as_str());
+                            if let Some(path) = file_path {
+                                if !files_modified.iter().any(|f| f == path) {
+                                    files_modified.push(path.to_string());
+                                }
+                            }
+                        }
+                        result
+                    }
                     Err(ref e) => {
                         // 包含错误类型和详细信息，便于调试
                         let error_type = match e {
@@ -1869,6 +2281,48 @@ pub async fn run_forked_agent(
                         format!("Tool execution error ({}): {}", error_type, e)
                     }
                 };
+
+                // 通过 event_tx 通知父级：子agent工具调用完成
+                if let Some(ref event_tx) = params.event_tx {
+                    let agent_type_str = params.agent_type.as_deref().unwrap_or("fork");
+                    // tool_call_end: CLI event_handler 使用
+                    let event = serde_json::json!({
+                        "type": "tool_call_end",
+                        "tool": tool_name,
+                        "call_id": tool_call.id,
+                        "agent_type": agent_type_str,
+                        "task_id": params.task_id,
+                        "success": tool_success,
+                    });
+                    if let Err(e) = event_tx.send(event.to_string()) {
+                        tracing::warn!(error = %e, tool = tool_name, "[forked_agent] failed to send tool_call_end event");
+                    }
+                    // tool_call_result: WebUI 使用，更新工具调用状态从 running -> done
+                    let result_event = serde_json::json!({
+                        "type": "tool_call_result",
+                        "call_id": tool_call.id,
+                        "task_id": params.task_id,
+                        "result": result_content,
+                        "duration_ms": 0,
+                    });
+                    if let Err(e) = event_tx.send(result_event.to_string()) {
+                        tracing::warn!(error = %e, tool = tool_name, "[forked_agent] failed to send tool_call_result event");
+                    }
+                }
+
+                // 通过 progress_tx 转发工具调用完成事件到外部渠道
+                if let Some(ref progress_tx) = params.progress_tx {
+                    let agent_type_str = params.agent_type.as_deref().unwrap_or("fork");
+                    let _ = progress_tx
+                        .send(crate::agent_progress::AgentProgress::ToolCallEnd {
+                            task_id: params.task_id.clone().unwrap_or_default(),
+                            tool: tool_name.clone(),
+                            call_id: tool_call.id.clone(),
+                            agent_type: agent_type_str.to_string(),
+                            success: tool_success,
+                        })
+                        .await;
+                }
 
                 // 添加工具结果到消息
                 let tool_result_msg = ChatMessage {
@@ -1888,7 +2342,17 @@ pub async fn run_forked_agent(
             continue;
         }
 
-        // 如果没有工具调用，结束循环
+        // 没有工具调用，检查是否应该结束循环
+        // one_shot 模式下，如果 turn 0 就没有工具调用，LLM 可能只是在"思考"
+        // （例如先列出分析计划），给一次额外机会继续到 turn 1
+        if params.one_shot && turn == 0 {
+            tracing::debug!(
+                fork_label = params.fork_label,
+                turn,
+                "[forked_agent] one_shot: turn 0 had no tool calls, continuing to turn 1"
+            );
+            continue;
+        }
         break;
     }
 
@@ -1930,18 +2394,25 @@ pub async fn run_forked_agent(
 ///
 /// 使用指数退避策略重试获取 provider，避免因短暂不可用而直接失败。
 ///
-/// ## 已知限制
-/// 重试循环在 sleep 时不检查 abort 信号。如果需要支持取消，
-/// 应该将 `AbortController` 传入此函数并使用 `tokio::select!`。
+/// 在每次重试前和 sleep 期间（每 200ms）检查 `abort_token`，
+/// 如果已取消则立即返回 `ForkedAgentError::Aborted`。
 async fn acquire_provider_with_retry(
     provider_pool: &Arc<ProviderPool>,
     max_attempts: usize,
     initial_delay_ms: u64,
     max_delay_ms: u64,
+    abort_token: &blockcell_core::AbortToken,
 ) -> Result<Arc<dyn blockcell_providers::Provider>, ForkedAgentError> {
     let mut delay_ms = initial_delay_ms;
 
     for attempt in 0..max_attempts {
+        // 检查取消信号，避免在已取消时继续重试
+        if abort_token.is_cancelled() {
+            return Err(ForkedAgentError::Aborted(
+                "Operation aborted while acquiring provider".to_string(),
+            ));
+        }
+
         match provider_pool.acquire() {
             Some((_name, provider)) => {
                 if attempt > 0 {
@@ -1960,7 +2431,19 @@ async fn acquire_provider_with_retry(
                         delay_ms,
                         "[forked_agent] No provider available, retrying..."
                     );
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    // 分段 sleep，每 200ms 检查一次取消信号
+                    let mut remaining = delay_ms;
+                    let check_interval = 200u64;
+                    while remaining > 0 {
+                        let sleep_ms = remaining.min(check_interval);
+                        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                        remaining = remaining.saturating_sub(sleep_ms);
+                        if abort_token.is_cancelled() {
+                            return Err(ForkedAgentError::Aborted(
+                                "Operation aborted while waiting for provider".to_string(),
+                            ));
+                        }
+                    }
                     // 指数退避，但不超过最大延迟
                     delay_ms = (delay_ms * 2).min(max_delay_ms);
                 }
@@ -2006,6 +2489,269 @@ impl ForkAgentEvent {
             "[fork_agent_event]"
         );
     }
+}
+
+/// 从工具参数中提取摘要信息，用于控制台实时显示。
+///
+/// 例如 read_file → "src/main.rs", grep → "pattern='TODO'", write_file → "config.json"
+fn extract_tool_summary(tool_name: &str, input: &serde_json::Value) -> String {
+    let obj = match input.as_object() {
+        Some(o) => o,
+        None => return String::new(),
+    };
+
+    match tool_name {
+        "read_file" | "file_edit" | "edit_file" => {
+            // 显示文件路径
+            obj.get("path")
+                .or_else(|| obj.get("file_path"))
+                .and_then(|v| v.as_str())
+                .map(truncate_path)
+                .unwrap_or_default()
+        }
+        "write_file" | "file_write" => obj
+            .get("path")
+            .or_else(|| obj.get("file_path"))
+            .and_then(|v| v.as_str())
+            .map(truncate_path)
+            .unwrap_or_default(),
+        "grep" | "search" => {
+            // 显示搜索模式
+            let pattern = obj.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let path = obj.get("path").and_then(|v| v.as_str()).map(truncate_path);
+            if let Some(p) = path {
+                format!("\"{}\" in {}", pattern, p)
+            } else {
+                format!("\"{}\"", pattern)
+            }
+        }
+        "glob" => obj
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .map(|p| format!("\"{}\"", p))
+            .unwrap_or_default(),
+        "exec" | "exec_local" => {
+            obj.get("command")
+                .and_then(|v| v.as_str())
+                .map(|c| {
+                    // 只显示命令的第一行/前60字符
+                    let first_line = c.lines().next().unwrap_or(c);
+                    if first_line.len() > 60 {
+                        format!("{}...", &first_line[..60])
+                    } else {
+                        first_line.to_string()
+                    }
+                })
+                .unwrap_or_default()
+        }
+        "web_search" | "web_fetch" => obj
+            .get("query")
+            .or_else(|| obj.get("url"))
+            .and_then(|v| v.as_str())
+            .map(|q| {
+                if q.len() > 80 {
+                    format!("{}...", &q[..80])
+                } else {
+                    q.to_string()
+                }
+            })
+            .unwrap_or_default(),
+        "list_dir" => obj
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(truncate_path)
+            .unwrap_or_default(),
+        _ => {
+            // 通用：尝试提取最常见的参数名
+            for key in &[
+                "path",
+                "file_path",
+                "query",
+                "url",
+                "name",
+                "command",
+                "pattern",
+                "message",
+            ] {
+                if let Some(v) = obj.get(*key).and_then(|v| v.as_str()) {
+                    let truncated = if v.len() > 80 {
+                        format!("{}...", &v[..80])
+                    } else {
+                        v.to_string()
+                    };
+                    return truncated;
+                }
+            }
+            String::new()
+        }
+    }
+}
+
+/// 截断路径，保留最后两级目录 + 文件名
+fn truncate_path(path: &str) -> String {
+    let parts: Vec<&str> = path.split(['/', '\\']).collect();
+    if parts.len() <= 3 {
+        path.to_string()
+    } else {
+        format!(".../{}", parts[parts.len() - 3..].join("/"))
+    }
+}
+
+/// 构建 Forked Agent 可用工具的 schema 定义。
+///
+/// 返回 OpenAI function-calling 格式的工具 schema 列表，
+/// 根据 disallowed_tools 过滤掉不允许的工具。
+///
+/// 支持的工具：read_file, list_dir, grep, glob, file_edit, edit_file, file_write, write_file
+pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json::Value> {
+    use serde_json::json;
+
+    let all_schemas = vec![
+        // read_file
+        json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read the contents of a file. Returns the file content as text, truncated if too large.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "The absolute or relative path to the file to read."
+                        }
+                    },
+                    "required": ["file_path"]
+                }
+            }
+        }),
+        // list_dir
+        json!({
+            "type": "function",
+            "function": {
+                "name": "list_dir",
+                "description": "List the contents of a directory. Returns file and directory names with type indicators (/ for directories).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The directory path to list. Defaults to current directory."
+                        }
+                    }
+                }
+            }
+        }),
+        // grep
+        json!({
+            "type": "function",
+            "function": {
+                "name": "grep",
+                "description": "Search for a pattern in a file. Returns matching lines (up to 100).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "The text pattern to search for."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "The file path to search in."
+                        }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        }),
+        // glob
+        json!({
+            "type": "function",
+            "function": {
+                "name": "glob",
+                "description": "Find files matching a pattern in a directory. Supports basic wildcards like *.rs, src*, etc.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "The glob pattern to match (e.g. '*.rs', 'src*')."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "The directory to search in. Defaults to current directory."
+                        }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        }),
+        // edit_file
+        json!({
+            "type": "function",
+            "function": {
+                "name": "edit_file",
+                "description": "Edit a file by replacing a unique string with a new string. The old_string must appear exactly once in the file unless replace_all is true.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "The path to the file to edit."
+                        },
+                        "old_string": {
+                            "type": "string",
+                            "description": "The exact text to find and replace. Must be unique in the file unless replace_all is true."
+                        },
+                        "new_string": {
+                            "type": "string",
+                            "description": "The text to replace old_string with."
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "If true, replace ALL occurrences of old_string. Default: false."
+                        }
+                    },
+                    "required": ["file_path", "old_string", "new_string"]
+                }
+            }
+        }),
+        // write_file
+        json!({
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write content to a file. Creates parent directories if needed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "The path to the file to write."
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The content to write to the file."
+                        }
+                    },
+                    "required": ["file_path", "content"]
+                }
+            }
+        }),
+    ];
+
+    // Filter out disallowed tools
+    all_schemas
+        .into_iter()
+        .filter(|schema| {
+            let name = schema
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            !disallowed_tools.iter().any(|d| d == name)
+        })
+        .collect()
 }
 
 #[cfg(test)]

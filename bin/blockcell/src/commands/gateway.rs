@@ -1,7 +1,8 @@
 use anyhow::Context;
 use blockcell_agent::{
-    AgentRuntime, CapabilityRegistryAdapter, ConfirmRequest, CoreEvolutionAdapter,
+    AgentRuntime, CapabilityRegistryAdapter, CheckpointManager, ConfirmRequest,
     MemoryStoreAdapter, MessageBus, ProviderLLMBridge, ResponseCacheConfig, TaskManager,
+    CoreEvolutionAdapter,
 };
 #[cfg(feature = "dingtalk")]
 use blockcell_channels::dingtalk::DingTalkChannel;
@@ -37,8 +38,8 @@ use blockcell_tools::{
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
 use axum::{
@@ -118,6 +119,22 @@ enum WsEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         media: Vec<String>,
     },
+    #[serde(rename = "agent_progress")]
+    AgentProgress {
+        task_id: String,
+        progress_type: String,
+        tokens_added: u64,
+        tools_added: u64,
+        total_tokens: u64,
+        total_tools: u64,
+    },
+    /// 任务阶段进度（阶段描述 + 百分比）
+    #[serde(rename = "agent_stage")]
+    AgentStage {
+        task_id: String,
+        stage: String,
+        percent: u8,
+    },
     #[serde(rename = "error")]
     Error { chat_id: String, message: String },
 }
@@ -153,6 +170,7 @@ impl WsEvent {
 struct GatewayState {
     inbound_tx: mpsc::Sender<InboundMessage>,
     task_manager: TaskManager,
+    checkpoint_manager: CheckpointManager,
     config: Config,
     paths: Paths,
     api_token: Option<String>,
@@ -185,6 +203,16 @@ struct GatewayState {
 pub(super) struct AgentScopedQuery {
     #[serde(default)]
     pub agent: Option<String>,
+}
+
+/// 格式化进度条（10 格宽度，用于 channel 进度转发）
+/// 使用四舍五入避免 1-9% 显示为空进度条
+fn format_progress_bar(percent: u8) -> String {
+    let clamped = percent.min(100);
+    // 四舍五入：(clamped * 10 + 50) / 100，5% 显示 1 格
+    let filled = ((clamped as usize * 10 + 50) / 100).min(10);
+    let empty = 10 - filled;
+    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
 }
 
 fn secure_eq(a: &str, b: &str) -> bool {
@@ -688,38 +716,34 @@ fn open_agent_memory_store(paths: &Paths, config: &Config) -> Option<MemoryStore
 
 /// Create a session clear callback for CommandContext.
 /// This callback is used by the /clear command to clear ResponseCache.
+///
+/// 使用 std::sync::RwLock 而非 tokio::sync::RwLock，使回调完全同步，
+/// 避免 handle.block_on() 在 tokio worker 线程中 panic。
 fn create_session_clear_callback(
     response_caches: Arc<RwLock<HashMap<String, blockcell_agent::ResponseCache>>>,
     agent_id: String,
     session_key: String,
 ) -> Arc<dyn Fn() -> bool + Send + Sync> {
     Arc::new(move || {
-        // Use try_current to get tokio runtime handle
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let caches = response_caches.clone();
-            let agent_id = agent_id.clone();
-            let session_key = session_key.clone();
-
-            handle.block_on(async {
-                let caches = caches.read().await;
-                if let Some(cache) = caches.get(&agent_id) {
-                    cache.clear_session(&session_key);
-                    info!(
-                        session_key = %session_key,
-                        agent_id = %agent_id,
-                        "[/clear] ResponseCache cleared"
-                    );
-                    true
-                } else {
-                    warn!(
-                        agent_id = %agent_id,
-                        "[/clear] No ResponseCache found for agent"
-                    );
-                    false
-                }
-            })
+        // std::sync::RwLock 的 read() 是同步的，无需 block_on
+        if let Ok(caches) = response_caches.read() {
+            if let Some(cache) = caches.get(&agent_id) {
+                cache.clear_session(&session_key);
+                info!(
+                    session_key = %session_key,
+                    agent_id = %agent_id,
+                    "[/clear] ResponseCache cleared"
+                );
+                true
+            } else {
+                warn!(
+                    agent_id = %agent_id,
+                    "[/clear] No ResponseCache found for agent"
+                );
+                false
+            }
         } else {
-            error!("[/clear] No tokio runtime available");
+            warn!("[/clear] ResponseCache RwLock poisoned");
             false
         }
     })
@@ -816,6 +840,9 @@ async fn spawn_agent_runtime(
     if let Err(e) = runtime.init_memory_file_store() {
         warn!(agent_id = %agent_id, error = %e, "Failed to initialize file memory store");
     }
+    if let Err(e) = runtime.init_skill_file_store() {
+        warn!(agent_id = %agent_id, error = %e, "Failed to initialize skill file store");
+    }
 
     runtime.set_capability_registry(cap_registry_handle);
     runtime.set_core_evolution(core_evo_handle);
@@ -827,8 +854,20 @@ async fn spawn_agent_runtime(
     ));
     runtime.set_response_cache(response_cache.clone());
     {
-        let mut caches = response_caches.write().await;
-        caches.insert(agent_id.to_string(), response_cache);
+        // std::sync::RwLock 的 write() 是同步的，但可能因 panic 而 poisoned
+        // 使用 recover 模式避免 cascade failure
+        match response_caches.write() {
+            Ok(mut caches) => {
+                caches.insert(agent_id.to_string(), response_cache);
+            }
+            Err(e) => {
+                // Lock poisoned - recover by clearing and re-inserting
+                let mut caches = e.into_inner();
+                caches.clear();
+                caches.insert(agent_id.to_string(), response_cache);
+                warn!("response_caches lock was poisoned, recovered");
+            }
+        }
     }
     info!(agent_id = %agent_id, "ResponseCache registered for /clear command");
 
@@ -836,6 +875,7 @@ async fn spawn_agent_runtime(
     if let Err(e) = runtime.init_memory_injector().await {
         warn!(error = %e, "Failed to initialize memory injector");
     }
+    runtime.init_runtime_handle();
 
     let event_emitter = runtime.event_emitter_handle();
 
@@ -1103,8 +1143,172 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     // ── Create shutdown channel ──
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
-    // ── Create shared task manager ──
-    let task_manager = TaskManager::new();
+    // ── Create progress channel for agent execution updates ──
+    let (progress_tx, mut progress_rx) = mpsc::channel::<blockcell_agent::AgentProgress>(100);
+
+    // ── Create shared task manager with workspace and progress channel ──
+    let task_manager = TaskManager::with_workspace_and_progress(&paths.workspace(), progress_tx);
+
+    // Restore unfinished tasks from disk
+    let restored = task_manager.restore_from_disk(&paths.workspace()).await;
+    if restored > 0 {
+        info!("Restored {} unfinished tasks from disk", restored);
+    }
+
+    // Start periodic cleanup of evicted tasks (with file cleanup)
+    let cleanup_handle = Arc::new(task_manager.clone()).spawn_cleanup_loop(&paths.workspace());
+
+    // ── Bridge progress events to WebSocket broadcast + Channel forwarding ──
+    let ws_broadcast_for_progress = ws_broadcast_tx.clone();
+    let task_manager_for_progress = task_manager.clone();
+    let outbound_tx_for_progress = outbound_tx.clone();
+    tokio::spawn(async move {
+        use std::collections::HashMap;
+        // 节流：记录每个 task_id 上次转发到 channel 的百分比
+        // 仅当百分比变化 >= CHANNEL_PROGRESS_THRESHOLD 时才转发
+        const CHANNEL_PROGRESS_THRESHOLD: u8 = 20;
+        let mut last_forwarded_percent: HashMap<String, u8> = HashMap::new();
+
+        while let Some(progress) = progress_rx.recv().await {
+            // Convert AgentProgress to WsEvent and broadcast
+            let event = match &progress {
+                blockcell_agent::AgentProgress::Delta {
+                    task_id,
+                    tokens_added,
+                    tools_added,
+                    total_tokens,
+                    total_tools,
+                } => WsEvent::AgentProgress {
+                    task_id: task_id.clone(),
+                    progress_type: "delta".to_string(),
+                    tokens_added: *tokens_added,
+                    tools_added: *tools_added,
+                    total_tokens: *total_tokens,
+                    total_tools: *total_tools,
+                },
+                blockcell_agent::AgentProgress::Stage {
+                    task_id,
+                    stage,
+                    percent,
+                } => {
+                    // ── Channel 进度转发 ──
+                    // 将 Stage 事件转发到任务的 origin_channel（QQ/微信/Telegram 等）
+                    let should_forward = match last_forwarded_percent.get(task_id) {
+                        Some(&last) => percent.abs_diff(last) >= CHANNEL_PROGRESS_THRESHOLD,
+                        None => true, // 首次总是转发
+                    };
+                    // 100% 完成时总是转发，并清理节流记录防止内存泄漏
+                    let should_forward = should_forward || *percent >= 100;
+                    // 完成时清理该 task_id 的节流记录
+                    if *percent >= 100 {
+                        last_forwarded_percent.remove(task_id);
+                    }
+
+                    if should_forward {
+                        if *percent < 100 {
+                            // 仅在未完成时更新节流记录，完成时已清理
+                            last_forwarded_percent.insert(task_id.clone(), *percent);
+                        }
+                        if let Some(task) = task_manager_for_progress.get_task(task_id).await {
+                            // 仅转发到非 ws/cli 渠道（空渠道也跳过）
+                            if !task.origin_channel.is_empty()
+                                && task.origin_channel != "ws"
+                                && task.origin_channel != "cli"
+                            {
+                                let progress_bar = format_progress_bar(*percent);
+                                let mut text = format!(
+                                    "📊 任务进度: {} [{}%] {}",
+                                    task.label, percent, progress_bar
+                                );
+                                if !stage.is_empty() {
+                                    // 附带阶段描述（如果非空）
+                                    // 注意：部分渠道有消息长度限制，截断到 50 字符
+                                    let stage_display: String = stage.chars().take(50).collect();
+                                    text.push_str(&format!(" - {}", stage_display));
+                                }
+                                let outbound = OutboundMessage::new(
+                                    &task.origin_channel,
+                                    &task.origin_chat_id,
+                                    &text,
+                                );
+                                let _ = outbound_tx_for_progress.send(outbound).await;
+                            }
+                        }
+                    }
+
+                    WsEvent::AgentStage {
+                        task_id: task_id.clone(),
+                        stage: stage.clone(),
+                        percent: *percent,
+                    }
+                }
+                blockcell_agent::AgentProgress::Notification(_) => {
+                    // Notifications are handled separately via system events
+                    continue;
+                }
+                blockcell_agent::AgentProgress::ToolCallStart {
+                    task_id,
+                    tool,
+                    call_id: _,
+                    agent_type,
+                    summary,
+                } => {
+                    // 转发工具调用开始事件到外部渠道
+                    if !task_id.is_empty() {
+                        if let Some(task) = task_manager_for_progress.get_task(task_id).await {
+                            if !task.origin_channel.is_empty()
+                                && task.origin_channel != "ws"
+                                && task.origin_channel != "cli"
+                            {
+                                let text = if summary.is_empty() {
+                                    format!("🔧 [{}] {}", agent_type, tool)
+                                } else {
+                                    format!("🔧 [{}] {}({})", agent_type, tool, summary)
+                                };
+                                let outbound = OutboundMessage::new(
+                                    &task.origin_channel,
+                                    &task.origin_chat_id,
+                                    &text,
+                                );
+                                let _ = outbound_tx_for_progress.send(outbound).await;
+                            }
+                        }
+                    }
+                    // 不转发到 WebSocket（event_tx 已经处理了 WebSocket）
+                    continue;
+                }
+                blockcell_agent::AgentProgress::ToolCallEnd {
+                    task_id,
+                    tool,
+                    call_id: _,
+                    agent_type,
+                    success,
+                } => {
+                    // 转发工具调用完成事件到外部渠道
+                    if !task_id.is_empty() {
+                        if let Some(task) = task_manager_for_progress.get_task(task_id).await {
+                            if !task.origin_channel.is_empty()
+                                && task.origin_channel != "ws"
+                                && task.origin_channel != "cli"
+                            {
+                                let status = if *success { "✓" } else { "✗" };
+                                let text = format!("{} [{}] {} done", status, agent_type, tool);
+                                let outbound = OutboundMessage::new(
+                                    &task.origin_channel,
+                                    &task.origin_chat_id,
+                                    &text,
+                                );
+                                let _ = outbound_tx_for_progress.send(outbound).await;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+            let _ = ws_broadcast_for_progress.send(event.to_json());
+        }
+    });
+
     let mcp_manager = Arc::new(McpManager::load(&paths).await?);
 
     // ── Create tool registry (shared for listing tools) ──
@@ -1344,6 +1548,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     // 斜杠命令拦截需要的变量
     let slash_paths = paths.clone();
     let slash_task_manager = task_manager.clone();
+    let slash_checkpoint_manager = blockcell_agent::CheckpointManager::new(&paths.workspace());
     let slash_outbound_tx = outbound_tx.clone();
     let slash_response_caches = response_caches.clone();
     let slash_config = config.clone();
@@ -1398,6 +1603,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
                 let ctx = CommandContext::for_channel(
                     slash_paths.clone(),
                     slash_task_manager.clone(),
+                    slash_checkpoint_manager.clone(),
                     msg.channel.clone(),
                     msg.chat_id.clone(),
                     Some(msg.sender_id.clone()),
@@ -1453,7 +1659,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
                         transformed_content,
                         original_command,
                     } => {
-                        // 命令需要转发给 AgentRuntime（如 /learn）
+                        // 命令需要转发给 AgentRuntime（如 /learn, /cancel-task, /resume）
                         info!(
                             channel = %msg.channel,
                             command = %original_command,
@@ -1461,6 +1667,11 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
                         );
                         // 修改消息内容为转换后的内容
                         msg.content = transformed_content;
+                        // 标记来源为斜杠命令，runtime 据此验证授权
+                        msg.metadata = serde_json::json!({
+                            "source": "slash_command",
+                            "original_command": original_command
+                        });
                         // 继续正常流程，转发给 AgentRuntime
                     }
                 }
@@ -1726,6 +1937,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     let gateway_state = GatewayState {
         inbound_tx: inbound_tx.clone(),
         task_manager,
+        checkpoint_manager: CheckpointManager::new(&paths.workspace()),
         config: config.clone(),
         paths: paths.clone(),
         api_token: api_token.clone(),
@@ -1964,6 +2176,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         ("interceptor".to_string(), interceptor_handle),
         ("heartbeat".to_string(), heartbeat_handle),
         ("ghost".to_string(), ghost_handle),
+        ("cleanup_loop".to_string(), cleanup_handle),
     ];
     handles.extend(runtime_handles);
     handles.extend(cron_handles);

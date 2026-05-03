@@ -52,6 +52,8 @@ pub struct ExtractionCursor {
     pub extraction_count: usize,
     /// 上次提取时的内容签名（用于检测内容变化）
     pub last_content_signature: Option<u64>,
+    /// 上次提取时的内容长度（用于精确计算内容变化量）
+    pub last_content_length: Option<usize>,
     /// 上次提取的 monotonic 时间点（不序列化，运行时使用）
     #[serde(skip)]
     pub last_extraction_instant: Option<Instant>,
@@ -67,6 +69,7 @@ impl ExtractionCursor {
             last_extraction_time: None,
             extraction_count: 0,
             last_content_signature: None,
+            last_content_length: None,
             last_extraction_instant: None,
         }
     }
@@ -127,14 +130,13 @@ impl ExtractionCursor {
 
         match self.last_content_signature {
             Some(last_sig) => {
-                // 计算签名差异
-                // 简单实现：签名不同就算有变化
-                // 更复杂实现：可以计算内容长度差异
-                current_signature != last_sig
-                    && current_content
-                        .len()
-                        .saturating_sub(estimate_content_len_from_signature(last_sig))
-                        >= content_change_threshold
+                if current_signature == last_sig {
+                    return false; // 签名相同，内容未变
+                }
+                // 签名不同，检查内容长度变化量
+                let last_len = self.last_content_length.unwrap_or(0);
+                let content_delta = current_content.len().abs_diff(last_len);
+                content_delta >= content_change_threshold
             }
             None => true, // 从未提取过，内容变化通过
         }
@@ -246,10 +248,11 @@ impl ExtractionCursor {
         self.extraction_count += 1;
     }
 
-    /// 更新游标（包含内容签名）
+    /// 更新游标（包含内容签名和长度）
     pub fn update_with_content(&mut self, message_uuid: Uuid, message_count: usize, content: &str) {
         self.update(message_uuid, message_count);
         self.last_content_signature = Some(compute_content_signature(content));
+        self.last_content_length = Some(content.len());
     }
 }
 
@@ -288,13 +291,6 @@ fn compute_content_signature(content: &str) -> u64 {
     hasher.finish()
 }
 
-/// 从签名估算内容长度（粗略估计）
-fn estimate_content_len_from_signature(_signature: u64) -> usize {
-    // 简单实现：签名不包含长度信息，返回 0
-    // 实际实现可以存储更多信息在签名中
-    0
-}
-
 /// 游标管理器
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractionCursorManager {
@@ -321,11 +317,19 @@ impl ExtractionCursorManager {
             if let Ok(manager) = serde_json::from_str::<ExtractionCursorManager>(&content) {
                 self.cursors = manager.cursors;
             } else {
-                // JSON 解析失败，记录警告但继续使用默认值
+                // JSON 解析失败，备份损坏文件后使用默认值
                 tracing::warn!(
                     path = %self.cursor_file_path.display(),
-                    "[cursor] Failed to parse cursor file, using defaults"
+                    "[cursor] Failed to parse cursor file, backing up and using defaults"
                 );
+                // 备份损坏的文件，避免数据永久丢失
+                let backup_path = self.cursor_file_path.with_extension("cursors.json.bak");
+                if let Err(e) = fs::rename(&self.cursor_file_path, &backup_path).await {
+                    tracing::warn!(
+                        error = %e,
+                        "[cursor] Failed to backup corrupted cursor file"
+                    );
+                }
             }
         }
         Ok(())

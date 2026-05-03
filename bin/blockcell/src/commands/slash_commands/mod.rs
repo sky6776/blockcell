@@ -214,7 +214,16 @@ impl SlashCommandHandler {
 
                 // 权限检查
                 if command.requires_permission() {
-                    // TODO: 实现权限验证
+                    // 预留的权限验证扩展点
+                    // 当前所有命令 requires_permission() 返回 false，此分支不会触发
+                    // 未来实现时需：
+                    // 1. 在 CommandSource 中填充 sender_id（用户身份）
+                    // 2. 在 Config 中定义权限规则（管理员列表/角色映射）
+                    // 3. 实现权限检查逻辑（检查用户是否有权执行此命令）
+                    // 示例：
+                    // if !ctx.source.sender_id.map(|id| is_admin(&id)).unwrap_or(false) {
+                    //     return CommandResult::PermissionDenied;
+                    // }
                 }
 
                 // 带超时执行命令

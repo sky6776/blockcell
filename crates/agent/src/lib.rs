@@ -1,6 +1,10 @@
+pub mod agent_progress;
+pub mod agent_prompts;
+pub mod agent_types;
 pub mod auto_memory;
 pub mod bus;
 pub mod capability_adapter;
+pub mod checkpoint;
 pub mod compact;
 pub mod context;
 pub(crate) mod error;
@@ -19,6 +23,7 @@ pub mod learning_throttle;
 pub mod memory_adapter;
 pub mod memory_file_store;
 pub mod memory_system;
+pub mod progress;
 pub mod prompt_skill_executor;
 pub mod response_cache;
 pub mod runtime;
@@ -36,10 +41,19 @@ pub mod summary_queue;
 pub mod system_event_orchestrator;
 pub mod system_event_store;
 pub mod task_manager;
+pub mod task_notification;
 pub(crate) mod token;
 pub mod unified_security_scanner;
 pub mod write_guard;
 
+pub use agent_progress::AgentProgress;
+pub use agent_prompts::{
+    EXPLORE_SYSTEM_PROMPT, GENERAL_SYSTEM_PROMPT, PLAN_SYSTEM_PROMPT, VERIFICATION_SYSTEM_PROMPT,
+    VIPER_SYSTEM_PROMPT,
+};
+pub use agent_types::{
+    built_in_agent_types, AgentTypeDefinition, AgentTypeRegistry, PermissionMode,
+};
 pub use auto_memory::{
     get_memory_dir, get_memory_file_path, should_extract_auto_memory,
     should_extract_auto_memory_with_config, AutoMemoryConfig, AutoMemoryExtractor,
@@ -56,8 +70,10 @@ pub use forked::{
     create_auto_mem_can_use_tool, create_cache_safe_params, create_cache_safe_params_with_tools,
     create_compact_can_use_tool, create_dream_can_use_tool, create_memory_file_can_use_tool,
     create_skill_review_can_use_tool, run_forked_agent, CacheSafeParams, CanUseToolFn,
-    ForkedAgentParams, ForkedAgentResult, ToolDefinition, ToolPermission, UsageMetrics,
+    ForkedAgentParams, ForkedAgentResult, ToolDefinition, ToolPermission,
 };
+// UsageMetrics 从 blockcell_core 导出
+pub use blockcell_core::UsageMetrics;
 pub use ghost_learning::{
     GhostEpisodeSnapshot, GhostLearningBoundary, GhostLearningBoundaryKind, GhostLearningPolicy,
     LearningDecision,
@@ -85,14 +101,17 @@ pub use memory_system::{
 };
 pub use response_cache::{ResponseCache, ResponseCacheConfig};
 pub use runtime::{AgentRuntime, ConfirmRequest};
+// Re-export RuntimeHandle trait from tools crate for convenience
+pub use blockcell_tools::RuntimeHandle;
+pub use checkpoint::{CheckpointManager, TaskCheckpoint};
 pub use session_memory::{
     get_session_memory_content_for_compact, get_session_memory_dir, get_session_memory_path,
     should_extract_memory, wait_for_session_memory_extraction,
     wait_for_session_memory_extraction_with_timeout, Section, SectionPriority, SessionMemoryConfig,
     SessionMemoryState, DEFAULT_SESSION_MEMORY_TEMPLATE,
 };
+pub use task_manager::{TaskManager, TaskStatus};
 pub use skill_file_store::{SkillFileMutation, SkillFileStore};
-pub use task_manager::TaskManager;
 pub use unified_security_scanner::{
     scan_learned_memory_content, scan_learned_skill_content, scan_learned_skill_dir,
     UnifiedSecurityScanner,

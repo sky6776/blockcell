@@ -2,7 +2,7 @@
 //!
 //! 定义斜杠命令执行所需的上下文信息。
 
-use blockcell_agent::TaskManager;
+use blockcell_agent::{CheckpointManager, TaskManager};
 use blockcell_core::Paths;
 use std::sync::Arc;
 
@@ -54,6 +54,8 @@ pub struct CommandContext {
     pub paths: Paths,
     /// 任务管理器
     pub task_manager: Option<TaskManager>,
+    /// 断点恢复管理器
+    pub checkpoint_manager: Option<CheckpointManager>,
     /// 原始消息来源
     pub source: CommandSource,
     /// 会话清除回调（用于 /clear 命令）
@@ -78,20 +80,32 @@ impl CommandContext {
     }
 
     /// 创建 CLI 上下文
-    pub fn for_cli(paths: Paths, task_manager: TaskManager, chat_id: String) -> Self {
+    pub fn for_cli(
+        paths: Paths,
+        task_manager: TaskManager,
+        checkpoint_manager: CheckpointManager,
+        chat_id: String,
+    ) -> Self {
         Self {
             paths,
             task_manager: Some(task_manager),
+            checkpoint_manager: Some(checkpoint_manager),
             source: CommandSource::cli(chat_id),
             session_clear_callback: None,
         }
     }
 
     /// 创建 WebSocket 上下文
-    pub fn for_websocket(paths: Paths, task_manager: TaskManager, chat_id: String) -> Self {
+    pub fn for_websocket(
+        paths: Paths,
+        task_manager: TaskManager,
+        checkpoint_manager: CheckpointManager,
+        chat_id: String,
+    ) -> Self {
         Self {
             paths,
             task_manager: Some(task_manager),
+            checkpoint_manager: Some(checkpoint_manager),
             source: CommandSource::websocket(chat_id),
             session_clear_callback: None,
         }
@@ -101,6 +115,7 @@ impl CommandContext {
     pub fn for_channel(
         paths: Paths,
         task_manager: TaskManager,
+        checkpoint_manager: CheckpointManager,
         channel: String,
         chat_id: String,
         sender_id: Option<String>,
@@ -108,6 +123,7 @@ impl CommandContext {
         Self {
             paths,
             task_manager: Some(task_manager),
+            checkpoint_manager: Some(checkpoint_manager),
             source: CommandSource::channel(channel, chat_id, sender_id),
             session_clear_callback: None,
         }

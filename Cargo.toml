@@ -119,6 +119,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 once_cell = "1.19"
 rabitq_rs = { git = "https://github.com/lqhl/rabitq-rs", package = "rabitq-rs" }
 
+# Testing utilities
+tempfile = "3.10"
+
 # URL encoding
 urlencoding = "2.1"
 

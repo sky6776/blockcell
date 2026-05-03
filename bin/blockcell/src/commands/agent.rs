@@ -1,6 +1,7 @@
 use blockcell_agent::{
-    AgentRuntime, CapabilityRegistryAdapter, ConfirmRequest, CoreEvolutionAdapter,
+    AgentRuntime, CapabilityRegistryAdapter, CheckpointManager, ConfirmRequest,
     MemoryStoreAdapter, MessageBus, ProviderLLMBridge, ResponseCache, ResponseCacheConfig,
+    CoreEvolutionAdapter,
     TaskManager,
 };
 #[cfg(feature = "dingtalk")]
@@ -445,6 +446,9 @@ pub async fn run(
         if let Err(e) = runtime.init_memory_file_store() {
             warn!(error = %e, "Failed to initialize file memory store");
         }
+        if let Err(e) = runtime.init_skill_file_store() {
+            warn!(error = %e, "Failed to initialize skill file store");
+        }
 
         runtime.set_capability_registry(cap_registry_handle.clone());
         runtime.set_core_evolution(core_evo_handle.clone());
@@ -455,7 +459,8 @@ pub async fn run(
         }
 
         // Create event broadcast channel for streaming output
-        let (event_tx, mut event_rx) = broadcast::channel::<String>(256);
+        // 容量 2048：避免长 streaming 响应（大量 token 事件）导致 receiver Lagged
+        let (event_tx, mut event_rx) = broadcast::channel::<String>(2048);
         runtime.set_event_tx(event_tx.clone());
 
         // Spawn event handler for streaming token output
@@ -463,41 +468,58 @@ pub async fn run(
             use std::io::Write;
             let mut stdout = std::io::stdout();
             let mut emitted_text_delta = false;
-            while let Ok(event_str) = event_rx.recv().await {
-                if let Ok(event) = serde_json::from_str::<serde_json::Value>(&event_str) {
-                    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    match event_type {
-                        "token" => {
-                            if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                                emitted_text_delta = true;
-                                print!("{}", delta);
-                                let _ = stdout.flush();
-                            }
-                        }
-                        "thinking" => {
-                            if let Some(content) = event.get("content").and_then(|v| v.as_str()) {
-                                print!("{}", content);
-                                let _ = stdout.flush();
-                            }
-                        }
-                        "tool_call_start" => {
-                            if let Some(tool) = event.get("tool").and_then(|v| v.as_str()) {
-                                eprintln!("\n🔧 Calling tool: {}...", tool);
-                            }
-                        }
-                        "message_done" => {
-                            if !emitted_text_delta {
-                                if let Some(content) = event.get("content").and_then(|v| v.as_str())
-                                {
-                                    if !content.is_empty() {
-                                        println!("\n{}", content);
+            loop {
+                match event_rx.recv().await {
+                    Ok(event_str) => {
+                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&event_str) {
+                            let event_type =
+                                event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            match event_type {
+                                "token" => {
+                                    if let Some(delta) = event.get("delta").and_then(|v| v.as_str())
+                                    {
+                                        emitted_text_delta = true;
+                                        print!("{}", delta);
+                                        let _ = stdout.flush();
                                     }
                                 }
+                                "thinking" => {
+                                    if let Some(content) =
+                                        event.get("content").and_then(|v| v.as_str())
+                                    {
+                                        print!("{}", content);
+                                        let _ = stdout.flush();
+                                    }
+                                }
+                                "tool_call_start" => {
+                                    if let Some(tool) = event.get("tool").and_then(|v| v.as_str()) {
+                                        eprintln!("\n🔧 Calling tool: {}...", tool);
+                                    }
+                                }
+                                "message_done" => {
+                                    if !emitted_text_delta {
+                                        if let Some(content) =
+                                            event.get("content").and_then(|v| v.as_str())
+                                        {
+                                            if !content.is_empty() {
+                                                println!("\n{}", content);
+                                            }
+                                        }
+                                    }
+                                    println!();
+                                    emitted_text_delta = false;
+                                }
+                                _ => {}
                             }
-                            println!();
-                            emitted_text_delta = false;
                         }
-                        _ => {}
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Receiver 落后于发送者，跳过 n 条消息，继续接收
+                        tracing::warn!(skipped = n, "Event receiver lagged, skipping messages");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // 所有 sender 已关闭，退出循环
+                        break;
                     }
                 }
             }
@@ -539,8 +561,49 @@ pub async fn run(
         // Create confirmation channel for path safety checks
         let (confirm_tx, mut confirm_rx) = mpsc::channel::<ConfirmRequest>(8);
 
-        // Create shared task manager
-        let task_manager = TaskManager::new();
+        // Create shared task manager with workspace and progress channel for persistence
+        let (progress_tx, mut progress_rx) = mpsc::channel::<blockcell_agent::AgentProgress>(100);
+        let task_manager =
+            TaskManager::with_workspace_and_progress(&paths.workspace(), progress_tx);
+
+        // Restore unfinished tasks from disk
+        let restored = task_manager.restore_from_disk(&paths.workspace()).await;
+        if restored > 0 {
+            info!("Restored {} unfinished tasks from disk", restored);
+        }
+
+        // Start periodic cleanup of evicted tasks (with file cleanup)
+        let cleanup_handle = Arc::new(task_manager.clone()).spawn_cleanup_loop(&paths.workspace());
+
+        // 启动进度事件监听：在控制台打印任务阶段进度
+        tokio::spawn(async move {
+            use blockcell_agent::AgentProgress;
+            while let Some(progress) = progress_rx.recv().await {
+                match progress {
+                    AgentProgress::Stage {
+                        task_id,
+                        stage,
+                        percent,
+                    } => {
+                        let short_id = short_task_id(&task_id, 8);
+                        if percent > 0 {
+                            eprintln!("[{}] {} ({}%)", short_id, stage, percent);
+                        } else {
+                            eprintln!("[{}] {}", short_id, stage);
+                        }
+                    }
+                    AgentProgress::Delta { .. } => {
+                        // Delta 事件在控制台不打印（太频繁）
+                    }
+                    AgentProgress::Notification(_) => {
+                        // Notification 由其他机制处理
+                    }
+                    AgentProgress::ToolCallStart { .. } | AgentProgress::ToolCallEnd { .. } => {
+                        // 工具调用事件通过 event_tx (broadcast) 处理，此处忽略
+                    }
+                }
+            }
+        });
 
         // Create channel manager for outbound message dispatch (before config is moved)
         let channel_manager =
@@ -654,7 +717,8 @@ pub async fn run(
         }
 
         // Create event broadcast channel for streaming output
-        let (event_tx, mut event_rx) = broadcast::channel::<String>(256);
+        // 容量 2048：避免长 streaming 响应（大量 token 事件）导致 receiver Lagged
+        let (event_tx, mut event_rx) = broadcast::channel::<String>(2048);
 
         runtime.set_outbound(outbound_tx);
         runtime.set_confirm(confirm_tx);
@@ -666,6 +730,9 @@ pub async fn run(
         }
         if let Err(e) = runtime.init_memory_file_store() {
             warn!(error = %e, "Failed to initialize file memory store");
+        }
+        if let Err(e) = runtime.init_skill_file_store() {
+            warn!(error = %e, "Failed to initialize skill file store");
         }
 
         runtime.set_capability_registry(cap_registry_handle.clone());
@@ -682,6 +749,7 @@ pub async fn run(
         if let Err(e) = runtime.init_memory_injector().await {
             warn!(error = %e, "Failed to initialize memory injector");
         }
+        runtime.init_runtime_handle();
 
         let event_emitter = runtime.event_emitter_handle();
 
@@ -719,61 +787,308 @@ pub async fn run(
         });
         info!("[dream] Dream service started for cross-session knowledge consolidation");
 
+        // 共享当前输入行状态，用于事件处理器在打印后台结果/进度时
+        // 先清除输入行和建议，打印完毕后重新渲染提示
+        let current_input: Arc<std::sync::Mutex<String>> =
+            Arc::new(std::sync::Mutex::new(String::new()));
+
         // Spawn event handler for streaming token output
-        let event_handler_handle = tokio::spawn(async move {
-            use std::io::Write;
-            let mut stdout = std::io::stdout();
-            // Track whether streaming tokens were emitted for the current response.
-            // If true, message_done should NOT reprint the content (avoid duplicate).
-            // If false (non-streaming path like skill loops), message_done prints content.
-            let mut emitted_text_delta = false;
-            while let Ok(event_str) = event_rx.recv().await {
-                if let Ok(event) = serde_json::from_str::<serde_json::Value>(&event_str) {
-                    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    match event_type {
-                        "token" => {
-                            // Streaming text token - print immediately
-                            if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                                emitted_text_delta = true;
-                                print!("{}", delta);
-                                let _ = stdout.flush();
-                            }
-                        }
-                        "thinking" => {
-                            // Thinking/reasoning content
-                            if let Some(content) = event.get("content").and_then(|v| v.as_str()) {
-                                print!("{}", content);
-                                let _ = stdout.flush();
-                            }
-                        }
-                        "tool_call_start" => {
-                            // Tool call started
-                            if let (Some(tool), Some(_call_id)) = (
-                                event.get("tool").and_then(|v| v.as_str()),
-                                event.get("call_id").and_then(|v| v.as_str()),
-                            ) {
-                                println!("\n🔧 Calling tool: {}...", tool);
-                            }
-                        }
-                        "message_done" => {
-                            if !emitted_text_delta {
-                                // Non-streaming response (e.g. skill loops): print content
-                                if let Some(content) = event.get("content").and_then(|v| v.as_str())
-                                {
-                                    if !content.is_empty() {
-                                        println!("\n{}", content);
+        let event_handler_handle = {
+            let current_input = current_input.clone();
+            tokio::spawn(async move {
+                use std::io::Write;
+                let mut stdout = std::io::stdout();
+                // Track whether streaming tokens were emitted for the current response.
+                // If true, message_done should NOT reprint the content (avoid duplicate).
+                // If false (non-streaming path like skill loops), message_done prints content.
+                let mut emitted_text_delta = false;
+                loop {
+                    match event_rx.recv().await {
+                        Ok(event_str) => {
+                            if let Ok(event) = serde_json::from_str::<serde_json::Value>(&event_str)
+                            {
+                                let event_type =
+                                    event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                match event_type {
+                                    "token" => {
+                                        // Streaming text token - print immediately
+                                        if let Some(delta) =
+                                            event.get("delta").and_then(|v| v.as_str())
+                                        {
+                                            emitted_text_delta = true;
+                                            print!("{}", delta);
+                                            let _ = stdout.flush();
+                                        }
                                     }
+                                    "thinking" => {
+                                        // Thinking/reasoning content
+                                        if let Some(content) =
+                                            event.get("content").and_then(|v| v.as_str())
+                                        {
+                                            print!("{}", content);
+                                            let _ = stdout.flush();
+                                        }
+                                    }
+                                    "tool_call_start" => {
+                                        // Tool call started
+                                        if let Some(tool) =
+                                            event.get("tool").and_then(|v| v.as_str())
+                                        {
+                                            let summary = event
+                                                .get("summary")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            // 如果有 agent_type，说明是子agent的工具调用
+                                            let agent_type = event
+                                                .get("agent_type")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            let task_id_short = event
+                                                .get("task_id")
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| short_task_id(s, 4))
+                                                .unwrap_or_default();
+                                            // 清除当前输入行，避免与提示重叠
+                                            clear_prompt_line(&current_input, &mut stdout);
+                                            if agent_type.is_empty() {
+                                                if summary.is_empty() {
+                                                    tracing::info!(
+                                                        tool = tool,
+                                                        "main agent tool call start"
+                                                    );
+                                                    eprintln!("\n🔧 {}", tool);
+                                                } else {
+                                                    tracing::info!(
+                                                        tool = tool,
+                                                        summary = summary,
+                                                        "main agent tool call start"
+                                                    );
+                                                    eprintln!("\n🔧 {}({})", tool, summary);
+                                                }
+                                            } else if task_id_short.is_empty() {
+                                                if summary.is_empty() {
+                                                    tracing::info!(
+                                                        agent_type = agent_type,
+                                                        tool = tool,
+                                                        "sub-agent tool call start"
+                                                    );
+                                                    eprintln!("  🔧 [{}] {}", agent_type, tool);
+                                                } else {
+                                                    tracing::info!(
+                                                        agent_type = agent_type,
+                                                        tool = tool,
+                                                        summary = summary,
+                                                        "sub-agent tool call start"
+                                                    );
+                                                    eprintln!(
+                                                        "  🔧 [{}] {}({})",
+                                                        agent_type, tool, summary
+                                                    );
+                                                }
+                                            } else {
+                                                if summary.is_empty() {
+                                                    tracing::info!(agent_type = agent_type, task_id = %task_id_short, tool = tool, "sub-agent tool call start");
+                                                    eprintln!(
+                                                        "  🔧 [{}:{}] {}",
+                                                        agent_type, task_id_short, tool
+                                                    );
+                                                } else {
+                                                    tracing::info!(agent_type = agent_type, task_id = %task_id_short, tool = tool, summary = summary, "sub-agent tool call start");
+                                                    eprintln!(
+                                                        "  🔧 [{}:{}] {}({})",
+                                                        agent_type, task_id_short, tool, summary
+                                                    );
+                                                }
+                                            }
+                                            // 恢复提示行
+                                            restore_prompt_line(&current_input, &mut stdout);
+                                        }
+                                    }
+                                    "tool_call_end" => {
+                                        // 子 agent 工具调用完成
+                                        let agent_type = event
+                                            .get("agent_type")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        let task_id_short = event
+                                            .get("task_id")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| short_task_id(s, 4))
+                                            .unwrap_or_default();
+                                        let tool = event
+                                            .get("tool")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        let success = event
+                                            .get("success")
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(true);
+                                        if !agent_type.is_empty() && !tool.is_empty() && !success {
+                                            clear_prompt_line(&current_input, &mut stdout);
+                                            if task_id_short.is_empty() {
+                                                tracing::info!(
+                                                    agent_type = agent_type,
+                                                    tool = tool,
+                                                    "sub-agent tool call failed"
+                                                );
+                                                eprintln!("  ✗ [{}] {} failed", agent_type, tool);
+                                            } else {
+                                                tracing::info!(agent_type = agent_type, task_id = %task_id_short, tool = tool, "sub-agent tool call failed");
+                                                eprintln!(
+                                                    "  ✗ [{}:{}] {} failed",
+                                                    agent_type, task_id_short, tool
+                                                );
+                                            }
+                                            restore_prompt_line(&current_input, &mut stdout);
+                                        }
+                                    }
+                                    "message_done" => {
+                                        // Message complete
+                                        // 检查是否是子agent汇总结果
+                                        let is_summary = event
+                                            .get("summary_for_subagents")
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false);
+                                        if is_summary {
+                                            // 主agent汇总子agent结果，直接打印
+                                            if let Some(content) =
+                                                event.get("content").and_then(|v| v.as_str())
+                                            {
+                                                if !content.is_empty() {
+                                                    clear_prompt_line(&current_input, &mut stdout);
+                                                    tracing::info!("sub-agent summary delivered");
+                                                    eprintln!("\n📋 **子agent结果汇总**");
+                                                    println!("{}", content);
+                                                    eprintln!("--- end ---");
+                                                    println!();
+                                                    restore_prompt_line(
+                                                        &current_input,
+                                                        &mut stdout,
+                                                    );
+                                                    // 标记已输出，防止后续 message_done 重复打印
+                                                    emitted_text_delta = true;
+                                                }
+                                            }
+                                        } else {
+                                            // For subagent results (background_delivery=true), print the content
+                                            // since it wasn't streamed via token events.
+                                            // For normal streaming responses, just print a newline.
+                                            let is_background = event
+                                                .get("background_delivery")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(false);
+                                            if is_background {
+                                                if let Some(content) =
+                                                    event.get("content").and_then(|v| v.as_str())
+                                                {
+                                                    if !content.is_empty() {
+                                                        // 获取 agent_type 用于标识来源
+                                                        let agent_type = event
+                                                            .get("agent_type")
+                                                            .and_then(|v| v.as_str())
+                                                            .unwrap_or("agent");
+                                                        let task_id_short = event
+                                                            .get("task_id")
+                                                            .and_then(|v| v.as_str())
+                                                            .map(|s| short_task_id(s, 8))
+                                                            .unwrap_or_default();
+                                                        // 清除当前输入行，打印结果，然后恢复提示
+                                                        clear_prompt_line(
+                                                            &current_input,
+                                                            &mut stdout,
+                                                        );
+                                                        tracing::info!(
+                                                            agent_type = agent_type,
+                                                            task_id = %task_id_short,
+                                                            "sub-agent background result delivered"
+                                                        );
+                                                        eprintln!(
+                                                            "\n--- {} agent [{}] result ---",
+                                                            agent_type, task_id_short
+                                                        );
+                                                        println!("{}", content);
+                                                        eprintln!("--- end ---");
+                                                        println!();
+                                                        restore_prompt_line(
+                                                            &current_input,
+                                                            &mut stdout,
+                                                        );
+                                                    }
+                                                }
+                                            } else {
+                                                // Non-streaming response: print content if not already emitted via tokens
+                                                if !emitted_text_delta {
+                                                    if let Some(content) = event
+                                                        .get("content")
+                                                        .and_then(|v| v.as_str())
+                                                    {
+                                                        if !content.is_empty() {
+                                                            println!("\n{}", content);
+                                                        }
+                                                    }
+                                                }
+                                                println!();
+                                                emitted_text_delta = false;
+                                            }
+                                        }
+                                    }
+                                    "agent_progress" => {
+                                        // 子 agent 进度事件
+                                        let agent_type = event
+                                            .get("agent_type")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("agent");
+                                        let task_id_short = event
+                                            .get("task_id")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| short_task_id(s, 4))
+                                            .unwrap_or_default();
+                                        let stage = event
+                                            .get("stage")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        let percent = event
+                                            .get("percent")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0);
+                                        if !stage.is_empty() {
+                                            clear_prompt_line(&current_input, &mut stdout);
+                                            let label = if task_id_short.is_empty() {
+                                                agent_type.to_string()
+                                            } else {
+                                                format!("{}:{}", agent_type, task_id_short)
+                                            };
+                                            // 同时输出到 tracing（写入日志文件）和 eprintln（终端显示）
+                                            tracing::info!(
+                                                label = %label,
+                                                stage = %stage,
+                                                percent = percent,
+                                                "sub-agent progress"
+                                            );
+                                            if percent > 0 {
+                                                eprintln!("  [{}] {} ({}%)", label, stage, percent);
+                                            } else {
+                                                eprintln!("  [{}] {}", label, stage);
+                                            }
+                                            restore_prompt_line(&current_input, &mut stdout);
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
-                            // Message complete - print newline
-                            println!();
-                            emitted_text_delta = false;
                         }
-                        _ => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            // Receiver 落后于发送者，跳过 n 条消息，继续接收
+                            tracing::warn!(skipped = n, "Event receiver lagged, skipping messages");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            // 所有 sender 已关闭，退出循环
+                            break;
+                        }
                     }
                 }
-            }
-        });
+            })
+        };
 
         // Spawn runtime loop
         let runtime_handle = tokio::spawn(async move {
@@ -788,8 +1103,12 @@ pub async fn run(
             while let Some(msg) = outbound_rx.recv().await {
                 match msg.channel.as_str() {
                     "cli" => {
-                        // CLI messages are already printed via streaming events (token),
-                        // skip to avoid duplicate output.
+                        // Print content if present (skill loops use non-streaming calls).
+                        // skip_ws_echo: 对于ws渠道，流式token已通过event_tx输出，避免重复
+                        // 对于CLI渠道，skip_ws_echo=true表示流式token已打印，跳过outbound重复输出
+                        if !msg.content.is_empty() && !msg.skip_ws_echo {
+                            let _ = printer_tx.send(msg).await;
+                        }
                     }
                     "cron" => {
                         let _ = printer_tx.send(msg).await;
@@ -805,18 +1124,22 @@ pub async fn run(
         });
 
         // Spawn outbound printer — prints responses from CLI and cron jobs
-        let printer_handle = tokio::spawn(async move {
-            while let Some(msg) = printer_rx.recv().await {
-                if msg.channel == "cron" {
-                    println!("\n[cron] {}", msg.content);
-                } else {
-                    println!("\n{}", msg.content);
+        let printer_handle = {
+            let current_input = current_input.clone();
+            tokio::spawn(async move {
+                let mut stdout = std::io::stdout();
+                while let Some(msg) = printer_rx.recv().await {
+                    clear_prompt_line(&current_input, &mut stdout);
+                    if msg.channel == "cron" {
+                        println!("\n[cron] {}", msg.content);
+                    } else {
+                        println!("\n{}", msg.content);
+                    }
+                    println!();
+                    restore_prompt_line(&current_input, &mut stdout);
                 }
-                println!();
-                print!("> ");
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-            }
-        });
+            })
+        };
 
         // Channel for the confirm handler to send a oneshot::Sender to the stdin thread,
         // so the stdin thread can route the next line of input as a confirmation response.
@@ -852,11 +1175,13 @@ pub async fn run(
         let stdin_tx = inbound_tx.clone();
         let session_clone = session.clone();
         let stdin_task_manager = task_manager.clone();
+        let stdin_checkpoint_manager = CheckpointManager::new(&paths.workspace());
 
         // 创建会话清除标记（用于 /clear 命令）
         let session_clear_flag = Arc::new(AtomicBool::new(false));
         let session_clear_flag_clone = session_clear_flag.clone();
         let response_cache_for_stdin = response_cache.clone();
+        let stdin_current_input = current_input.clone();
 
         let stdin_handle = tokio::task::spawn_blocking(move || {
             let mut stdout = std::io::stdout();
@@ -876,6 +1201,7 @@ pub async fn run(
                     &mut stdout,
                     &session_clone,
                     &stdin_tx,
+                    &stdin_current_input,
                 );
 
                 // Check if a confirmation request arrived
@@ -903,6 +1229,7 @@ pub async fn run(
                     let ctx = CommandContext::for_cli(
                         stdin_paths.clone(),
                         stdin_task_manager.clone(),
+                        stdin_checkpoint_manager.clone(),
                         session_clone
                             .split(':')
                             .nth(1)
@@ -944,7 +1271,7 @@ pub async fn run(
                             transformed_content,
                             original_command,
                         } => {
-                            // 命令需要转发给 AgentRuntime（如 /learn）
+                            // 命令需要转发给 AgentRuntime（如 /learn, /cancel-task, /resume）
                             tracing::info!(
                                 command = %original_command,
                                 "Forwarding command to AgentRuntime"
@@ -960,7 +1287,11 @@ pub async fn run(
                                     .to_string(),
                                 content: transformed_content,
                                 media: vec![],
-                                metadata: serde_json::Value::Null,
+                                // 标记来源为斜杠命令，runtime 据此验证授权
+                                metadata: serde_json::json!({
+                                    "source": "slash_command",
+                                    "original_command": original_command
+                                }),
                                 timestamp_ms: chrono::Utc::now().timestamp_millis(),
                             };
                             if stdin_tx.blocking_send(inbound).is_err() {
@@ -1010,6 +1341,10 @@ pub async fn run(
         let _ = stdin_handle.await;
 
         info!("Shutting down agent...");
+
+        // Stop cleanup loop
+        cleanup_handle.abort();
+
         let _ = shutdown_tx.send(());
 
         // Drop inbound_tx to close the channel and stop runtime
@@ -1043,8 +1378,13 @@ fn read_line_with_command_picker(
     stdout: &mut std::io::Stdout,
     _session: &str,
     _stdin_tx: &mpsc::Sender<InboundMessage>,
+    current_input: &std::sync::Mutex<String>,
 ) -> String {
     let mut input = String::new();
+    // 同步共享输入状态
+    if let Ok(mut shared) = current_input.lock() {
+        shared.clear();
+    }
     let all_items = collect_command_items(paths);
     let mut selected_index: usize = 0;
     let mut showing_picker = false;
@@ -1105,6 +1445,9 @@ fn read_line_with_command_picker(
 
                         // Add character to input
                         input.push(c);
+                        if let Ok(mut shared) = current_input.lock() {
+                            *shared = input.clone();
+                        }
 
                         // Check if we should show suggestions - detect '/' anywhere
                         if let Some((pos, query)) = extract_command_query(&input) {
@@ -1162,6 +1505,9 @@ fn read_line_with_command_picker(
                                 } else {
                                     input = format!("/{} ", item.name);
                                 }
+                                if let Ok(mut shared) = current_input.lock() {
+                                    *shared = input.clone();
+                                }
                                 render_input_line(&input, stdout);
                                 showing_picker = false;
                                 visible_count = 0;
@@ -1173,6 +1519,10 @@ fn read_line_with_command_picker(
                         // Submit the input
                         if showing_picker {
                             clear_suggestions(prev_visible_limit, &input, stdout);
+                        }
+                        // 清除共享输入状态，提交后不再需要恢复提示
+                        if let Ok(mut shared) = current_input.lock() {
+                            shared.clear();
                         }
                         let _ = terminal::disable_raw_mode();
                         println!();
@@ -1193,6 +1543,9 @@ fn read_line_with_command_picker(
                                     input = format!("{} /{} ", &input[..pos], item.name);
                                 } else {
                                     input = format!("/{} ", item.name);
+                                }
+                                if let Ok(mut shared) = current_input.lock() {
+                                    *shared = input.clone();
                                 }
                                 render_input_line(&input, stdout);
                                 showing_picker = false;
@@ -1263,6 +1616,9 @@ fn read_line_with_command_picker(
                         if !input.is_empty() {
                             // Remove last character
                             input.pop();
+                            if let Ok(mut shared) = current_input.lock() {
+                                *shared = input.clone();
+                            }
 
                             // Re-show suggestions if still in command mode
                             if let Some((_, query)) = extract_command_query(&input) {
@@ -1339,6 +1695,58 @@ fn read_line_with_command_picker(
             }
         }
     }
+}
+
+/// Clear the current input line (including any suggestions), preparing for
+/// 从 task_id 字符串中提取短且有意义的标识符。
+///
+/// Task ID 格式为 "task-{uuid_prefix}"（如 "task-bec116a0"）。
+/// 直接取前N个字符会得到无意义的 "task"。
+/// 此函数先剥离 "task-" 前缀，再从 UUID 部分取字符。
+///
+/// # Examples
+/// - `short_task_id("task-bec116a0", 4)` → `"bec1"`
+/// - `short_task_id("task-816ca144", 4)` → `"816c"`
+/// - `short_task_id("some-other-id", 4)` → `"some"` (无前缀匹配，回退)
+/// - `short_task_id("", 4)` → `""`
+fn short_task_id(task_id: &str, max_chars: usize) -> String {
+    if task_id.is_empty() {
+        return String::new();
+    }
+    // 剥离 "task-" 前缀，取有意义的 UUID 部分
+    let meaningful = if let Some(rest) = task_id.strip_prefix("task-") {
+        rest
+    } else {
+        task_id
+    };
+    meaningful.chars().take(max_chars).collect()
+}
+
+/// an interrupting output (e.g. background agent result, progress).
+/// After the caller prints its content, it should call `restore_prompt_line`.
+fn clear_prompt_line(_current_input: &std::sync::Mutex<String>, stdout: &mut std::io::Stdout) {
+    use std::io::Write;
+    // Clear current line and move to start
+    let _ = execute!(stdout, Print("\r"), Clear(ClearType::CurrentLine));
+    let _ = stdout.flush();
+    // Note: we don't know how many suggestion lines are visible,
+    // but since we're in raw mode the cursor is on the input line,
+    // so clearing CurrentLine is sufficient. Any suggestions below
+    // will be overwritten when we restore the prompt.
+}
+
+/// Restore the prompt line after an interrupting output.
+/// Re-renders "> {input}" so the user can continue typing.
+fn restore_prompt_line(current_input: &std::sync::Mutex<String>, stdout: &mut std::io::Stdout) {
+    use std::io::Write;
+    let input = current_input.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = execute!(
+        stdout,
+        Print("\r"),
+        Clear(ClearType::CurrentLine),
+        Print(format!("> {}", input))
+    );
+    let _ = stdout.flush();
 }
 
 /// Render the input line using crossterm commands

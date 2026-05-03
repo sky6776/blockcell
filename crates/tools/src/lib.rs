@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod agent_status;
 pub mod alert_rule;
 pub mod app_control;
@@ -33,6 +34,7 @@ pub mod office_write;
 pub mod registry;
 pub mod registry_builder;
 pub mod security_scan;
+pub mod send_message;
 pub mod session_recall;
 pub mod session_search;
 pub mod skill_manage;
@@ -50,7 +52,7 @@ pub mod web;
 use async_trait::async_trait;
 use blockcell_core::system_event::{EventPriority, SystemEvent};
 use blockcell_core::types::PermissionSet;
-use blockcell_core::{Config, OutboundMessage, Result};
+use blockcell_core::{AgentIdentity, Config, OutboundMessage, Result};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -83,14 +85,43 @@ pub type OutboundSender = mpsc::Sender<OutboundMessage>;
 #[async_trait]
 pub trait SpawnHandle: Send + Sync {
     /// Spawn a subagent task. Returns a JSON string with task_id and status.
+    ///
+    /// # Arguments
+    /// - `task`: The task description for the subagent
+    /// - `label`: A label for the task (used in task list)
+    /// - `origin_channel`: The channel the request came from
+    /// - `origin_chat_id`: The chat ID of the original conversation
+    /// - `agent_type`: Optional agent type identifier (e.g., "explore", "plan")
     fn spawn(
         &self,
         task: &str,
         label: &str,
         origin_channel: &str,
         origin_chat_id: &str,
+        agent_type: Option<&str>,
     ) -> Result<Value>;
 }
+
+/// Trait for typed agent execution from the agent tool.
+/// Supports Fork mode (inherits parent context) and typed agent spawning.
+#[async_trait]
+pub trait RuntimeHandle: Send + Sync {
+    /// Execute in Fork mode - inherits parent conversation context.
+    /// Returns the agent's response as a string.
+    async fn execute_fork_mode(&self, prompt: String) -> Result<String>;
+
+    /// Spawn a typed agent with specific capabilities.
+    /// Returns task_id for tracking.
+    async fn spawn_typed_agent(
+        &self,
+        agent_type: &str,
+        prompt: String,
+        description: Option<String>,
+    ) -> Result<String>;
+}
+
+/// Opaque handle to the runtime for typed agent execution.
+pub type AgentRuntimeHandle = Arc<dyn RuntimeHandle>;
 
 /// Opaque handle to the task manager, passed through ToolContext.
 /// This avoids a circular dependency between tools and agent crates.
@@ -268,6 +299,10 @@ pub trait TaskManagerOps: Send + Sync {
     async fn list_tasks_json(&self, status_filter: Option<String>) -> Value;
     async fn get_task_json(&self, task_id: &str) -> Option<Value>;
     async fn summary_json(&self) -> Value;
+    /// Send a message to a running agent task's message queue.
+    async fn send_message(&self, task_id: &str, message: String) -> Result<()>;
+    /// Check if a task is a ONE_SHOT type (cannot receive SendMessage).
+    async fn is_one_shot_task(&self, task_id: &str) -> bool;
 }
 
 #[derive(Clone)]
@@ -299,8 +334,30 @@ pub struct ToolContext {
     pub channel_contacts_file: Option<PathBuf>,
     /// Session response cache handle for session_recall tool.
     pub response_cache: Option<ResponseCacheHandle>,
+    /// Runtime handle for typed agent execution (agent tool).
+    pub runtime_handle: Option<AgentRuntimeHandle>,
+    // ===== 新增字段 =====
+    /// 当前Agent身份
+    pub agent_identity: Option<AgentIdentity>,
     /// Skill mutex handle for checking if a skill is currently active.
     pub skill_mutex: Option<SkillMutexHandle>,
+}
+
+impl ToolContext {
+    /// 获取当前Agent身份
+    pub fn current_identity(&self) -> Option<&AgentIdentity> {
+        self.agent_identity.as_ref()
+    }
+
+    /// 检查是否可以spawn子Agent（简化版）
+    /// 只检查ForkChild，不查询registry
+    /// 无身份信息时默认拒绝（保守策略，防止 ForkChild 逃逸）
+    pub fn can_spawn_subagent(&self) -> bool {
+        self.agent_identity
+            .as_ref()
+            .map(|id| id.can_spawn_subagent_basic())
+            .unwrap_or(false)
+    }
 }
 
 pub struct ToolSchema {
