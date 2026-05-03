@@ -467,7 +467,53 @@ impl OpenAIProvider {
         ))
     }
 
+    fn normalize_text_tool_markup(content: &str) -> String {
+        content
+            .replace("<｜DSML｜", "<")
+            .replace("</｜DSML｜", "</")
+            .replace("<|DSML|", "<")
+            .replace("</|DSML|", "</")
+    }
+
+    fn strip_text_tool_wrappers(content: &str) -> String {
+        let mut remaining = content.to_string();
+        for tag in ["<tool_calls>", "</tool_calls>", "<tools>", "</tools>"] {
+            remaining = remaining.replace(tag, "");
+        }
+        remaining
+    }
+
+    fn looks_like_text_tool_markup_delta(delta: &str) -> bool {
+        let normalized = Self::normalize_text_tool_markup(delta);
+        let lower = normalized.to_lowercase();
+        lower.contains("<tool_call")
+            || lower.contains("</tool_call")
+            || lower.contains("[tool_call]")
+            || lower.contains("[/tool_call]")
+            || lower.contains("<minimax:tool_call")
+            || lower.contains("</minimax:tool_call")
+            || lower.contains("<tool_calls")
+            || lower.contains("</tool_calls")
+            || lower.contains("<invoke")
+            || lower.contains("</invoke")
+            || lower.contains("<parameter")
+            || lower.contains("</parameter")
+            || lower.contains("[called:")
+    }
+
+    fn text_tool_markup_delta_closes(delta: &str) -> bool {
+        let normalized = Self::normalize_text_tool_markup(delta);
+        let lower = normalized.to_lowercase();
+        lower.contains("</tool_call>")
+            || lower.contains("[/tool_call]")
+            || lower.contains("</tool_calls>")
+            || lower.contains("</minimax:tool_call>")
+            || lower.contains("</invoke>")
+    }
+
     fn parse_text_tool_calls(content: &str) -> (String, Vec<ToolCallRequest>) {
+        let normalized_content = Self::normalize_text_tool_markup(content);
+        let content = normalized_content.as_str();
         let mut tool_calls = Vec::new();
         let mut remaining = String::new();
         let mut rest = content;
@@ -742,7 +788,9 @@ impl OpenAIProvider {
             remaining = pass4_remaining;
         }
 
-        let remaining = remaining.trim().to_string();
+        let remaining = Self::strip_text_tool_wrappers(&remaining)
+            .trim()
+            .to_string();
         (remaining, tool_calls)
     }
 
@@ -1389,6 +1437,7 @@ impl Provider for OpenAIProvider {
             let mut accumulated_reasoning = String::new();
             let mut finish_reason = "stop".to_string();
             let mut usage = Value::Null;
+            let mut suppress_text_tool_markup = false;
 
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
@@ -1427,11 +1476,24 @@ impl Provider for OpenAIProvider {
                                         // 处理文本增量
                                         if let Some(content) = &choice.delta.content {
                                             accumulated_content.push_str(content);
-                                            let _ = tx
-                                                .send(StreamChunk::TextDelta {
-                                                    delta: content.clone(),
-                                                })
-                                                .await;
+                                            let is_text_tool_markup =
+                                                tools_available
+                                                    && !matches!(mode, ToolCallMode::None)
+                                                    && (suppress_text_tool_markup
+                                                        || OpenAIProvider::looks_like_text_tool_markup_delta(content));
+
+                                            if is_text_tool_markup {
+                                                suppress_text_tool_markup =
+                                                    !OpenAIProvider::text_tool_markup_delta_closes(
+                                                        content,
+                                                    );
+                                            } else {
+                                                let _ = tx
+                                                    .send(StreamChunk::TextDelta {
+                                                        delta: content.clone(),
+                                                    })
+                                                    .await;
+                                            }
                                         }
 
                                         // 处理推理内容
@@ -1711,6 +1773,33 @@ ls -la
     }
 
     #[test]
+    fn test_parse_deepseek_dsml_tool_calls() {
+        let content = r#"<｜DSML｜tool_calls>
+<｜DSML｜invoke name="list_dir">
+<｜DSML｜parameter name="path" string="true">/home/blockcell/.blockcell/workspace/skills</｜DSML｜parameter>
+</｜DSML｜invoke>
+<｜DSML｜invoke name="list_dir">
+<｜DSML｜parameter name="path" string="true">/home/blockcell/.blockcell/skills</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>"#;
+
+        let (remaining, calls) = OpenAIProvider::parse_text_tool_calls(content);
+
+        assert!(remaining.is_empty(), "remaining: {:?}", remaining);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "list_dir");
+        assert_eq!(
+            calls[0].arguments["path"],
+            "/home/blockcell/.blockcell/workspace/skills"
+        );
+        assert_eq!(calls[1].name, "list_dir");
+        assert_eq!(
+            calls[1].arguments["path"],
+            "/home/blockcell/.blockcell/skills"
+        );
+    }
+
+    #[test]
     fn test_parse_minimax_invoke_without_minimax_wrapper() {
         // Sometimes the model omits the </minimax:tool_call> wrapper
         let content = "Let me check.\n<invoke name=\"list_skills\">\n</invoke>\nDone.";
@@ -1742,6 +1831,25 @@ ls -la
             response.content.as_deref(),
             Some("我来帮您查看上一级目录。")
         );
+        assert_eq!(response.finish_reason, "tool_calls");
+    }
+
+    #[test]
+    fn test_finalize_stream_response_parses_dsml_tool_call_blocks() {
+        let response = finalize_stream_response(
+            ToolCallMode::Text,
+            true,
+            "<｜DSML｜tool_calls><｜DSML｜invoke name=\"list_dir\"><｜DSML｜parameter name=\"path\" string=\"true\">/tmp</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>".to_string(),
+            String::new(),
+            vec![],
+            "stop".to_string(),
+            Value::Null,
+        );
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "list_dir");
+        assert_eq!(response.tool_calls[0].arguments["path"], "/tmp");
+        assert!(response.content.is_none());
         assert_eq!(response.finish_reason, "tool_calls");
     }
 

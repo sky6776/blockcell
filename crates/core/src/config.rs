@@ -2229,10 +2229,55 @@ where
     T: Serialize,
 {
     let content = stringify_json5_pretty(value)?;
+    write_text_atomic_durable(path, &content)
+}
+
+fn write_text_atomic_durable(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, content)?;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp_path = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        file_name,
+        std::process::id(),
+        nonce
+    ));
+
+    {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        use std::io::Write;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+    }
+
+    match std::fs::rename(&tmp_path, path) {
+        Ok(()) => {}
+        Err(err) if path.exists() => {
+            tracing::debug!(
+                path = %path.display(),
+                error = %err,
+                "Atomic config rename failed; retrying after removing existing file"
+            );
+            std::fs::remove_file(path)?;
+            std::fs::rename(&tmp_path, path)?;
+        }
+        Err(err) => return Err(err.into()),
+    }
+
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+
     Ok(())
 }
 
@@ -2246,10 +2291,7 @@ pub fn validate_config_json5_file(path: &Path, content: &str) -> Result<Config> 
 
 pub fn write_raw_validated_config_json5(path: &Path, content: &str) -> Result<Config> {
     let config = validate_config_json5_str(content)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, content)?;
+    write_text_atomic_durable(path, content)?;
     Ok(config)
 }
 

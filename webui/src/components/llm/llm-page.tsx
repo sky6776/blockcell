@@ -135,10 +135,12 @@ export function LLMPage() {
           outputPrice: e.outputPrice,
         })),
       };
-      
-      // Remove legacy fields
-      delete defaults.model;
-      delete defaults.provider;
+
+      const primaryModel = modelPool.find(e => e.model.trim());
+      if (primaryModel) {
+        defaults.model = primaryModel.model;
+        defaults.provider = primaryModel.provider || undefined;
+      }
 
       const providersNormalized = Object.fromEntries(
         Object.entries(providers || {}).map(([k, v]) => {
