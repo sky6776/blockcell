@@ -2232,6 +2232,36 @@ where
     write_text_atomic_durable(path, &content)
 }
 
+#[cfg(windows)]
+fn replace_file_atomic_durable(tmp_path: &Path, path: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let tmp_wide: Vec<u16> = tmp_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let ok = unsafe {
+        MoveFileExW(
+            tmp_wide.as_ptr(),
+            path_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+
+    if ok == 0 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomic_durable(tmp_path: &Path, path: &Path) -> Result<()> {
+    std::fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
 fn write_text_atomic_durable(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2260,19 +2290,7 @@ fn write_text_atomic_durable(path: &Path, content: &str) -> Result<()> {
         file.sync_all()?;
     }
 
-    match std::fs::rename(&tmp_path, path) {
-        Ok(()) => {}
-        Err(err) if path.exists() => {
-            tracing::debug!(
-                path = %path.display(),
-                error = %err,
-                "Atomic config rename failed; retrying after removing existing file"
-            );
-            std::fs::remove_file(path)?;
-            std::fs::rename(&tmp_path, path)?;
-        }
-        Err(err) => return Err(err.into()),
-    }
+    replace_file_atomic_durable(&tmp_path, path)?;
 
     if let Ok(dir) = std::fs::File::open(parent) {
         let _ = dir.sync_all();

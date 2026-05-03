@@ -138,8 +138,8 @@ export function LLMPage() {
 
       const primaryModel = modelPool.find(e => e.model.trim());
       if (primaryModel) {
-        defaults.model = primaryModel.model;
-        defaults.provider = primaryModel.provider || undefined;
+        defaults.model = primaryModel.model.trim();
+        defaults.provider = primaryModel.provider?.trim() || defaults.provider;
       }
 
       const providersNormalized = Object.fromEntries(
