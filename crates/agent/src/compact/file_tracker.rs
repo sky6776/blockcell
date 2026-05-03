@@ -244,7 +244,8 @@ mod tests {
         // Bug #70: 涓枃瀛楃鍦?UTF-8 涓崰 3 瀛楄妭锛屽瓧鑺傜储寮?2000 鍙兘钀藉湪瀛楃涓棿瀵艰嚧 panic
         let mut tracker = FileTracker::new();
 
-        // 鏋勯€犺秴杩?2000 瀛楄妭鐨勪腑鏂囧唴瀹癸紙姣忎釜涓枃瀛楃 3 瀛楄妭锛?        let chinese_content = "浣犲ソ涓栫晫".repeat(200); // 4*3*200 = 2400 瀛楄妭
+        // 构造超过 2000 字节的中文内容（每个中文字符 3 字节）
+        let chinese_content = "你好世界".repeat(200);
         assert!(chinese_content.len() > 2000);
 
         // 涓嶅簲 panic
@@ -253,19 +254,22 @@ mod tests {
         let records = tracker.all_records();
         let record = records.get(&PathBuf::from("/chinese.md")).unwrap();
 
-        // 鎽樿搴旇鎴柇涓斿寘鍚埅鏂爣璁?        assert!(record.summary.contains("[content truncated]"));
-        // 鎴柇鍚庣殑鍐呭蹇呴』鏄湁鏁堢殑 UTF-8锛堜笉浼?panic 璇存槑宸查€氳繃锛?        let _ = record.summary.chars().count();
+        assert!(record.summary.contains("[content truncated]"));
+        let _ = record.summary.chars().count();
+
+        // 摘要应被截断且包含截断标记；截断后的内容必须是有效 UTF-8。
     }
 
     #[test]
     fn test_file_tracker_mixed_text_truncation() {
-        // 娣峰悎 ASCII + 涓枃 + emoji 鐨勬埅鏂祴璇?        let mut tracker = FileTracker::new();
+        // 混合 ASCII + 中文的截断测试
 
         let mut mixed = String::new();
         // 鏋勯€犳伆濂戒娇瀛楄妭 2000 钀藉湪澶氬瓧鑺傚瓧绗︿腑闂寸殑鍐呭
         mixed.push_str(&"a".repeat(1999)); // 1999 瀛楄妭 ASCII
         mixed.push('假'); // 3 字节中文，总 2002 字节
 
+        let mut tracker = FileTracker::new();
         tracker.record_read(PathBuf::from("/mixed.txt"), &mixed);
 
         let records = tracker.all_records();

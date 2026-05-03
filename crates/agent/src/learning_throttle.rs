@@ -56,9 +56,26 @@ impl LearningThrottle {
 
     /// Record that a review has completed
     pub fn review_completed(&self) {
-        self.active_reviews.fetch_sub(1, Ordering::Relaxed);
-        if let Ok(mut guard) = self.last_review_completed.lock() {
-            *guard = Some(Instant::now());
+        let mut current = self.active_reviews.load(Ordering::Relaxed);
+        let mut decremented = false;
+        while current > 0 {
+            match self.active_reviews.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    decremented = true;
+                    break;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+        if decremented {
+            if let Ok(mut guard) = self.last_review_completed.lock() {
+                *guard = Some(Instant::now());
+            }
         }
     }
 
@@ -116,5 +133,13 @@ mod tests {
         throttle.review_completed();
         // Immediately after completion, cooldown is active
         assert!(!throttle.can_start_review());
+    }
+
+    #[test]
+    fn test_completion_without_start_does_not_underflow() {
+        let throttle = LearningThrottle::new(2, 300);
+        throttle.review_completed();
+        assert_eq!(throttle.active_count(), 0);
+        assert!(throttle.can_start_review());
     }
 }

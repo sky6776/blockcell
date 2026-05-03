@@ -67,6 +67,22 @@ enum ReviewMode {
     Combined,
 }
 
+struct LearningReviewCompletionGuard {
+    coordinator: Arc<crate::learning_coordinator::LearningCoordinator>,
+}
+
+impl LearningReviewCompletionGuard {
+    fn new(coordinator: Arc<crate::learning_coordinator::LearningCoordinator>) -> Self {
+        Self { coordinator }
+    }
+}
+
+impl Drop for LearningReviewCompletionGuard {
+    fn drop(&mut self) {
+        self.coordinator.review_completed();
+    }
+}
+
 /// Memory Review 提示词
 /// Memory Review 提示词 (与 Hermes _MEMORY_REVIEW_PROMPT 一致)
 const MEMORY_REVIEW_PROMPT: &str = "\
@@ -2362,6 +2378,8 @@ impl AgentRuntime {
         let learning_coordinator = Arc::clone(&self.learning_coordinator);
 
         tokio::spawn(async move {
+            let _review_completion_guard = LearningReviewCompletionGuard::new(learning_coordinator);
+
             // 构建 Skill 索引（仅在 Skill/Combined 模式下需要）
             let skill_summary = match mode_clone {
                 ReviewMode::Memory => String::new(),
@@ -2504,8 +2522,6 @@ impl AgentRuntime {
                     tracing::warn!(mode = ?mode_clone, error = %e, "[Nudge] Review 失败");
                 }
             }
-            // Mark review as completed for throttle tracking
-            learning_coordinator.review_completed();
         });
     }
 

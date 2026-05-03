@@ -393,10 +393,12 @@ mod tests {
     fn test_should_extract_auto_memory() {
         let manager = ExtractionCursorManager::new(Path::new("/config"));
 
-        // 娑堟伅鏁颁笉瓒?        let types = should_extract_auto_memory(&manager, 5);
+        // 消息数不足
+        let types = should_extract_auto_memory(&manager, 5);
         assert!(types.is_empty());
 
-        // 娑堟伅鏁拌冻澶?        let types = should_extract_auto_memory(&manager, 15);
+        // 消息数足够
+        let types = should_extract_auto_memory(&manager, 15);
         assert!(!types.is_empty());
         assert!(types.contains(&MemoryType::User));
     }
