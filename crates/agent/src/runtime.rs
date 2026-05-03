@@ -2068,6 +2068,14 @@ impl AgentRuntime {
         // Create unified write guard for coordinated write protection
         let write_guard = Arc::new(crate::write_guard::WriteGuard::new(paths.base.clone()));
 
+        // 加载 Agent 类型注册表 (从多种来源: Built-in → User-level → Project-level)
+        let agent_type_registry = {
+            let workspace = paths.workspace();
+            let loader =
+                crate::agent_loader::AgentDefinitionLoader::new(&paths.base, Some(&workspace));
+            loader.load_all()
+        };
+
         Ok(Self {
             config,
             paths,
@@ -2104,7 +2112,7 @@ impl AgentRuntime {
             memory_injector_needs_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             abort_token: AbortToken::new(),
             runtime_handle: None,
-            agent_type_registry: crate::agent_types::AgentTypeRegistry::new(),
+            agent_type_registry,
             learning_coordinator: Arc::new({
                 let nudge_engine = crate::skill_nudge::SkillNudgeEngine::new(nudge_config);
                 let ghost_policy =
@@ -2235,10 +2243,10 @@ impl AgentRuntime {
     // Worktree Isolation Methods
     // ═══════════════════════════════════════════════════════════════════════════════
 
-    /// Check if an agent type requires worktree isolation.
-    /// Only viper agent needs isolation for code implementation tasks.
-    pub fn requires_worktree(&self, agent_type: &str) -> bool {
-        agent_type == "viper"
+    /// 检查 Agent 类型是否需要 worktree 隔离
+    /// 基于 AgentTypeDefinition 中的 isolation 字段判断，而非硬编码类型名
+    pub fn requires_worktree(&self, def: &crate::agent_types::AgentTypeDefinition) -> bool {
+        def.isolation == Some(crate::agent_types::IsolationMode::Worktree)
     }
 
     /// Detect if the current working directory is already inside a git worktree.
@@ -3659,6 +3667,7 @@ impl AgentRuntime {
             channel_contacts_file: Some(self.paths.channel_contacts_file()),
             response_cache: None,
             skill_mutex: None,
+            agent_type_registry: None,
             runtime_handle: self.runtime_handle.clone(),
             agent_identity: blockcell_core::current_agent_context(),
         })
@@ -7079,6 +7088,8 @@ impl AgentRuntime {
             skill_mutex: Some(
                 Arc::new(self.skill_mutex.clone()) as blockcell_tools::SkillMutexHandle
             ),
+            agent_type_registry: Some(Arc::new(self.agent_type_registry.clone())
+                as blockcell_tools::AgentTypeRegistryHandle),
         };
 
         // Emit tool_call_start event to WebSocket clients
@@ -7638,6 +7649,7 @@ impl AgentRuntime {
                     runtime_handle: None,
                     agent_identity: None,
                     skill_mutex: None,
+                    agent_type_registry: None,
                 };
 
                 // Execute tool synchronously via a new tokio runtime handle
@@ -8737,6 +8749,13 @@ impl AgentRuntime {
         let disallowed_tools = def.disallowed_tools.clone();
         let max_turns = def.max_turns;
         let one_shot = def.one_shot;
+        let tools = def.tools.clone();
+        let model = def.model.clone();
+        let skills = def.skills.clone();
+        let mcp_servers = def.mcp_servers.clone();
+        let initial_prompt = def.initial_prompt.clone();
+        let background = def.background;
+        let color = def.color.clone();
         let prompt_clone = prompt.clone();
         let identity_clone = identity.clone();
         let task_id_clone = task_id.clone();
@@ -8751,8 +8770,8 @@ impl AgentRuntime {
         // Create child AbortToken for chain cancellation
         let child_abort_token = self.abort_token.child();
 
-        // 检查是否需要 worktree 隔离（仅 viper agent）
-        let needs_worktree = self.requires_worktree(agent_type);
+        // 检查是否需要 worktree 隔离（基于 AgentTypeDefinition.isolation 配置）
+        let needs_worktree = self.requires_worktree(def);
         // 检查是否已在 worktree 中（避免嵌套 worktree）
         let already_in_worktree = self.is_in_worktree().await;
         let worktree_path = if needs_worktree && !already_in_worktree {
@@ -8817,7 +8836,14 @@ impl AgentRuntime {
                         .task_id(Some(task_id_clone.clone()))
                         .disallowed_tools(disallowed_tools)
                         .one_shot(one_shot)
-                        .tool_schemas(tool_schemas);
+                        .tool_schemas(tool_schemas)
+                        .tools(tools)
+                        .model(model)
+                        .skills(skills)
+                        .mcp_servers(mcp_servers)
+                        .initial_prompt(initial_prompt)
+                        .background(background)
+                        .color(color);
 
                     // 只有在有值时才设置 max_turns
                     if let Some(turns) = max_turns {
@@ -9065,9 +9091,10 @@ impl LightweightRuntimeHandle {
             .and_then(|guard| guard.clone())
     }
 
-    /// Check if an agent type requires worktree isolation.
-    fn requires_worktree(agent_type: &str) -> bool {
-        agent_type == "viper"
+    /// 检查 Agent 类型是否需要 worktree 隔离
+    /// 基于 AgentTypeDefinition 中的 isolation 字段判断，而非硬编码类型名
+    fn requires_worktree(def: &crate::agent_types::AgentTypeDefinition) -> bool {
+        def.isolation == Some(crate::agent_types::IsolationMode::Worktree)
     }
 
     /// Detect if the current working directory is already inside a git worktree.
@@ -9383,6 +9410,13 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
         let disallowed_tools = def.disallowed_tools.clone();
         let max_turns = def.max_turns;
         let one_shot = def.one_shot;
+        let tools = def.tools.clone();
+        let model = def.model.clone();
+        let skills = def.skills.clone();
+        let mcp_servers = def.mcp_servers.clone();
+        let initial_prompt = def.initial_prompt.clone();
+        let background = def.background;
+        let color = def.color.clone();
         let prompt_clone = prompt.clone();
         let identity_clone = identity.clone();
         let task_id_clone = task_id.clone();
@@ -9404,7 +9438,8 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
         let skills_dir_for_spawn = self.paths.skills_dir();
 
         // Worktree isolation support
-        let needs_worktree = Self::requires_worktree(agent_type);
+        // 检查是否需要 worktree 隔离（基于 AgentTypeDefinition.isolation 配置）
+        let needs_worktree = Self::requires_worktree(def);
         let workspace = self.paths.workspace().to_path_buf();
         let already_in_worktree = Self::is_in_worktree(&workspace).await;
         let worktree_path = if needs_worktree && !already_in_worktree {
@@ -9464,7 +9499,14 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
                         .task_id(Some(task_id_clone.clone()))
                         .disallowed_tools(disallowed_tools)
                         .one_shot(one_shot)
-                        .overrides(overrides);
+                        .overrides(overrides)
+                        .tools(tools)
+                        .model(model)
+                        .skills(skills)
+                        .mcp_servers(mcp_servers)
+                        .initial_prompt(initial_prompt)
+                        .background(background)
+                        .color(color);
 
                     if let Some(turns) = max_turns {
                         builder = builder.max_turns(turns);
@@ -10932,6 +10974,7 @@ mod tests {
             #[allow(deprecated)]
             skill_mutex: Some(Arc::new(crate::skill_mutex::SkillMutex::new())
                 as blockcell_tools::SkillMutexHandle),
+            agent_type_registry: None,
         };
 
         assert!(ctx.event_emitter.is_some());
@@ -13472,6 +13515,7 @@ description: local demo
             one_shot: true,
             permission_mode: PermissionMode::Bubble,
             isolation: None,
+            ..Default::default()
         };
 
         assert!(one_shot_type.one_shot);
@@ -13486,6 +13530,7 @@ description: local demo
             one_shot: false,
             permission_mode: PermissionMode::Inherit,
             isolation: None,
+            ..Default::default()
         };
 
         assert!(!normal_type.one_shot);

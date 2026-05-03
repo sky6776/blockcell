@@ -5,40 +5,33 @@ use serde_json::{json, Value};
 
 use crate::{Tool, ToolContext, ToolSchema};
 
-/// Agent tool parameters
+/// Agent 工具参数
 #[derive(Debug, Deserialize)]
 pub struct AgentToolParams {
-    /// Agent type (omit for Fork mode - inherits parent context)
+    /// Agent 类型 (省略则使用 Fork 模式 - 继承父级上下文)
     pub subagent_type: Option<String>,
 
-    /// Task description - full prompt to send to subagent
+    /// 任务描述 - 发送给子 Agent 的完整提示
     pub prompt: String,
 
-    /// Short description (3-5 words) for display and notification
+    /// 简短描述 (3-5 个词) 用于显示和通知
     pub description: Option<String>,
 
-    /// Force spawn even if a same-type task is already running
+    /// 强制 spawn，即使同类型任务已在运行
     #[serde(default)]
     pub force: bool,
 }
 
-/// Agent tool - spawn specialized subagents for complex tasks
+/// Agent 工具 - 启动专用子 Agent 处理复杂多步任务
 ///
-/// Available agent types:
-/// - explore: Fast read-only codebase exploration (one-shot)
-/// - plan: Architecture and implementation planning (one-shot)
-/// - verification: Testing and validation specialist (multi-turn, Bubble permission)
-/// - viper: Production code implementation agent (multi-turn, Bubble permission)
-/// - general: General-purpose agent for complex tasks (multi-turn, Bubble permission)
+/// Fork 模式 (省略 subagent_type):
+/// - 继承父级完整对话上下文
+/// - 共享 Prompt Cache 提高效率
+/// - 同步执行，直接返回结果 (不是 task_id)
+/// - 不能继续 spawn 子 Agent (防止递归)
 ///
-/// Fork mode (omit subagent_type):
-/// - Inherits full parent conversation context
-/// - Shares prompt cache for efficiency
-/// - Executes synchronously, returns result directly (not task_id)
-/// - Cannot spawn further subagents (prevents recursion)
-///
-/// Typed agents (specify subagent_type) run in background,
-/// returning task_id for progress tracking via /tasks.
+/// Typed Agent (指定 subagent_type):
+/// - 后台运行，返回 task_id 用于进度追踪
 pub struct AgentTool;
 
 #[async_trait]
@@ -46,32 +39,18 @@ impl Tool for AgentTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "agent",
-            description: "Launch a new agent to handle complex, multi-step tasks. Each agent type has specific capabilities and tools available.
-
-When to use:
-- If the target is already known, use the direct tool: Read for a known path, Grep for a specific symbol
-- Reserve agent tool for open-ended questions spanning the codebase, or tasks matching available agent types
-
-Available types:
-- explore: Fast read-only agent for codebase exploration (one-shot, max 20 turns)
-- plan: Architect agent for implementation planning (one-shot, max 30 turns)
-- verification: Testing/validation specialist (multi-turn, Bubble permission)
-- viper: Implementation agent for production code (multi-turn, Bubble permission)
-- general: General-purpose complex task handler (multi-turn, Bubble permission)
-
-Fork mode (omit subagent_type):
-Executes synchronously, inherits conversation context, shares prompt cache.
-Returns result directly (not task_id). Cannot spawn further subagents to prevent recursion.
-
-Typed agents (specify subagent_type):
-Run in background, return task_id for progress tracking via /tasks command.",
+            description: "Launch a new agent to handle complex, multi-step tasks autonomously. \
+Available built-in types: explore (codebase exploration), plan (implementation planning), \
+verification (testing/validation), viper (production code), general (complex tasks). \
+Custom types may also be available from ~/.blockcell/agents/ or .blockcell/agents/. \
+Omit subagent_type for fork mode (inherits parent context, shares prompt cache, synchronous). \
+Specify subagent_type for typed agents (background execution, returns task_id).",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "subagent_type": {
                         "type": "string",
-                        "enum": ["explore", "plan", "verification", "viper", "general"],
-                        "description": "Agent type to use. Omit for fork mode (inherits parent conversation context, shares prompt cache)."
+                        "description": "Agent type to use. Omit for fork mode (inherits parent conversation context, shares prompt cache). Available types include built-in and custom agents defined in ~/.blockcell/agents/ or .blockcell/agents/."
                     },
                     "prompt": {
                         "type": "string",
@@ -100,15 +79,16 @@ Run in background, return task_id for progress tracking via /tasks command.",
 
         if prompt.is_none() {
             return Err(Error::Validation(
-                "'prompt' is required and must be non-empty".to_string(),
+                "'prompt' 是必填字段且不能为空".to_string(),
             ));
         }
 
         if let Some(type_str) = params.get("subagent_type").and_then(|v| v.as_str()) {
-            let valid_types = ["explore", "plan", "verification", "viper", "general"];
-            if !valid_types.contains(&type_str) {
+            // 验证 subagent_type: 仅做基本格式检查
+            // 运行时 execute() 会通过 AgentTypeRegistry 做完整验证
+            if type_str.len() < 3 || type_str.len() > 50 {
                 return Err(Error::Validation(format!(
-                    "Invalid subagent_type: {}",
+                    "subagent_type 长度无效: {} (需要 3-50 字符)",
                     type_str
                 )));
             }
@@ -120,23 +100,22 @@ Run in background, return task_id for progress tracking via /tasks command.",
     async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
         let parsed: AgentToolParams = serde_json::from_value(params)?;
 
-        // ===== 新增：检查spawn权限 =====
+        // ===== 检查 spawn 权限 =====
         if !ctx.can_spawn_subagent() {
             return Ok(json!({
                 "error": "Cannot spawn subagent",
-                "reason": "ForkChild and ONE_SHOT agents cannot spawn further agents",
-                "hint": "Use direct tools instead (Read, Grep, Write, Edit)"
+                "reason": "ForkChild 和 ONE_SHOT Agent 不能继续 spawn 子 Agent",
+                "hint": "请直接使用工具 (Read, Grep, Write, Edit)"
             }));
         }
 
-        // Check if runtime handle is available
+        // 检查 runtime handle 是否可用
         let runtime_handle = ctx
             .runtime_handle
             .as_ref()
-            .ok_or_else(|| Error::Tool("Runtime handle not available".to_string()))?;
+            .ok_or_else(|| Error::Tool("Runtime handle 不可用".to_string()))?;
 
-        // If subagent_type is omitted -> Fork mode (synchronous execution)
-        // Fork mode executes directly and returns the result content (not a task_id)
+        // 如果省略 subagent_type -> Fork 模式 (同步执行)
         if parsed.subagent_type.is_none() {
             let result = runtime_handle.execute_fork_mode(parsed.prompt).await?;
             return Ok(json!({
@@ -146,17 +125,26 @@ Run in background, return task_id for progress tracking via /tasks command.",
             }));
         }
 
-        // Typed agent execution (always runs in background)
+        // Typed Agent 执行 (始终后台运行)
         let agent_type = parsed.subagent_type.unwrap();
 
+        // ===== 从注册表验证 agent_type =====
+        if let Some(ref registry) = ctx.agent_type_registry {
+            if !registry.has_type(&agent_type) {
+                let available = registry.type_names();
+                return Err(Error::Validation(format!(
+                    "无效的 subagent_type '{}', 可用类型: {}",
+                    agent_type,
+                    available.join(", ")
+                )));
+            }
+        }
+
         // ===== 检查是否有同类型的 Running 任务 =====
-        // 防止 LLM 基于过时的对话历史误判任务仍在运行，
-        // 实际查询 TaskManager 获取真实状态
         if !parsed.force {
             if let Some(ref tm) = ctx.task_manager {
                 let running_tasks = tm.list_tasks_json(Some("running".to_string())).await;
                 if let Some(tasks_array) = running_tasks.as_array() {
-                    // 查找同 agent_type 的 Running 任务
                     let same_type_running: Vec<_> = tasks_array
                         .iter()
                         .filter(|t| {
@@ -168,7 +156,6 @@ Run in background, return task_id for progress tracking via /tasks command.",
                         .collect();
 
                     if !same_type_running.is_empty() {
-                        // 有同类型任务在运行，返回信息让 LLM 做决策
                         let running_ids: Vec<String> = same_type_running
                             .iter()
                             .filter_map(|t| {
@@ -183,15 +170,15 @@ Run in background, return task_id for progress tracking via /tasks command.",
                             "mode": "typed",
                             "status": "duplicate_check",
                             "message": format!(
-                                "There is already a {} agent task running (task_id: {}). \
-                                 If you want to start a new task anyway, call the agent tool again with force=true. \
-                                 If you want to wait for the existing task, use /tasks to monitor progress.",
+                                "已有 {} Agent 任务在运行 (task_id: {}). \
+                                 如需强制启动新任务，请使用 force=true. \
+                                 如需等待现有任务完成，请使用 /tasks 监控进度.",
                                 agent_type,
                                 running_ids.join(", ")
                             ),
                             "running_task_ids": running_ids,
                             "agent_type": agent_type,
-                            "hint": "Set force=true to spawn anyway, or wait for the existing task to complete"
+                            "hint": "设置 force=true 强制 spawn，或等待现有任务完成"
                         }));
                     }
                 }
@@ -218,7 +205,7 @@ mod tests {
         let tool = AgentTool;
         let schema = tool.schema();
         assert_eq!(schema.name, "agent");
-        // Check description is comprehensive
+        // 检查描述包含关键信息
         let desc = schema.description;
         assert!(desc.contains("explore"));
         assert!(desc.contains("plan"));
@@ -236,7 +223,7 @@ mod tests {
         let params = schema.parameters.as_object().unwrap();
         let props = params.get("properties").unwrap().as_object().unwrap();
 
-        // Check required fields
+        // 检查必填字段
         assert!(params
             .get("required")
             .unwrap()
@@ -244,64 +231,53 @@ mod tests {
             .unwrap()
             .contains(&json!("prompt")));
 
-        // Check all properties exist
+        // 检查所有属性存在
         assert!(props.contains_key("subagent_type"));
         assert!(props.contains_key("prompt"));
         assert!(props.contains_key("description"));
         assert!(props.contains_key("force"));
-
-        // Check enum values for subagent_type
-        let subagent_enum = props
-            .get("subagent_type")
-            .unwrap()
-            .get("enum")
-            .unwrap()
-            .as_array()
-            .unwrap();
-        assert_eq!(subagent_enum.len(), 5);
-        assert!(subagent_enum.contains(&json!("explore")));
-        assert!(subagent_enum.contains(&json!("plan")));
-        assert!(subagent_enum.contains(&json!("verification")));
-        assert!(subagent_enum.contains(&json!("viper")));
-        assert!(subagent_enum.contains(&json!("general")));
     }
 
     #[test]
     fn test_agent_validate_prompt_required() {
         let tool = AgentTool;
-        // Valid: has prompt
+        // 有效: 有 prompt
         assert!(tool
             .validate(&json!({"prompt": "analyze the codebase"}))
             .is_ok());
-        // Invalid: no prompt
+        // 无效: 没有 prompt
         assert!(tool.validate(&json!({})).is_err());
-        // Invalid: empty prompt
+        // 无效: 空 prompt
         assert!(tool.validate(&json!({"prompt": ""})).is_err());
     }
 
     #[test]
     fn test_agent_validate_subagent_type() {
         let tool = AgentTool;
-        // Valid types
+        // 有效内置类型
         for agent_type in ["explore", "plan", "verification", "viper", "general"] {
             assert!(tool
                 .validate(&json!({"prompt": "test", "subagent_type": agent_type}))
                 .is_ok());
         }
-        // Invalid type
+        // 自定义类型 (长度有效) - validate 只做基本格式检查
         assert!(tool
-            .validate(&json!({"prompt": "test", "subagent_type": "invalid_type"}))
+            .validate(&json!({"prompt": "test", "subagent_type": "code-reviewer"}))
+            .is_ok());
+        // 无效类型 (长度太短)
+        assert!(tool
+            .validate(&json!({"prompt": "test", "subagent_type": "ab"}))
             .is_err());
     }
 
     #[test]
     fn test_agent_validate_optional_fields() {
         let tool = AgentTool;
-        // description is optional
+        // description 是可选的
         assert!(tool
             .validate(&json!({"prompt": "test", "description": "short desc"}))
             .is_ok());
-        // all optional fields
+        // 所有可选字段
         assert!(tool
             .validate(&json!({
                 "prompt": "test",
@@ -313,14 +289,14 @@ mod tests {
 
     #[test]
     fn test_agent_params_deserialization() {
-        // Minimal params
+        // 最小参数
         let params: AgentToolParams =
             serde_json::from_value(json!({"prompt": "test prompt"})).unwrap();
         assert_eq!(params.prompt, "test prompt");
         assert!(params.subagent_type.is_none());
         assert!(params.description.is_none());
 
-        // Full params
+        // 完整参数
         let params: AgentToolParams = serde_json::from_value(json!({
             "prompt": "analyze code",
             "subagent_type": "explore",
@@ -334,17 +310,28 @@ mod tests {
 
     #[test]
     fn test_agent_fork_mode_detection() {
-        // Fork mode: no subagent_type
+        // Fork 模式: 没有 subagent_type
         let params: AgentToolParams =
             serde_json::from_value(json!({"prompt": "fork task"})).unwrap();
         assert!(params.subagent_type.is_none());
 
-        // Typed mode: has subagent_type
+        // Typed 模式: 有 subagent_type
         let params: AgentToolParams = serde_json::from_value(json!({
             "prompt": "typed task",
             "subagent_type": "explore"
         }))
         .unwrap();
         assert!(params.subagent_type.is_some());
+    }
+
+    #[test]
+    fn test_agent_schema_description() {
+        let tool = AgentTool;
+        let schema = tool.schema();
+        // 检查描述包含关键信息
+        assert!(schema.description.contains("explore"));
+        assert!(schema.description.contains("plan"));
+        assert!(schema.description.contains("fork mode"));
+        assert!(schema.description.contains("background"));
     }
 }

@@ -1,3 +1,4 @@
+pub mod agent_loader;
 pub mod agent_progress;
 pub mod agent_prompts;
 pub mod agent_types;
@@ -46,13 +47,14 @@ pub(crate) mod token;
 pub mod unified_security_scanner;
 pub mod write_guard;
 
+pub use agent_loader::{AgentDefinitionLoader, AgentLoadError};
 pub use agent_progress::AgentProgress;
 pub use agent_prompts::{
     EXPLORE_SYSTEM_PROMPT, GENERAL_SYSTEM_PROMPT, PLAN_SYSTEM_PROMPT, VERIFICATION_SYSTEM_PROMPT,
     VIPER_SYSTEM_PROMPT,
 };
 pub use agent_types::{
-    built_in_agent_types, AgentTypeDefinition, AgentTypeRegistry, PermissionMode,
+    built_in_agent_types, AgentSource, AgentTypeDefinition, AgentTypeRegistry, PermissionMode,
 };
 pub use auto_memory::{
     get_memory_dir, get_memory_file_path, should_extract_auto_memory,

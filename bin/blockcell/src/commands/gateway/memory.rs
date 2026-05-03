@@ -47,6 +47,7 @@ async fn execute_memory_create_via_tool(
         runtime_handle: None,
         agent_identity: None,
         skill_mutex: None,
+        agent_type_registry: None,
     };
 
     state.tool_registry.execute("memory_upsert", ctx, req).await

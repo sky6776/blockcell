@@ -123,6 +123,29 @@ pub trait RuntimeHandle: Send + Sync {
 /// Opaque handle to the runtime for typed agent execution.
 pub type AgentRuntimeHandle = Arc<dyn RuntimeHandle>;
 
+/// Trait for accessing agent type registry from the agent tool.
+/// Supports dynamic schema generation and type validation.
+/// This avoids a circular dependency between tools and agent crates.
+pub trait AgentTypeRegistryOps: Send + Sync {
+    /// Get all available agent type names
+    fn type_names(&self) -> Vec<String>;
+
+    /// Check if an agent type exists
+    fn has_type(&self, agent_type: &str) -> bool;
+
+    /// Get the description (when_to_use) for an agent type
+    fn get_description(&self, agent_type: &str) -> Option<String>;
+
+    /// Check if an agent type is one-shot
+    fn is_one_shot(&self, agent_type: &str) -> Option<bool>;
+
+    /// Get the permission mode name for an agent type
+    fn get_permission_mode(&self, agent_type: &str) -> Option<String>;
+}
+
+/// Opaque handle to agent type registry, passed through ToolContext.
+pub type AgentTypeRegistryHandle = Arc<dyn AgentTypeRegistryOps + Send + Sync>;
+
 /// Opaque handle to the task manager, passed through ToolContext.
 /// This avoids a circular dependency between tools and agent crates.
 pub type TaskManagerHandle = Arc<dyn TaskManagerOps + Send + Sync>;
@@ -341,6 +364,8 @@ pub struct ToolContext {
     pub agent_identity: Option<AgentIdentity>,
     /// Skill mutex handle for checking if a skill is currently active.
     pub skill_mutex: Option<SkillMutexHandle>,
+    /// Agent 类型注册表 (用于 AgentTool 动态 schema 和验证)
+    pub agent_type_registry: Option<AgentTypeRegistryHandle>,
 }
 
 impl ToolContext {

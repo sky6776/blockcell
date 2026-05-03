@@ -114,6 +114,20 @@ pub struct ForkedAgentParams {
     pub external_skills_dirs: Vec<PathBuf>,
     /// Skill mutex (shared with parent agent to prevent concurrent skill modifications)
     pub skill_mutex: Option<Arc<SkillMutex>>,
+    /// 允许的工具列表 (None = 全部工具)
+    pub tools: Option<Vec<String>>,
+    /// 模型覆盖 (None = inherit from parent)
+    pub model: Option<String>,
+    /// 预加载的技能列表
+    pub skills: Vec<String>,
+    /// MCP 服务器引用列表
+    pub mcp_servers: Vec<String>,
+    /// 首轮提示注入
+    pub initial_prompt: Option<String>,
+    /// 是否后台运行
+    pub background: bool,
+    /// UI 显示颜色
+    pub color: Option<String>,
 }
 
 impl ForkedAgentParams {
@@ -157,6 +171,13 @@ impl ForkedAgentParams {
             skills_dir: None,
             external_skills_dirs: Vec::new(),
             skill_mutex: None,
+            tools: None,
+            model: None,
+            skills: Vec::new(),
+            mcp_servers: Vec::new(),
+            initial_prompt: None,
+            background: false,
+            color: None,
         }
     }
 
@@ -301,6 +322,20 @@ pub struct ForkedAgentParamsBuilder {
     skills_dir: Option<PathBuf>,
     external_skills_dirs: Vec<PathBuf>,
     skill_mutex: Option<Arc<SkillMutex>>,
+    /// 允许的工具列表
+    tools: Option<Vec<String>>,
+    /// 模型覆盖
+    model: Option<String>,
+    /// 预加载的技能列表
+    skills: Vec<String>,
+    /// MCP 服务器引用列表
+    mcp_servers: Vec<String>,
+    /// 首轮提示注入
+    initial_prompt: Option<String>,
+    /// 是否后台运行
+    background: bool,
+    /// UI 显示颜色
+    color: Option<String>,
 }
 
 impl ForkedAgentParamsBuilder {
@@ -464,6 +499,48 @@ impl ForkedAgentParamsBuilder {
         self
     }
 
+    /// 设置允许的工具列表 (None = 全部工具)
+    pub fn tools(mut self, tools: Option<Vec<String>>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    /// 设置模型覆盖 (None = 继承父级)
+    pub fn model(mut self, model: Option<String>) -> Self {
+        self.model = model;
+        self
+    }
+
+    /// 设置预加载的技能列表
+    pub fn skills(mut self, skills: Vec<String>) -> Self {
+        self.skills = skills;
+        self
+    }
+
+    /// 设置 MCP 服务器引用列表
+    pub fn mcp_servers(mut self, servers: Vec<String>) -> Self {
+        self.mcp_servers = servers;
+        self
+    }
+
+    /// 设置首轮提示注入
+    pub fn initial_prompt(mut self, prompt: Option<String>) -> Self {
+        self.initial_prompt = prompt;
+        self
+    }
+
+    /// 设置是否后台运行
+    pub fn background(mut self, background: bool) -> Self {
+        self.background = background;
+        self
+    }
+
+    /// 设置 UI 显示颜色
+    pub fn color(mut self, color: Option<String>) -> Self {
+        self.color = color;
+        self
+    }
+
     /// 构建 ForkedAgentParams
     ///
     /// 如果 `provider_pool` 未设置，返回 `ForkedAgentError::NoProviderAvailable`。
@@ -501,6 +578,13 @@ impl ForkedAgentParamsBuilder {
             skills_dir: self.skills_dir,
             external_skills_dirs: self.external_skills_dirs,
             skill_mutex: self.skill_mutex,
+            tools: self.tools,
+            model: self.model,
+            skills: self.skills,
+            mcp_servers: self.mcp_servers,
+            initial_prompt: self.initial_prompt,
+            background: self.background,
+            color: self.color,
         })
     }
 }
@@ -1941,6 +2025,36 @@ pub async fn run_forked_agent(
         messages.insert(0, ChatMessage::system(&system_prompt));
     }
 
+    // 注入 initial_prompt（自定义 Agent 的首轮提示）
+    if let Some(ref initial_prompt) = params.initial_prompt {
+        tracing::debug!(
+            initial_prompt_len = initial_prompt.len(),
+            "[forked_agent] 注入 initial_prompt"
+        );
+        // 在系统提示之后、用户消息之前插入
+        messages.push(ChatMessage::user(initial_prompt));
+    }
+
+    // 构建工具 schema（根据 tools 白名单和 disallowed_tools 黑名单过滤）
+    let filtered_tool_schemas = if let Some(ref allowed_tools) = params.tools {
+        // 白名单模式：只保留白名单中的工具
+        params
+            .tool_schemas
+            .iter()
+            .filter(|schema| {
+                schema
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|name| allowed_tools.iter().any(|t| t == name))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        // 无白名单：使用全部工具 schema
+        params.tool_schemas.clone()
+    };
+
     // 记录开始
     tracing::info!(
         fork_label = params.fork_label,
@@ -1950,6 +2064,8 @@ pub async fn run_forked_agent(
         agent_type = ?params.agent_type,
         one_shot = params.one_shot,
         disallowed_tools = ?params.disallowed_tools,
+        tools_whitelist = ?params.tools,
+        filtered_tool_count = filtered_tool_schemas.len(),
         "[forked_agent] starting"
     );
 
@@ -1994,6 +2110,16 @@ pub async fn run_forked_agent(
             return Err(e);
         }
     };
+
+    // 模型覆盖提示（当自定义 Agent 指定了特定模型时）
+    // TODO: 未来通过 ProviderPool::acquire_by_model() 实现真正的模型覆盖
+    if let Some(ref model_override) = params.model {
+        tracing::info!(
+            fork_label = params.fork_label,
+            model_override,
+            "[forked_agent] 自定义 Agent 指定了模型覆盖 (当前版本暂未生效，使用默认模型)"
+        );
+    }
 
     let max_turns = params.max_turns.unwrap_or(5);
     let mut current_messages = messages.clone();
@@ -2050,8 +2176,11 @@ pub async fn run_forked_agent(
             let _ = event_tx.send(event.to_string());
         }
 
-        // 调用 LLM（传入工具 schema，让 LLM 知道可以调用哪些工具）
-        let response = match provider.chat(&current_messages, &params.tool_schemas).await {
+        // 调用 LLM（传入过滤后的工具 schema，让 LLM 知道可以调用哪些工具）
+        let response = match provider
+            .chat(&current_messages, &filtered_tool_schemas)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(

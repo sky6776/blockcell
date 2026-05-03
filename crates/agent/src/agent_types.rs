@@ -1,73 +1,140 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::agent_prompts::{
     EXPLORE_SYSTEM_PROMPT, GENERAL_SYSTEM_PROMPT, PLAN_SYSTEM_PROMPT, VERIFICATION_SYSTEM_PROMPT,
     VIPER_SYSTEM_PROMPT,
 };
 
-/// Permission mode for agent types
+/// Agent 定义来源
 ///
-/// Determines how permissions flow between parent and child agents:
-/// - `Inherit`: Child agent inherits parent's permissions (default)
-/// - `Bubble`: Permission requests bubble up to parent agent
+/// 标识 Agent 定义从何处加载:
+/// - `BuiltIn`: Rust 源码中硬编码
+/// - `UserLevel`: 从 `~/.blockcell/agents/*.md` 加载
+/// - `ProjectLevel`: 从 `<project>/.blockcell/agents/*.md` 加载
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub enum AgentSource {
+    /// 内置 Agent (Rust 源码硬编码)
+    #[default]
+    BuiltIn,
+    /// 用户级 Agent (~/.blockcell/agents/)
+    UserLevel,
+    /// 项目级 Agent (<project>/.blockcell/agents/)
+    ProjectLevel,
+}
+
+/// Agent 类型的权限模式
+///
+/// 决定父子 Agent 之间的权限流转方式:
+/// - `Inherit`: 子 Agent 继承父 Agent 的权限 (默认)
+/// - `Bubble`: 权限请求向上冒泡到父 Agent
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub enum PermissionMode {
-    /// Inherit parent's permissions
+    /// 继承父 Agent 的权限
     #[default]
     Inherit,
-    /// Permission requests bubble up to parent
+    /// 权限请求向上冒泡到父 Agent
     Bubble,
 }
 
-/// Isolation mode for agent execution
+/// Agent 执行隔离模式
 ///
-/// Determines whether the agent runs in an isolated environment:
-/// - `None`: No isolation, shares the working directory (default)
-/// - `Worktree`: Git worktree isolation for code-writing agents
+/// 决定 Agent 是否在隔离环境中运行:
+/// - `None`: 无隔离，共享工作目录 (默认)
+/// - `Worktree`: Git worktree 隔离，适用于代码编写类 Agent
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub enum IsolationMode {
-    /// No isolation, shares working directory
+    /// 无隔离，共享工作目录
     #[default]
     None,
-    /// Git worktree isolation for code-writing agents
+    /// Git worktree 隔离，适用于代码编写类 Agent
     Worktree,
 }
 
-/// Agent type definition
+/// Agent 类型定义
 ///
-/// Defines the configuration for an agent type, including:
-/// - Type identifier and usage scenario description
-/// - Disallowed tools list
-/// - Optional max turns limit
-/// - Optional system prompt template
-/// - ONE_SHOT flag (cannot continue with SendMessage after completion)
-/// - Permission mode for permission flow between parent and child agents
+/// 定义 Agent 类型的完整配置，包括:
+/// - 类型标识符和使用场景描述
+/// - 禁止的工具列表
+/// - 可选的最大轮次限制
+/// - 可选的系统提示模板
+/// - ONE_SHOT 标志 (完成后不能继续 SendMessage)
+/// - 父子 Agent 之间的权限流转模式
+/// - 可选的允许工具列表 (None = 所有工具)
+/// - 可选的模型覆盖
+/// - 预加载技能列表
+/// - MCP 服务器引用
+/// - 可选的首轮提示注入
+/// - 后台执行标志
+/// - UI 显示颜色
+/// - 定义来源和文件元数据
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentTypeDefinition {
-    /// Agent type identifier
+    /// Agent 类型标识符
     pub agent_type: String,
 
-    /// Usage scenario description (injected into System Prompt)
+    /// 使用场景描述 (注入到系统提示中)
     pub when_to_use: String,
 
-    /// List of disallowed tools
+    /// 禁止的工具列表
     pub disallowed_tools: Vec<String>,
 
-    /// Maximum turns limit (optional)
+    /// 最大轮次限制 (可选)
     pub max_turns: Option<u32>,
 
-    /// System prompt template (optional)
+    /// 系统提示模板 (可选)
     pub system_prompt_template: Option<String>,
 
-    /// ONE_SHOT flag - if true, cannot continue with SendMessage after completion
+    /// ONE_SHOT 标志 — 为 true 时完成后不能继续 SendMessage
     pub one_shot: bool,
 
-    /// Permission mode for permission flow
+    /// 权限流转模式
     pub permission_mode: PermissionMode,
 
-    /// Isolation mode (optional) - determines execution environment isolation
+    /// 隔离模式 (可选) — 决定执行环境的隔离方式
     pub isolation: Option<IsolationMode>,
+
+    // === 自定义 Agent 配置字段 ===
+    /// 允许的工具列表 (None = 所有工具, Some(["*"]) 也表示所有工具)
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+
+    /// 模型覆盖 (None = 继承父 Agent 的模型)
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// 预加载技能列表
+    #[serde(default)]
+    pub skills: Vec<String>,
+
+    /// MCP 服务器引用 (必须在全局配置中存在)
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
+
+    /// 首轮提示注入 (在第一条用户消息之前)
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
+
+    /// 是否始终后台运行
+    #[serde(default)]
+    pub background: bool,
+
+    /// UI 显示颜色
+    #[serde(default)]
+    pub color: Option<String>,
+
+    /// Agent 定义来源
+    #[serde(skip)]
+    pub source: AgentSource,
+
+    /// 原始文件名 (不含 .md 扩展名)
+    #[serde(skip)]
+    pub filename: Option<String>,
+
+    /// 定义文件所在目录
+    #[serde(skip)]
+    pub base_dir: Option<PathBuf>,
 }
 
 impl Default for AgentTypeDefinition {
@@ -81,6 +148,16 @@ impl Default for AgentTypeDefinition {
             one_shot: false,
             permission_mode: PermissionMode::default(),
             isolation: None,
+            tools: None,
+            model: None,
+            skills: vec![],
+            mcp_servers: vec![],
+            initial_prompt: None,
+            background: false,
+            color: None,
+            source: AgentSource::default(),
+            filename: None,
+            base_dir: None,
         }
     }
 }
@@ -97,6 +174,16 @@ impl AgentTypeDefinition {
             one_shot: true,
             permission_mode: PermissionMode::Inherit,
             isolation: None,
+            tools: None,
+            model: None,
+            skills: vec![],
+            mcp_servers: vec![],
+            initial_prompt: None,
+            background: false,
+            color: None,
+            source: AgentSource::BuiltIn,
+            filename: None,
+            base_dir: None,
         }
     }
 
@@ -111,6 +198,16 @@ impl AgentTypeDefinition {
             one_shot: true,
             permission_mode: PermissionMode::Inherit,
             isolation: None,
+            tools: None,
+            model: None,
+            skills: vec![],
+            mcp_servers: vec![],
+            initial_prompt: None,
+            background: false,
+            color: None,
+            source: AgentSource::BuiltIn,
+            filename: None,
+            base_dir: None,
         }
     }
 
@@ -125,6 +222,16 @@ impl AgentTypeDefinition {
             one_shot: false,
             permission_mode: PermissionMode::Inherit,
             isolation: None,
+            tools: None,
+            model: None,
+            skills: vec![],
+            mcp_servers: vec![],
+            initial_prompt: None,
+            background: false,
+            color: None,
+            source: AgentSource::BuiltIn,
+            filename: None,
+            base_dir: None,
         }
     }
 
@@ -139,6 +246,16 @@ impl AgentTypeDefinition {
             one_shot: false,
             permission_mode: PermissionMode::Bubble,
             isolation: Some(IsolationMode::Worktree), // viper 写代码，需要 worktree 隔离
+            tools: None,
+            model: None,
+            skills: vec![],
+            mcp_servers: vec![],
+            initial_prompt: None,
+            background: false,
+            color: None,
+            source: AgentSource::BuiltIn,
+            filename: None,
+            base_dir: None,
         }
     }
 
@@ -154,6 +271,16 @@ impl AgentTypeDefinition {
             one_shot: false,
             permission_mode: PermissionMode::Bubble,
             isolation: None,
+            tools: None,
+            model: None,
+            skills: vec![],
+            mcp_servers: vec![],
+            initial_prompt: None,
+            background: false,
+            color: None,
+            source: AgentSource::BuiltIn,
+            filename: None,
+            base_dir: None,
         }
     }
 }
@@ -254,6 +381,33 @@ impl AgentTypeRegistry {
 impl Default for AgentTypeRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 为 AgentTypeRegistry 实现 blockcell_tools 的 AgentTypeRegistryOps trait
+/// 避免循环依赖：tools crate 定义 trait，agent crate 实现 trait
+impl blockcell_tools::AgentTypeRegistryOps for AgentTypeRegistry {
+    fn type_names(&self) -> Vec<String> {
+        self.types.keys().cloned().collect()
+    }
+
+    fn has_type(&self, agent_type: &str) -> bool {
+        self.types.contains_key(agent_type)
+    }
+
+    fn get_description(&self, agent_type: &str) -> Option<String> {
+        self.types.get(agent_type).map(|d| d.when_to_use.clone())
+    }
+
+    fn is_one_shot(&self, agent_type: &str) -> Option<bool> {
+        self.types.get(agent_type).map(|d| d.one_shot)
+    }
+
+    fn get_permission_mode(&self, agent_type: &str) -> Option<String> {
+        self.types.get(agent_type).map(|d| match d.permission_mode {
+            PermissionMode::Inherit => "Inherit".to_string(),
+            PermissionMode::Bubble => "Bubble".to_string(),
+        })
     }
 }
 
@@ -362,13 +516,23 @@ mod tests {
         let mut registry = AgentTypeRegistry::new_empty();
         let custom_def = AgentTypeDefinition {
             agent_type: "custom".to_string(),
-            when_to_use: "Custom agent type".to_string(),
+            when_to_use: "自定义 Agent 类型".to_string(),
             disallowed_tools: vec!["exec".to_string()],
             max_turns: Some(10),
             system_prompt_template: None,
             one_shot: false,
             permission_mode: PermissionMode::Inherit,
             isolation: None,
+            tools: None,
+            model: None,
+            skills: vec![],
+            mcp_servers: vec![],
+            initial_prompt: None,
+            background: false,
+            color: None,
+            source: AgentSource::BuiltIn,
+            filename: None,
+            base_dir: None,
         };
         registry.register(custom_def);
         assert!(registry.get("custom").is_some());
@@ -399,13 +563,23 @@ mod tests {
         let mut registry = AgentTypeRegistry::new_empty();
         let def = AgentTypeDefinition {
             agent_type: "test".to_string(),
-            when_to_use: "Test".to_string(),
+            when_to_use: "测试".to_string(),
             disallowed_tools: vec!["real_tool".to_string(), "phantom_tool".to_string()],
             max_turns: None,
             system_prompt_template: None,
             one_shot: false,
             permission_mode: PermissionMode::Inherit,
             isolation: None,
+            tools: None,
+            model: None,
+            skills: vec![],
+            mcp_servers: vec![],
+            initial_prompt: None,
+            background: false,
+            color: None,
+            source: AgentSource::BuiltIn,
+            filename: None,
+            base_dir: None,
         };
         registry.register(def);
         let known_tools = vec!["real_tool"];

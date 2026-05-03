@@ -193,6 +193,7 @@ mod tests {
             runtime_handle: None,
             agent_identity: None,
             skill_mutex: None,
+            agent_type_registry: None,
         };
 
         tool.execute(
