@@ -42,7 +42,7 @@ impl Tool for AgentTool {
             description: "Launch a new agent to handle complex, multi-step tasks autonomously. \
 Available built-in types: explore (codebase exploration), plan (implementation planning), \
 verification (testing/validation), viper (production code), general (complex tasks). \
-Custom types may also be available from ~/.blockcell/agents/ or .blockcell/agents/. \
+Custom types may also be available from ~/.blockcell/workspace/agents/ or .blockcell/agents/. \
 Omit subagent_type for fork mode (inherits parent context, shares prompt cache, synchronous). \
 Specify subagent_type for typed agents (background execution, returns task_id).",
             parameters: json!({
@@ -50,7 +50,7 @@ Specify subagent_type for typed agents (background execution, returns task_id)."
                 "properties": {
                     "subagent_type": {
                         "type": "string",
-                        "description": "Agent type to use. Omit for fork mode (inherits parent conversation context, shares prompt cache). Available types include built-in and custom agents defined in ~/.blockcell/agents/ or .blockcell/agents/."
+                        "description": "Agent type to use. Omit for fork mode (inherits parent conversation context, shares prompt cache). Available types include built-in and custom agents defined in ~/.blockcell/workspace/agents/ or .blockcell/agents/."
                     },
                     "prompt": {
                         "type": "string",
@@ -84,13 +84,36 @@ Specify subagent_type for typed agents (background execution, returns task_id)."
         }
 
         if let Some(type_str) = params.get("subagent_type").and_then(|v| v.as_str()) {
-            // 验证 subagent_type: 仅做基本格式检查
+            // 验证 subagent_type: 基本格式检查
             // 运行时 execute() 会通过 AgentTypeRegistry 做完整验证
-            if type_str.len() < 3 || type_str.len() > 50 {
+            let char_count = type_str.chars().count();
+            if !(3..=50).contains(&char_count) {
                 return Err(Error::Validation(format!(
                     "subagent_type 长度无效: {} (需要 3-50 字符)",
                     type_str
                 )));
+            }
+            // 检查字符格式：只允许字母、数字、连字符
+            let chars: Vec<char> = type_str.chars().collect();
+            if !chars[0].is_ascii_alphanumeric() {
+                return Err(Error::Validation(format!(
+                    "subagent_type '{}' 必须以字母或数字开头",
+                    type_str
+                )));
+            }
+            if !chars[chars.len() - 1].is_ascii_alphanumeric() {
+                return Err(Error::Validation(format!(
+                    "subagent_type '{}' 必须以字母或数字结尾",
+                    type_str
+                )));
+            }
+            for &ch in &chars {
+                if !ch.is_ascii_alphanumeric() && ch != '-' {
+                    return Err(Error::Validation(format!(
+                        "subagent_type '{}' 包含非法字符 '{}'",
+                        type_str, ch
+                    )));
+                }
             }
         }
 
@@ -212,7 +235,7 @@ mod tests {
         assert!(desc.contains("verification"));
         assert!(desc.contains("viper"));
         assert!(desc.contains("general"));
-        assert!(desc.contains("Fork mode"));
+        assert!(desc.contains("fork mode"));
         assert!(desc.contains("background"));
     }
 

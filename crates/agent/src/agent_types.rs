@@ -11,14 +11,14 @@ use crate::agent_prompts::{
 ///
 /// 标识 Agent 定义从何处加载:
 /// - `BuiltIn`: Rust 源码中硬编码
-/// - `UserLevel`: 从 `~/.blockcell/agents/*.md` 加载
+/// - `UserLevel`: 从 `~/.blockcell/workspace/agents/*.md` 加载
 /// - `ProjectLevel`: 从 `<project>/.blockcell/agents/*.md` 加载
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub enum AgentSource {
     /// 内置 Agent (Rust 源码硬编码)
     #[default]
     BuiltIn,
-    /// 用户级 Agent (~/.blockcell/agents/)
+    /// 用户级 Agent (~/.blockcell/workspace/agents/)
     UserLevel,
     /// 项目级 Agent (<project>/.blockcell/agents/)
     ProjectLevel,
@@ -329,6 +329,19 @@ impl AgentTypeRegistry {
                     tool
                 );
                 def.disallowed_tools.push(tool.to_string());
+            }
+        }
+
+        // 如果 tools 白名单中包含被禁止的工具，从白名单中移除
+        // 避免白名单和黑名单的矛盾
+        if let Some(ref mut tools) = def.tools {
+            let before_len = tools.len();
+            tools.retain(|t| !forbidden.contains(&t.as_str()));
+            if tools.len() != before_len {
+                tracing::warn!(
+                    agent_type = %def.agent_type,
+                    "Removed forbidden tools from tools whitelist to prevent recursive spawning"
+                );
             }
         }
 

@@ -2036,23 +2036,38 @@ pub async fn run_forked_agent(
     }
 
     // 构建工具 schema（根据 tools 白名单和 disallowed_tools 黑名单过滤）
-    let filtered_tool_schemas = if let Some(ref allowed_tools) = params.tools {
-        // 白名单模式：只保留白名单中的工具
-        params
-            .tool_schemas
-            .iter()
+    let filtered_tool_schemas = {
+        let schemas: Vec<_> = if let Some(ref allowed_tools) = params.tools {
+            // 白名单模式：只保留白名单中的工具
+            params
+                .tool_schemas
+                .iter()
+                .filter(|schema| {
+                    schema
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|name| allowed_tools.iter().any(|t| t == name))
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect()
+        } else {
+            // 无白名单：使用全部工具 schema
+            params.tool_schemas.clone()
+        };
+
+        // 黑名单过滤：排除 disallowed_tools 中的工具
+        // 这一步在白名单模式和无白名单模式下都需要执行
+        schemas
+            .into_iter()
             .filter(|schema| {
                 schema
                     .get("name")
                     .and_then(|v| v.as_str())
-                    .map(|name| allowed_tools.iter().any(|t| t == name))
+                    .map(|name| !params.disallowed_tools.iter().any(|t| t == name))
                     .unwrap_or(true)
             })
-            .cloned()
             .collect::<Vec<_>>()
-    } else {
-        // 无白名单：使用全部工具 schema
-        params.tool_schemas.clone()
     };
 
     // 记录开始

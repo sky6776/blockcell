@@ -474,6 +474,8 @@ mod tests {
             response_cache: None,
             skill_mutex: None,
             agent_type_registry: None,
+            runtime_handle: None,
+            agent_identity: None,
         }
     }
 
@@ -507,6 +509,8 @@ mod tests {
             response_cache: None,
             skill_mutex: None,
             agent_type_registry: None,
+            runtime_handle: None,
+            agent_identity: None,
         }
     }
 
