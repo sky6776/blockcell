@@ -1,4 +1,4 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -11,6 +11,9 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
+
+use crate::unified_security_scanner::scan_learned_memory_content;
+use crate::write_guard::{WriteGuard, WriteGuardError, WriteGuardRAII, WriteTarget};
 
 const USER_CHAR_LIMIT: usize = 8_000;
 const MEMORY_CHAR_LIMIT: usize = 16_000;
@@ -54,6 +57,8 @@ pub struct MemoryFileStore {
     memory_path: PathBuf,
     snapshots_dir: PathBuf,
     lock_path: PathBuf,
+    /// Unified write guard for coordinated write protection across memory + skill files
+    write_guard: Option<Arc<WriteGuard>>,
     write_lock: Arc<Mutex<()>>,
 }
 
@@ -67,6 +72,7 @@ impl MemoryFileStore {
             memory_path: paths.memory_md(),
             snapshots_dir,
             lock_path: paths.memory_dir().join(".memory_file_store.lockdir"),
+            write_guard: None,
             write_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -80,7 +86,8 @@ impl MemoryFileStore {
 
     pub fn add(&self, target: MemoryFileTarget, content: &str) -> Result<MemoryFileMutation> {
         let content = normalize_entry(content)?;
-        scan_learned_content(&content)?;
+        scan_learned_memory_content(&content)?;
+        let _wg = self.acquire_write_guard(target)?;
         let _guard = self
             .write_lock
             .lock()
@@ -119,7 +126,8 @@ impl MemoryFileStore {
             return Err(Error::Validation("old_text cannot be empty".to_string()));
         }
         let content = normalize_entry(content)?;
-        scan_learned_content(&content)?;
+        scan_learned_memory_content(&content)?;
+        let _wg = self.acquire_write_guard(target)?;
         let _guard = self
             .write_lock
             .lock()
@@ -155,6 +163,7 @@ impl MemoryFileStore {
         if old_text.is_empty() {
             return Err(Error::Validation("old_text cannot be empty".to_string()));
         }
+        let _wg = self.acquire_write_guard(target)?;
         let path = self.path_for(target);
         let _guard = self
             .write_lock
@@ -185,6 +194,7 @@ impl MemoryFileStore {
     }
 
     pub fn restore_latest(&self, target: MemoryFileTarget) -> Result<MemoryFileMutation> {
+        let _wg = self.acquire_write_guard(target)?;
         let _guard = self
             .write_lock
             .lock()
@@ -198,12 +208,8 @@ impl MemoryFileStore {
         };
         let path = self.path_for(target);
         let current_snapshot = self.snapshot_before_write(target, path)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(&snapshot_path, path)?;
-        sync_path(path)?;
-        sync_parent_dir(path)?;
+        let restored_content = fs::read_to_string(&snapshot_path)?;
+        atomic_write_text(path, &restored_content)?;
         Ok(MemoryFileMutation {
             target,
             action: "restore_latest".to_string(),
@@ -211,6 +217,27 @@ impl MemoryFileStore {
                 .or_else(|| Some(snapshot_path.to_string_lossy().to_string())),
             message: format!("{} memory restored", target.as_str()),
         })
+    }
+
+    /// Set the unified write guard for coordinated write protection
+    pub fn set_write_guard(&mut self, guard: Arc<WriteGuard>) {
+        self.write_guard = Some(guard);
+    }
+
+    /// Acquire the unified write guard for the given target, if configured.
+    /// Returns Ok(RAII guard) on success, Err if the target is already being written.
+    /// If no write_guard is configured, returns Ok(None) (backward compat).
+    fn acquire_write_guard(&self, target: MemoryFileTarget) -> Result<Option<WriteGuardRAII>> {
+        let Some(ref guard) = self.write_guard else {
+            return Ok(None);
+        };
+        let write_target = memory_target_to_write_target(target);
+        guard
+            .acquire(write_target)
+            .map(Some)
+            .map_err(|WriteGuardError { target }| {
+                Error::Other(format!("concurrent write in progress for {target}"))
+            })
     }
 
     fn format_for_system_prompt(&self, target: MemoryFileTarget) -> Result<Option<String>> {
@@ -252,7 +279,7 @@ impl MemoryFileStore {
     }
 
     fn latest_snapshot_for(&self, target: MemoryFileTarget) -> Result<Option<PathBuf>> {
-        let prefix = format!("{}", target.as_str()) + "_";
+        let prefix = format!("{}_", target.as_str());
         let mut latest: Option<PathBuf> = None;
         for entry in fs::read_dir(&self.snapshots_dir)? {
             let entry = entry?;
@@ -322,6 +349,13 @@ fn parse_target(target: &str) -> Result<MemoryFileTarget> {
     }
 }
 
+fn memory_target_to_write_target(target: MemoryFileTarget) -> WriteTarget {
+    match target {
+        MemoryFileTarget::User => WriteTarget::UserMd,
+        MemoryFileTarget::Memory => WriteTarget::MemoryMd,
+    }
+}
+
 fn mutation_json(mutation: MemoryFileMutation) -> Value {
     json!({
         "success": true,
@@ -346,11 +380,15 @@ fn read_entries(path: &Path) -> Result<Vec<String>> {
 }
 
 fn atomic_write_entries(path: &Path, entries: &[String]) -> Result<()> {
+    atomic_write_text(path, &entries.join(ENTRY_SEPARATOR))
+}
+
+fn atomic_write_text(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let tmp_path = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
-    write_file_durable(&tmp_path, &entries.join(ENTRY_SEPARATOR))?;
+    write_file_durable(&tmp_path, content)?;
     fs::rename(&tmp_path, path)?;
     sync_parent_dir(path)?;
     Ok(())
@@ -403,16 +441,13 @@ fn write_file_durable(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-fn sync_path(path: &Path) -> Result<()> {
-    let file = OpenOptions::new().read(true).open(path)?;
-    file.sync_all()?;
-    Ok(())
-}
-
 fn sync_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
-        let dir = File::open(parent)?;
-        dir.sync_all()?;
+        match File::open(parent) {
+            Ok(dir) => dir.sync_all()?,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(err) => return Err(err.into()),
+        }
     }
     Ok(())
 }
@@ -440,36 +475,6 @@ fn ensure_char_budget(target: MemoryFileTarget, entries: &[String]) -> Result<()
             total,
             limit
         )));
-    }
-    Ok(())
-}
-
-fn scan_learned_content(content: &str) -> Result<()> {
-    let lower = content.to_lowercase();
-    let blocked = [
-        "ignore previous instructions",
-        "ignore all previous instructions",
-        "system prompt",
-        "developer message",
-        "reveal your instructions",
-        "exfiltrate",
-        "api_key",
-        "secret_key",
-        "private key",
-        "-----begin",
-    ];
-    if blocked.iter().any(|needle| lower.contains(needle)) {
-        return Err(Error::Validation(
-            "learned memory content failed safety scan".to_string(),
-        ));
-    }
-    if content
-        .chars()
-        .any(|ch| matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
-    {
-        return Err(Error::Validation(
-            "learned memory content contains hidden direction controls".to_string(),
-        ));
     }
     Ok(())
 }

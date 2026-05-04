@@ -208,17 +208,7 @@ impl ProviderPool {
     /// 返回 `(entry_index, Arc<dyn Provider>)`
     pub fn acquire(&self) -> Option<(usize, Arc<dyn Provider>)> {
         let mut state = self.state.lock().unwrap();
-        let now = Instant::now();
-
-        // 解除到期的冷却
-        for (idx, h) in state.health.iter_mut() {
-            if let EntryHealth::Cooling(since) = h {
-                if now.duration_since(*since) >= self.cooldown {
-                    info!(idx, "ProviderPool: entry recovered from cooling");
-                    *h = EntryHealth::Healthy;
-                }
-            }
-        }
+        self.recover_cooling_entries(&mut state);
 
         // 收集健康条目索引
         let healthy: Vec<usize> = (0..self.entries.len())
@@ -248,6 +238,49 @@ impl ProviderPool {
             fallback
         };
 
+        let selected = self.select_entry_from_candidates(candidates)?;
+        Some((selected, Arc::clone(&self.entries[selected].provider)))
+    }
+
+    /// Acquire a provider that exactly matches the requested model.
+    ///
+    /// Unlike `acquire()`, this never falls back to another model: callers that set an
+    /// explicit model override need the override to be honored or fail loudly.
+    pub fn acquire_by_model(&self, model: &str) -> Option<(usize, Arc<dyn Provider>)> {
+        let mut state = self.state.lock().unwrap();
+        self.recover_cooling_entries(&mut state);
+
+        let candidates: Vec<usize> = (0..self.entries.len())
+            .filter(|idx| self.entries[*idx].model == model)
+            .filter(|idx| state.health.get(idx) == Some(&EntryHealth::Healthy))
+            .collect();
+
+        if candidates.is_empty() {
+            warn!(
+                model,
+                "ProviderPool: no healthy provider matches requested model"
+            );
+            return None;
+        }
+
+        let selected = self.select_entry_from_candidates(candidates)?;
+        Some((selected, Arc::clone(&self.entries[selected].provider)))
+    }
+
+    fn recover_cooling_entries(&self, state: &mut PoolState) {
+        let now = Instant::now();
+
+        for (idx, h) in state.health.iter_mut() {
+            if let EntryHealth::Cooling(since) = h {
+                if now.duration_since(*since) >= self.cooldown {
+                    info!(idx, "ProviderPool: entry recovered from cooling");
+                    *h = EntryHealth::Healthy;
+                }
+            }
+        }
+    }
+
+    fn select_entry_from_candidates(&self, candidates: Vec<usize>) -> Option<usize> {
         // 按 priority 分组，取最高优先级（最小值）
         let min_priority = candidates
             .iter()
@@ -286,7 +319,7 @@ impl ProviderPool {
             }
         }
 
-        Some((selected, Arc::clone(&self.entries[selected].provider)))
+        Some(selected)
     }
 
     /// 上报调用结果，驱动健康状态变更。
@@ -407,6 +440,22 @@ pub struct PoolEntryStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use blockcell_core::types::{ChatMessage, LLMResponse};
+    use serde_json::Value;
+
+    struct DummyProvider;
+
+    #[async_trait]
+    impl Provider for DummyProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[Value],
+        ) -> blockcell_core::Result<LLMResponse> {
+            Ok(LLMResponse::default())
+        }
+    }
 
     #[test]
     fn test_classify_error_rate_limit() {
@@ -524,5 +573,39 @@ mod tests {
         pool.report(0, CallResult::AuthError);
         let status = pool.status_summary();
         assert_eq!(status[0].health, "dead");
+    }
+
+    #[test]
+    fn test_acquire_by_model_selects_exact_model() {
+        let pool = ProviderPool {
+            entries: vec![
+                BuiltEntry {
+                    model: "model-a".to_string(),
+                    provider_name: "test".to_string(),
+                    weight: 1,
+                    priority: 1,
+                    provider: Arc::new(DummyProvider),
+                },
+                BuiltEntry {
+                    model: "model-b".to_string(),
+                    provider_name: "test".to_string(),
+                    weight: 1,
+                    priority: 1,
+                    provider: Arc::new(DummyProvider),
+                },
+            ],
+            state: Mutex::new(PoolState {
+                health: HashMap::from([(0, EntryHealth::Healthy), (1, EntryHealth::Healthy)]),
+                stats: HashMap::new(),
+            }),
+            fail_threshold: 3,
+            cooldown: Duration::from_secs(60),
+        };
+
+        let (idx, _) = pool
+            .acquire_by_model("model-b")
+            .expect("model-b should be available");
+        assert_eq!(idx, 1);
+        assert!(pool.acquire_by_model("missing-model").is_none());
     }
 }

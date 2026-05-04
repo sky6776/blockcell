@@ -14,7 +14,9 @@ export type WsEventType =
   | 'evolution_triggered'
   | 'session_renamed'
   | 'system_event_notification'
-  | 'system_event_summary';
+  | 'system_event_summary'
+  | 'agent_progress'
+  | 'agent_stage';
 
 export interface WsEvent {
   type: WsEventType;
@@ -50,6 +52,15 @@ export interface WsEvent {
   body?: string;
   compact_text?: string;
   items?: any[];
+  // agent progress fields
+  progress_type?: string;
+  tokens_added?: number;
+  tools_added?: number;
+  total_tokens?: number;
+  total_tools?: number;
+  // agent stage fields
+  stage?: string;
+  percent?: number;
 }
 
 export type DisconnectReason = 'none' | 'auth_failed' | 'network_error' | 'server_down' | 'connecting' | 'reconnect_exhausted';

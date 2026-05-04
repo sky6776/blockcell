@@ -99,6 +99,9 @@ mod tests {
             channel_contacts_file: None,
             response_cache: None,
             skill_mutex: None,
+            agent_type_registry: None,
+            runtime_handle: None,
+            agent_identity: None,
         }
     }
 

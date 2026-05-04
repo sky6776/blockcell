@@ -31,13 +31,16 @@ mod cache_safe;
 mod can_use_tool;
 mod context;
 
-pub use agent::{run_forked_agent, ForkedAgentParams, ForkedAgentResult, UsageMetrics};
+pub use agent::{
+    build_forked_tool_schemas, run_forked_agent, ForkedAgentParams, ForkedAgentResult,
+};
+// UsageMetrics 现在从 blockcell_core 导入，不再本地定义
 pub use cache_safe::{
     create_cache_safe_params, create_cache_safe_params_with_tools, get_last_cache_safe_params,
     save_cache_safe_params, CacheSafeParams, ToolDefinition,
 };
 pub use can_use_tool::{
-    build_combined_review_tool_schemas, build_memory_review_tool_schemas,
+    build_combined_review_tool_schemas, build_flush_tool_schemas, build_memory_review_tool_schemas,
     build_skill_review_tool_schemas, create_auto_mem_can_use_tool,
     create_combined_review_can_use_tool, create_compact_can_use_tool, create_dream_can_use_tool,
     create_flush_can_use_tool, create_memory_file_can_use_tool, create_memory_review_can_use_tool,
@@ -47,3 +50,5 @@ pub use context::{
     create_subagent_context, AbortController, ContentReplacementState, FileStateCache,
     QueryTracking, SubagentContext, SubagentOverrides,
 };
+// AbortToken 从 blockcell_core 导出
+pub use blockcell_core::AbortToken;

@@ -11,6 +11,7 @@ mod tests {
     use blockcell_agent::session_memory::{
         should_extract_memory, SessionMemoryConfig, SessionMemoryState,
     };
+    use blockcell_core::config::Layer4Config;
     use blockcell_core::types::ChatMessage;
     use std::path::PathBuf;
 
@@ -34,7 +35,10 @@ mod tests {
     fn test_compact_trigger() {
         let config = MemorySystemConfig {
             token_budget: 100,
-            compact_threshold: 0.8,
+            layer4: Layer4Config {
+                compact_threshold_ratio: 0.8,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let memory_system = MemorySystem::new(
@@ -76,7 +80,10 @@ mod tests {
     fn test_post_sampling_hook_compact() {
         let config = MemorySystemConfig {
             token_budget: 100,
-            compact_threshold: 0.8,
+            layer4: Layer4Config {
+                compact_threshold_ratio: 0.8,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut memory_system = MemorySystem::new(
@@ -124,6 +131,10 @@ mod tests {
                 minimum_message_tokens_to_init: 10_000,
                 minimum_tokens_between_update: 5_000,
                 tool_calls_between_updates: 3,
+                extraction_wait_timeout_ms: 15_000,
+                extraction_stale_threshold_ms: 60_000,
+                max_section_length: 2_000,
+                max_total_session_memory_tokens: 12_000,
             },
             ..Default::default()
         };
@@ -189,11 +200,11 @@ mod tests {
 
         assert!(config.auto_memory_enabled);
         assert!(config.compact_enabled);
-        assert_eq!(config.compact_threshold, 0.8);
+        assert_eq!(config.layer4.compact_threshold_ratio, 0.8);
         assert_eq!(config.token_budget, 100_000);
-        assert_eq!(config.session_memory.minimum_message_tokens_to_init, 10_000);
-        assert_eq!(config.session_memory.minimum_tokens_between_update, 5_000);
-        assert_eq!(config.session_memory.tool_calls_between_updates, 3);
+        assert_eq!(config.layer3.minimum_message_tokens_to_init, 10_000);
+        assert_eq!(config.layer3.minimum_tokens_between_update, 5_000);
+        assert_eq!(config.layer3.tool_calls_between_updates, 3);
     }
 
     // ========================================================================
@@ -442,7 +453,7 @@ mod tests {
     #[test]
     fn test_layer3_layer4_recovery_interaction() {
         use blockcell_agent::compact::{
-            FileRecoveryState, MAX_FILE_RECOVERY_TOKENS, MAX_SINGLE_FILE_TOKENS,
+            FileTracker, RecoveryBudget, MAX_FILE_RECOVERY_TOKENS, MAX_SINGLE_FILE_TOKENS,
         };
         use blockcell_agent::session_memory::{Section, SectionPriority};
 
@@ -457,14 +468,21 @@ mod tests {
         assert_eq!(MAX_FILE_RECOVERY_TOKENS, 50_000);
         assert_eq!(MAX_SINGLE_FILE_TOKENS, 5_000);
 
-        // 验证恢复上下文能跟踪文件状态
-        let file_state = FileRecoveryState {
-            path: PathBuf::from("/tmp/test.rs"),
-            content_summary: "fn main() {}".to_string(),
-            estimated_tokens: 1000,
-            was_modified: false,
-        };
-        assert!(file_state.estimated_tokens <= MAX_SINGLE_FILE_TOKENS);
+        // 验证 RecoveryBudget 默认值与常量一致
+        let budget = RecoveryBudget::default();
+        assert_eq!(budget.max_file_recovery_tokens, MAX_FILE_RECOVERY_TOKENS);
+        assert_eq!(budget.max_single_file_tokens, MAX_SINGLE_FILE_TOKENS);
+        assert_eq!(budget.max_skill_recovery_tokens, 25_000);
+        assert_eq!(budget.max_session_memory_recovery_tokens, 12_000);
+        assert_eq!(budget.max_files_to_recover, 5);
+
+        // 验证 FileTracker 能跟踪文件状态
+        let mut tracker = FileTracker::new();
+        tracker.record_read(PathBuf::from("/tmp/test.rs"), "fn main() {}");
+        let recent =
+            tracker.get_recent_files(budget.max_files_to_recover, budget.max_single_file_tokens);
+        assert_eq!(recent.len(), 1);
+        assert!(recent[0].estimated_tokens <= MAX_SINGLE_FILE_TOKENS);
     }
 
     /// 测试 Layer 5 + Layer 7 交互：自动记忆提取与 Forked Agent
@@ -582,7 +600,10 @@ mod tests {
         // 创建记忆系统并验证流程
         let config = MemorySystemConfig {
             token_budget: 50_000,
-            compact_threshold: 0.8,
+            layer4: Layer4Config {
+                compact_threshold_ratio: 0.8,
+                ..Default::default()
+            },
             auto_memory_enabled: true,
             ..Default::default()
         };
@@ -722,6 +743,10 @@ mod tests {
             minimum_message_tokens_to_init: 5_000,
             minimum_tokens_between_update: 2_000,
             tool_calls_between_updates: 2,
+            extraction_wait_timeout_ms: 15_000,
+            extraction_stale_threshold_ms: 60_000,
+            max_section_length: 2_000,
+            max_total_session_memory_tokens: 12_000,
         };
         let mut state = SessionMemoryState {
             config,
@@ -959,8 +984,8 @@ mod tests {
     #[test]
     fn test_compact_recovery_reinjection() {
         use blockcell_agent::compact::{
-            build_recovery_message, FileTracker, SkillTracker, MAX_FILES_TO_RECOVER,
-            MAX_SINGLE_FILE_TOKENS,
+            build_recovery_message, FileTracker, RecoveryBudget, SkillTracker,
+            MAX_FILES_TO_RECOVER, MAX_SINGLE_FILE_TOKENS,
         };
         use std::path::PathBuf;
 
@@ -1003,8 +1028,12 @@ _No errors encountered._
 "#;
 
         // 4. 构建恢复消息
-        let recovery_message =
-            build_recovery_message(&file_tracker, &skill_tracker, Some(session_memory));
+        let recovery_message = build_recovery_message(
+            &file_tracker,
+            &skill_tracker,
+            Some(session_memory),
+            &RecoveryBudget::default(),
+        );
 
         // 5. 验证恢复消息内容
         assert!(recovery_message.contains("Files Previously Read"));
@@ -1046,27 +1075,30 @@ _No errors encountered._
     /// 验证恢复消息的格式符合预期，能被 LLM 正确理解
     #[test]
     fn test_compact_recovery_message_format() {
-        use blockcell_agent::compact::{build_recovery_message, FileTracker, SkillTracker};
+        use blockcell_agent::compact::{
+            build_recovery_message, FileTracker, RecoveryBudget, SkillTracker,
+        };
 
         // 创建空的 tracker
         let file_tracker = FileTracker::new();
         let skill_tracker = SkillTracker::new();
+        let budget = RecoveryBudget::default();
 
         // 测试空内容
-        let empty_recovery = build_recovery_message(&file_tracker, &skill_tracker, None);
+        let empty_recovery = build_recovery_message(&file_tracker, &skill_tracker, None, &budget);
         assert!(empty_recovery.is_empty());
 
         // 只测试文件
         let mut file_tracker_only = FileTracker::new();
         file_tracker_only.record_read(PathBuf::from("/test.rs"), "test content");
-        let files_only = build_recovery_message(&file_tracker_only, &skill_tracker, None);
+        let files_only = build_recovery_message(&file_tracker_only, &skill_tracker, None, &budget);
         assert!(files_only.contains("Files Previously Read"));
         assert!(!files_only.contains("Skills Previously Loaded"));
 
         // 只测试技能
         let mut skill_tracker_only = SkillTracker::new();
         skill_tracker_only.record_load("test-skill", "skill content");
-        let skills_only = build_recovery_message(&file_tracker, &skill_tracker_only, None);
+        let skills_only = build_recovery_message(&file_tracker, &skill_tracker_only, None, &budget);
         assert!(!skills_only.contains("Files Previously Read"));
         assert!(skills_only.contains("Skills Previously Loaded"));
 
@@ -1075,6 +1107,7 @@ _No errors encountered._
             &file_tracker,
             &skill_tracker,
             Some("# Session\nTest content"),
+            &budget,
         );
         assert!(session_only.contains("Session Memory"));
     }
@@ -1085,7 +1118,8 @@ _No errors encountered._
     #[test]
     fn test_compact_recovery_token_budget() {
         use blockcell_agent::compact::{
-            build_recovery_message, FileTracker, SkillTracker, MAX_SINGLE_FILE_TOKENS,
+            build_recovery_message, FileTracker, RecoveryBudget, SkillTracker,
+            MAX_SINGLE_FILE_TOKENS,
         };
 
         // 创建包含大量内容的 tracker
@@ -1119,7 +1153,12 @@ _No errors encountered._
         }
 
         // 构建恢复消息
-        let recovery = build_recovery_message(&file_tracker, &skill_tracker, None);
+        let recovery = build_recovery_message(
+            &file_tracker,
+            &skill_tracker,
+            None,
+            &RecoveryBudget::default(),
+        );
 
         // 验证恢复消息不为空
         assert!(!recovery.is_empty());
@@ -1212,7 +1251,10 @@ _No errors encountered._
         // Layer 4: 创建低预算配置以触发 Compact
         let config = MemorySystemConfig {
             token_budget: 1000, // 很低的预算
-            compact_threshold: 0.5,
+            layer4: Layer4Config {
+                compact_threshold_ratio: 0.5,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -1285,7 +1327,10 @@ _No errors encountered._
         // Compact 最高优先级
         let config = MemorySystemConfig {
             token_budget: 100,
-            compact_threshold: 0.8,
+            layer4: Layer4Config {
+                compact_threshold_ratio: 0.8,
+                ..Default::default()
+            },
             auto_memory_enabled: true,
             ..Default::default()
         };

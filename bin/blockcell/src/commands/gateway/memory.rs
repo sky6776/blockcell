@@ -44,7 +44,10 @@ async fn execute_memory_create_via_tool(
         event_emitter: None,
         channel_contacts_file: Some(agent_paths.channel_contacts_file()),
         response_cache: None,
+        runtime_handle: None,
+        agent_identity: None,
         skill_mutex: None,
+        agent_type_registry: None,
     };
 
     state.tool_registry.execute("memory_upsert", ctx, req).await
@@ -137,7 +140,7 @@ pub(super) async fn handle_memory_stats(
 mod tests {
     use super::*;
     use axum::body::to_bytes;
-    use blockcell_agent::TaskManager;
+    use blockcell_agent::{CheckpointManager, TaskManager};
     use blockcell_channels::ChannelManager;
     use blockcell_core::{build_session_key, Paths};
     use blockcell_skills::{EvolutionService, EvolutionServiceConfig};
@@ -269,6 +272,7 @@ mod tests {
         GatewayState {
             inbound_tx,
             task_manager: TaskManager::new(),
+            checkpoint_manager: CheckpointManager::new(&paths.workspace()),
             config,
             paths,
             api_token: None,

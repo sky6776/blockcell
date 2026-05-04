@@ -23,6 +23,10 @@ fn get_memory_store(ctx: &ToolContext) -> Result<&crate::MemoryStoreHandle> {
         .ok_or_else(|| Error::Tool("Memory store not available".to_string()))
 }
 
+/// 判断文本是否像 Ghost Agent 维护日志
+///
+/// 用于阻止 Ghost Agent 将自己的维护日志写入记忆存储。
+/// 使用精确匹配模式避免误判用户正常内容（如健康话题、数据 feed 等）。
 fn get_memory_file_store(ctx: &ToolContext) -> Result<&crate::MemoryFileStoreHandle> {
     ctx.memory_file_store
         .as_ref()
@@ -38,9 +42,10 @@ fn looks_like_ghost_maintenance_log(text: &str) -> bool {
         || t.contains("记忆整理")
         || t.contains("文件清理")
         || t.contains("社区互动")
-        || t.contains("heart")
-        || t.contains("heartbeat")
-        || t.contains("feed")
+        || t.contains("heartbeat check")  // 精确匹配，避免误判健康话题
+        || t.contains("heartbeat report")
+        || t.contains("feed cycle")       // 精确匹配，避免误判数据 feed
+        || t.contains("feed routine")
 }
 
 #[async_trait]
@@ -357,6 +362,36 @@ impl Tool for MemoryUpsertTool {
             return Err(Error::Validation(
                 "Missing required parameter: content".to_string(),
             ));
+        }
+        // 验证 type 字段与 schema enum 一致
+        if let Some(item_type) = params.get("type").and_then(|v| v.as_str()) {
+            const VALID_TYPES: &[&str] = &[
+                "fact",
+                "preference",
+                "project",
+                "task",
+                "glossary",
+                "contact",
+                "snippet",
+                "policy",
+                "note",
+            ];
+            if !VALID_TYPES.contains(&item_type) {
+                return Err(Error::Validation(format!(
+                    "Invalid memory type '{}'. Must be one of: {}",
+                    item_type,
+                    VALID_TYPES.join(", ")
+                )));
+            }
+        }
+        // 验证 scope 字段
+        if let Some(scope) = params.get("scope").and_then(|v| v.as_str()) {
+            if scope != "long_term" && scope != "short_term" {
+                return Err(Error::Validation(format!(
+                    "Invalid scope '{}'. Must be 'long_term' or 'short_term'",
+                    scope
+                )));
+            }
         }
         Ok(())
     }
@@ -786,6 +821,9 @@ mod tests {
             channel_contacts_file: None,
             response_cache: None,
             skill_mutex: None,
+            agent_type_registry: None,
+            runtime_handle: None,
+            agent_identity: None,
         }
     }
 
@@ -814,7 +852,10 @@ mod tests {
             event_emitter: None,
             channel_contacts_file: None,
             response_cache: None,
+            runtime_handle: None,
+            agent_identity: None,
             skill_mutex: None,
+            agent_type_registry: None,
         }
     }
 

@@ -27,7 +27,7 @@ pub use extractor::{
 };
 pub use recovery::{
     get_session_memory_content_for_compact, get_session_memory_dir, get_session_memory_path,
-    wait_for_session_memory_extraction,
+    wait_for_session_memory_extraction, wait_for_session_memory_extraction_with_timeout,
 };
 pub use template::{
     validate_session_memory, Section, SectionPriority, ValidationResult,
@@ -36,11 +36,15 @@ pub use template::{
 
 use std::path::PathBuf;
 
-/// 时间阈值常量
+/// 时间阈值常量 — 仅用作 SessionMemoryConfig::default() 的回退值，
+/// 运行时使用 Layer3Config 中的对应字段。
+/// 注意：wait_for_session_memory_extraction() 已改为接受参数，
+/// 不再使用这些常量作为默认值。
 pub const EXTRACTION_WAIT_TIMEOUT_MS: u64 = 15_000;
 pub const EXTRACTION_STALE_THRESHOLD_MS: u64 = 60_000;
 
-/// Section 限制常量
+/// Section 限制常量 — 仅用作 SessionMemoryConfig::default() 的回退值，
+/// 运行时使用 Layer3Config 中的对应字段
 pub const MAX_SECTION_LENGTH: usize = 2000;
 pub const MAX_TOTAL_SESSION_MEMORY_TOKENS: usize = 12000;
 

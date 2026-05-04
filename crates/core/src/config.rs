@@ -1805,11 +1805,418 @@ impl Default for MemoryVectorConfig {
     }
 }
 
+// === Layer 1: 工具结果持久化配置 ===
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Layer1Config {
+    /// 单个工具结果的最大字符数（超过此值触发持久化，通过 ResponseCacheConfig 在运行时生效）
+    #[serde(default = "default_l1_max_result_size")]
+    pub max_result_size_chars: usize,
+    #[serde(default = "default_l1_max_per_message")]
+    pub max_tool_results_per_message_chars: usize,
+    #[serde(default = "default_l1_preview_size")]
+    pub preview_size_bytes: usize,
+    #[serde(default = "default_l1_max_replacement")]
+    pub max_replacement_entries: usize,
+    #[serde(default = "default_l1_cache_max")]
+    pub cache_max_per_session: usize,
+    /// 可缓存最小字符数（低于此数不缓存）
+    #[serde(default = "default_cacheable_min_chars")]
+    pub cacheable_min_chars: usize,
+}
+
+fn default_l1_max_result_size() -> usize {
+    50_000
+}
+fn default_l1_max_per_message() -> usize {
+    150_000
+}
+fn default_l1_preview_size() -> usize {
+    2_000
+}
+fn default_l1_max_replacement() -> usize {
+    1_000
+}
+fn default_l1_cache_max() -> usize {
+    10
+}
+fn default_cacheable_min_chars() -> usize {
+    800
+}
+
+impl Default for Layer1Config {
+    fn default() -> Self {
+        Self {
+            max_result_size_chars: 50_000,
+            max_tool_results_per_message_chars: 150_000,
+            preview_size_bytes: 2_000,
+            max_replacement_entries: 1_000,
+            cache_max_per_session: 10,
+            cacheable_min_chars: 800,
+        }
+    }
+}
+
+// === Layer 2: 时间触发 MicroCompact 配置 ===
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Layer2Config {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_l2_gap_threshold")]
+    pub gap_threshold_minutes: u32,
+    #[serde(default = "default_l2_keep_recent")]
+    pub keep_recent: u32,
+}
+
+fn default_l2_gap_threshold() -> u32 {
+    60
+}
+fn default_l2_keep_recent() -> u32 {
+    5
+}
+
+impl Default for Layer2Config {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            gap_threshold_minutes: 60,
+            keep_recent: 5,
+        }
+    }
+}
+
+// === Layer 3: Session Memory 提取配置 ===
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Layer3Config {
+    #[serde(default = "default_l3_init_tokens")]
+    pub minimum_message_tokens_to_init: usize,
+    #[serde(default = "default_l3_update_tokens")]
+    pub minimum_tokens_between_update: usize,
+    #[serde(default = "default_l3_tool_calls")]
+    pub tool_calls_between_updates: usize,
+    #[serde(default = "default_l3_wait_timeout")]
+    pub extraction_wait_timeout_ms: u64,
+    #[serde(default = "default_l3_stale_threshold")]
+    pub extraction_stale_threshold_ms: u64,
+    #[serde(default = "default_l3_max_section")]
+    pub max_section_length: usize,
+    #[serde(default = "default_l3_max_total_tokens")]
+    pub max_total_session_memory_tokens: usize,
+}
+
+fn default_l3_init_tokens() -> usize {
+    10_000
+}
+fn default_l3_update_tokens() -> usize {
+    5_000
+}
+fn default_l3_tool_calls() -> usize {
+    3
+}
+fn default_l3_wait_timeout() -> u64 {
+    15_000
+}
+fn default_l3_stale_threshold() -> u64 {
+    60_000
+}
+fn default_l3_max_section() -> usize {
+    2_000
+}
+fn default_l3_max_total_tokens() -> usize {
+    12_000
+}
+
+impl Default for Layer3Config {
+    fn default() -> Self {
+        Self {
+            minimum_message_tokens_to_init: 10_000,
+            minimum_tokens_between_update: 5_000,
+            tool_calls_between_updates: 3,
+            extraction_wait_timeout_ms: 15_000,
+            extraction_stale_threshold_ms: 60_000,
+            max_section_length: 2_000,
+            max_total_session_memory_tokens: 12_000,
+        }
+    }
+}
+
+// === Layer 4: Full Compact + 恢复配置 ===
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Layer4Config {
+    #[serde(default = "default_l4_threshold_ratio")]
+    pub compact_threshold_ratio: f64,
+    #[serde(default = "default_l4_keep_recent")]
+    pub keep_recent_messages: usize,
+    #[serde(default = "default_l4_max_output")]
+    pub max_output_tokens: usize,
+    #[serde(default = "default_l4_file_recovery")]
+    pub max_file_recovery_tokens: usize,
+    #[serde(default = "default_l4_single_file")]
+    pub max_single_file_tokens: usize,
+    #[serde(default = "default_l4_max_files")]
+    pub max_files_to_recover: usize,
+    #[serde(default = "default_l4_skill_recovery")]
+    pub max_skill_recovery_tokens: usize,
+    #[serde(default = "default_l4_session_memory_recovery")]
+    pub max_session_memory_recovery_tokens: usize,
+    #[serde(default = "default_l4_tracker_summary")]
+    pub tracker_summary_chars: usize,
+}
+
+fn default_l4_threshold_ratio() -> f64 {
+    0.8
+}
+fn default_l4_keep_recent() -> usize {
+    2
+}
+fn default_l4_max_output() -> usize {
+    12_000
+}
+fn default_l4_file_recovery() -> usize {
+    50_000
+}
+fn default_l4_single_file() -> usize {
+    5_000
+}
+fn default_l4_max_files() -> usize {
+    5
+}
+fn default_l4_skill_recovery() -> usize {
+    25_000
+}
+fn default_l4_session_memory_recovery() -> usize {
+    12_000
+}
+fn default_l4_tracker_summary() -> usize {
+    2_000
+}
+
+impl Default for Layer4Config {
+    fn default() -> Self {
+        Self {
+            compact_threshold_ratio: 0.8,
+            keep_recent_messages: 2,
+            max_output_tokens: 12_000,
+            max_file_recovery_tokens: 50_000,
+            max_single_file_tokens: 5_000,
+            max_files_to_recover: 5,
+            max_skill_recovery_tokens: 25_000,
+            max_session_memory_recovery_tokens: 12_000,
+            tracker_summary_chars: 2_000,
+        }
+    }
+}
+
+// === Layer 5: Auto Memory 提取 + 注入配置 ===
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Layer5Config {
+    #[serde(default = "default_l5_min_messages")]
+    pub min_messages_for_extraction: usize,
+    #[serde(default = "default_l5_cooldown")]
+    pub extraction_cooldown_messages: usize,
+    #[serde(default = "default_l5_max_file_tokens")]
+    pub max_memory_file_tokens: usize,
+    #[serde(default = "default_l5_injection_max")]
+    pub injection_max_tokens: usize,
+    /// 提取时间冷却阈值（秒），距离上次提取需经过此时间
+    #[serde(default = "default_l5_time_cooldown_secs")]
+    pub extraction_time_cooldown_secs: u64,
+    /// 内容变化阈值（字符数），内容变化需超过此值才触发提取
+    #[serde(default = "default_l5_content_change_threshold")]
+    pub content_change_threshold: usize,
+}
+
+fn default_l5_min_messages() -> usize {
+    15
+}
+fn default_l5_cooldown() -> usize {
+    5
+}
+fn default_l5_max_file_tokens() -> usize {
+    4_000
+}
+fn default_l5_injection_max() -> usize {
+    4_000
+}
+fn default_l5_time_cooldown_secs() -> u64 {
+    300
+}
+fn default_l5_content_change_threshold() -> usize {
+    500
+}
+
+impl Default for Layer5Config {
+    fn default() -> Self {
+        Self {
+            min_messages_for_extraction: 15,
+            extraction_cooldown_messages: 5,
+            max_memory_file_tokens: 4_000,
+            injection_max_tokens: 4_000,
+            extraction_time_cooldown_secs: 300,
+            content_change_threshold: 500,
+        }
+    }
+}
+
+// === 7 层记忆系统配置 ===
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemorySystemConfig {
+    #[serde(default = "default_token_budget")]
+    pub token_budget: usize,
+    #[serde(default = "default_true")]
+    pub auto_memory_enabled: bool,
+    #[serde(default = "default_true")]
+    pub compact_enabled: bool,
+    #[serde(default)]
+    pub layer1: Layer1Config,
+    #[serde(default)]
+    pub layer2: Layer2Config,
+    #[serde(default)]
+    pub layer3: Layer3Config,
+    #[serde(default)]
+    pub layer4: Layer4Config,
+    #[serde(default)]
+    pub layer5: Layer5Config,
+}
+
+fn default_token_budget() -> usize {
+    100_000
+}
+
+impl Default for MemorySystemConfig {
+    fn default() -> Self {
+        Self {
+            token_budget: 100_000,
+            auto_memory_enabled: true,
+            compact_enabled: true,
+            layer1: Layer1Config::default(),
+            layer2: Layer2Config::default(),
+            layer3: Layer3Config::default(),
+            layer4: Layer4Config::default(),
+            layer5: Layer5Config::default(),
+        }
+    }
+}
+
+impl MemorySystemConfig {
+    /// Validate configuration and return a list of warnings.
+    ///
+    /// Warnings are non-fatal — the system will still start, but the user
+    /// should be informed about potentially problematic settings.
+    pub fn validate(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        // token_budget range check
+        if self.token_budget < 20_000 {
+            warnings.push(format!(
+                "memorySystem.tokenBudget = {} is very low (min recommended: 20,000). \
+                 This may cause frequent compaction.",
+                self.token_budget
+            ));
+        }
+        if self.token_budget > 500_000 {
+            warnings.push(format!(
+                "memorySystem.tokenBudget = {} is very high (max recommended: 500,000). \
+                 This may cause excessive memory usage.",
+                self.token_budget
+            ));
+        }
+
+        // L1: max_result_size_chars <= max_tool_results_per_message_chars
+        if self.layer1.max_result_size_chars > self.layer1.max_tool_results_per_message_chars {
+            warnings.push(format!(
+                "layer1.maxResultSizeChars ({}) > layer1.maxToolResultsPerMessageChars ({}). \
+                 Single result exceeds per-message budget.",
+                self.layer1.max_result_size_chars, self.layer1.max_tool_results_per_message_chars
+            ));
+        }
+
+        // L4: compact_threshold_ratio range
+        if self.layer4.compact_threshold_ratio < 0.5 {
+            warnings.push(format!(
+                "layer4.compactThresholdRatio = {:.2} is below 0.5. \
+                 This may cause premature compaction.",
+                self.layer4.compact_threshold_ratio
+            ));
+        }
+        if self.layer4.compact_threshold_ratio > 0.95 {
+            warnings.push(format!(
+                "layer4.compactThresholdRatio = {:.2} is above 0.95. \
+                 This may leave insufficient room for compaction.",
+                self.layer4.compact_threshold_ratio
+            ));
+        }
+
+        // L4: recovery budget check
+        let total_recovery = self.layer4.max_file_recovery_tokens
+            + self.layer4.max_skill_recovery_tokens
+            + self.layer4.max_session_memory_recovery_tokens;
+        let budget_95pct = (self.token_budget as f64 * 0.95) as usize;
+        if total_recovery > budget_95pct {
+            warnings.push(format!(
+                "L4 recovery total ({} + {} + {} = {}) exceeds 95% of tokenBudget ({}). \
+                 Recovery may consume too much of the budget.",
+                self.layer4.max_file_recovery_tokens,
+                self.layer4.max_skill_recovery_tokens,
+                self.layer4.max_session_memory_recovery_tokens,
+                total_recovery,
+                budget_95pct
+            ));
+        }
+
+        // L4: single file × max files <= file recovery budget
+        let max_file_total = self.layer4.max_single_file_tokens * self.layer4.max_files_to_recover;
+        if max_file_total > self.layer4.max_file_recovery_tokens {
+            warnings.push(format!(
+                "layer4.maxSingleFileTokens ({}) × layer4.maxFilesToRecover ({}) = {} \
+                 exceeds layer4.maxFileRecoveryTokens ({}). \
+                 Some files may not be recovered.",
+                self.layer4.max_single_file_tokens,
+                self.layer4.max_files_to_recover,
+                max_file_total,
+                self.layer4.max_file_recovery_tokens
+            ));
+        }
+
+        // L3 vs L4: session memory consistency
+        if self.layer3.max_total_session_memory_tokens
+            != self.layer4.max_session_memory_recovery_tokens
+        {
+            warnings.push(format!(
+                "layer3.maxTotalSessionMemoryTokens ({}) != \
+                 layer4.maxSessionMemoryRecoveryTokens ({}). \
+                 Consider aligning these values.",
+                self.layer3.max_total_session_memory_tokens,
+                self.layer4.max_session_memory_recovery_tokens
+            ));
+        }
+
+        // L5: injection_max_tokens should be reasonable
+        if self.layer5.injection_max_tokens > self.layer5.max_memory_file_tokens * 4 {
+            warnings.push(format!(
+                "layer5.injectionMaxTokens ({}) > 4 × layer5.maxMemoryFileTokens ({}). \
+                 Injection budget may be too large relative to file size limit.",
+                self.layer5.injection_max_tokens, self.layer5.max_memory_file_tokens
+            ));
+        }
+
+        warnings
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryConfig {
     #[serde(default)]
     pub vector: MemoryVectorConfig,
+    /// 7 层记忆系统阈值配置
+    #[serde(default)]
+    pub memory_system: MemorySystemConfig,
 }
 
 /// Self-Improve 配置 — Nudge + Review 子系统
@@ -1841,7 +2248,7 @@ pub struct SelfImproveNudgeConfig {
     #[serde(default = "default_memory_hard_threshold")]
     pub memory_hard_threshold: u32,
     /// 是否启用 nudge (默认: true)
-    #[serde(default = "default_true_val")]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// 最小 nudge 间隔秒数 (默认: 300)
     #[serde(default = "default_min_nudge_interval_secs")]
@@ -1859,9 +2266,6 @@ fn default_memory_soft_threshold() -> u32 {
 }
 fn default_memory_hard_threshold() -> u32 {
     6
-}
-fn default_true_val() -> bool {
-    true
 }
 fn default_min_nudge_interval_secs() -> u64 {
     300
@@ -1885,7 +2289,7 @@ impl Default for SelfImproveNudgeConfig {
 #[serde(rename_all = "camelCase")]
 pub struct SelfImproveReviewConfig {
     /// 是否启用 Review (默认: true)
-    #[serde(default = "default_true_val")]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Review 最大轮次 (默认: 8)
     #[serde(default = "default_max_review_rounds")]
@@ -2403,6 +2807,13 @@ impl Config {
                         needs_save = true;
                     }
                 }
+                // Ensure memorySystem config section exists
+                if !raw.contains("memorySystem") {
+                    tracing::info!(
+                        "Adding missing memorySystem config section to config (7-layer memory thresholds)"
+                    );
+                    needs_save = true;
+                }
             }
         }
 
@@ -2428,6 +2839,12 @@ impl Config {
             } else {
                 tracing::info!(path = %config_path.display(), "Config file updated with missing fields");
             }
+        }
+
+        // Validate memorySystem config and log warnings (non-fatal)
+        let mem_warnings = config.memory.memory_system.validate();
+        for warning in &mem_warnings {
+            tracing::warn!(warning, "memorySystem config warning");
         }
 
         Ok(config)

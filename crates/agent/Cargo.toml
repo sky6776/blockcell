@@ -28,3 +28,6 @@ tiktoken-rs = { workspace = true }
 [features]
 default = ["napcat"]
 napcat = ["blockcell-tools/napcat"]
+
+[dev-dependencies]
+tempfile = { workspace = true }

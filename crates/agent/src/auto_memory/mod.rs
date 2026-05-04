@@ -20,17 +20,26 @@ mod memory_type;
 pub mod scanner;
 
 pub use cursor::{ExtractionCursor, ExtractionCursorManager};
+pub(crate) use extractor::build_message_content_signature;
 pub use extractor::{
-    extract_auto_memory, should_extract_auto_memory, AutoMemoryExtractor, ExtractionParams,
-    ExtractionResult,
+    should_extract_auto_memory, should_extract_auto_memory_with_config, AutoMemoryConfig,
+    AutoMemoryExtractor, ExtractionParams, ExtractionResult,
 };
 pub use injector::{format_memory_for_context, InjectedMemory, InjectionConfig, MemoryInjector};
 pub use memory_type::{get_memory_file_path, MemoryType, MEMORY_FILE_NAMES};
 
-/// 记忆提取配置
+/// 记忆提取配置 — 仅用作 AutoMemoryConfig::default() 和
+/// should_extract_auto_memory() 的回退值，
+/// 运行时使用 Layer5Config 中的对应字段
+#[deprecated(note = "use crate::unified_security_scanner for learned content scanning")]
+pub use scanner as deprecated_scanner;
 pub const MIN_MESSAGES_FOR_EXTRACTION: usize = 15;
 pub const EXTRACTION_COOLDOWN_MESSAGES: usize = 5;
 pub const MAX_MEMORY_FILE_TOKENS: usize = 4000;
+
+/// 注入预算默认值 — 仅用作 InjectionConfig::default() 的回退值，
+/// 运行时使用 Layer5Config.injection_max_tokens
+pub const DEFAULT_INJECTION_MAX_TOKENS: usize = 4000;
 
 /// 记忆目录名
 pub const MEMORY_DIR_NAME: &str = "memory";
