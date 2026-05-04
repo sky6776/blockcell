@@ -39,6 +39,82 @@ pub struct OpenAIProvider {
     tool_call_mode: AtomicU8,
 }
 
+struct TextToolMarkupStreamFilter {
+    enabled: bool,
+    suppressing: bool,
+    pending: String,
+}
+
+impl TextToolMarkupStreamFilter {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            suppressing: false,
+            pending: String::new(),
+        }
+    }
+
+    fn push(&mut self, delta: &str) -> Option<String> {
+        if !self.enabled {
+            return Some(delta.to_string());
+        }
+
+        self.pending.push_str(delta);
+
+        if self.suppressing {
+            if OpenAIProvider::text_tool_markup_delta_closes(&self.pending) {
+                self.pending.clear();
+                self.suppressing = false;
+            }
+            return None;
+        }
+
+        if let Some(marker_start) = OpenAIProvider::find_text_tool_marker_start(&self.pending) {
+            let visible = self.pending[..marker_start].to_string();
+            let hidden = self.pending[marker_start..].to_string();
+            self.pending = hidden;
+            self.suppressing = true;
+            if OpenAIProvider::text_tool_markup_delta_closes(&self.pending) {
+                self.pending.clear();
+                self.suppressing = false;
+            }
+            return if visible.is_empty() {
+                None
+            } else {
+                Some(visible)
+            };
+        }
+
+        let held_suffix_len = OpenAIProvider::text_tool_marker_candidate_suffix_len(&self.pending);
+        if held_suffix_len == self.pending.len() {
+            return None;
+        }
+
+        let emit_len = self.pending.len() - held_suffix_len;
+        let visible = self.pending[..emit_len].to_string();
+        self.pending = self.pending[emit_len..].to_string();
+        if visible.is_empty() {
+            None
+        } else {
+            Some(visible)
+        }
+    }
+
+    fn flush(&mut self) -> Option<String> {
+        if !self.enabled || !self.suppressing {
+            let visible = std::mem::take(&mut self.pending);
+            if visible.is_empty() {
+                None
+            } else {
+                Some(visible)
+            }
+        } else {
+            self.pending.clear();
+            None
+        }
+    }
+}
+
 impl OpenAIProvider {
     fn sanitize_messages_for_native_tools(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         let mut sanitized = Vec::with_capacity(messages.len());
@@ -467,7 +543,86 @@ impl OpenAIProvider {
         ))
     }
 
+    fn normalize_text_tool_markup(content: &str) -> String {
+        content
+            .replace("<｜DSML｜", "<")
+            .replace("</｜DSML｜", "</")
+            .replace("<|DSML|", "<")
+            .replace("</|DSML|", "</")
+    }
+
+    fn strip_text_tool_wrappers(content: &str) -> String {
+        let mut remaining = content.to_string();
+        for tag in ["<tool_calls>", "</tool_calls>", "<tools>", "</tools>"] {
+            remaining = remaining.replace(tag, "");
+        }
+        remaining
+    }
+
+    fn text_tool_marker_starts() -> &'static [&'static str] {
+        &[
+            "<｜DSML｜",
+            "</｜DSML｜",
+            "<|DSML|",
+            "</|DSML|",
+            "<tool_call",
+            "</tool_call",
+            "[tool_call]",
+            "[/tool_call]",
+            "<minimax:tool_call",
+            "</minimax:tool_call",
+            "<tool_calls",
+            "</tool_calls",
+            "<invoke",
+            "</invoke",
+            "<parameter",
+            "</parameter",
+            "[called:",
+        ]
+    }
+
+    fn starts_with_text_tool_marker(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        Self::text_tool_marker_starts()
+            .iter()
+            .any(|marker| lower.starts_with(&marker.to_lowercase()))
+    }
+
+    fn find_text_tool_marker_start(text: &str) -> Option<usize> {
+        text.char_indices()
+            .map(|(idx, _)| idx)
+            .find(|idx| Self::starts_with_text_tool_marker(&text[*idx..]))
+    }
+
+    fn text_tool_marker_candidate_suffix_len(text: &str) -> usize {
+        text.char_indices()
+            .map(|(idx, _)| idx)
+            .filter_map(|idx| {
+                let suffix = &text[idx..];
+                let suffix_lower = suffix.to_lowercase();
+                Self::text_tool_marker_starts()
+                    .iter()
+                    .map(|marker| marker.to_lowercase())
+                    .any(|marker| suffix.len() < marker.len() && marker.starts_with(&suffix_lower))
+                    .then_some(suffix.len())
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn text_tool_markup_delta_closes(delta: &str) -> bool {
+        let normalized = Self::normalize_text_tool_markup(delta);
+        let lower = normalized.to_lowercase();
+        lower.contains("</tool_call>")
+            || lower.contains("[/tool_call]")
+            || lower.contains("</tool_calls>")
+            || lower.contains("</minimax:tool_call>")
+            || lower.contains("</invoke>")
+    }
+
     fn parse_text_tool_calls(content: &str) -> (String, Vec<ToolCallRequest>) {
+        let normalized_content = Self::normalize_text_tool_markup(content);
+        let content = normalized_content.as_str();
         let mut tool_calls = Vec::new();
         let mut remaining = String::new();
         let mut rest = content;
@@ -742,7 +897,9 @@ impl OpenAIProvider {
             remaining = pass4_remaining;
         }
 
-        let remaining = remaining.trim().to_string();
+        let remaining = Self::strip_text_tool_wrappers(&remaining)
+            .trim()
+            .to_string();
         (remaining, tool_calls)
     }
 
@@ -1389,6 +1546,9 @@ impl Provider for OpenAIProvider {
             let mut accumulated_reasoning = String::new();
             let mut finish_reason = "stop".to_string();
             let mut usage = Value::Null;
+            let mut text_tool_markup_filter = TextToolMarkupStreamFilter::new(
+                tools_available && !matches!(mode, ToolCallMode::None),
+            );
 
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
@@ -1402,6 +1562,9 @@ impl Provider for OpenAIProvider {
 
                             if let Some(data) = line.strip_prefix("data: ") {
                                 if data == "[DONE]" {
+                                    if let Some(delta) = text_tool_markup_filter.flush() {
+                                        let _ = tx.send(StreamChunk::TextDelta { delta }).await;
+                                    }
                                     // 构建最终响应
                                     let final_tool_calls: Vec<ToolCallRequest> = tool_calls
                                         .into_values()
@@ -1427,11 +1590,12 @@ impl Provider for OpenAIProvider {
                                         // 处理文本增量
                                         if let Some(content) = &choice.delta.content {
                                             accumulated_content.push_str(content);
-                                            let _ = tx
-                                                .send(StreamChunk::TextDelta {
-                                                    delta: content.clone(),
-                                                })
-                                                .await;
+                                            if let Some(delta) =
+                                                text_tool_markup_filter.push(content)
+                                            {
+                                                let _ =
+                                                    tx.send(StreamChunk::TextDelta { delta }).await;
+                                            }
                                         }
 
                                         // 处理推理内容
@@ -1505,6 +1669,9 @@ impl Provider for OpenAIProvider {
             }
 
             // 如果流结束但没有收到 [DONE]，也发送完成事件
+            if let Some(delta) = text_tool_markup_filter.flush() {
+                let _ = tx.send(StreamChunk::TextDelta { delta }).await;
+            }
             let final_tool_calls: Vec<ToolCallRequest> = tool_calls
                 .into_values()
                 .map(|acc| acc.to_tool_call_request())
@@ -1711,6 +1878,64 @@ ls -la
     }
 
     #[test]
+    fn test_parse_deepseek_dsml_tool_calls() {
+        let content = r#"<｜DSML｜tool_calls>
+<｜DSML｜invoke name="list_dir">
+<｜DSML｜parameter name="path" string="true">/home/blockcell/.blockcell/workspace/skills</｜DSML｜parameter>
+</｜DSML｜invoke>
+<｜DSML｜invoke name="list_dir">
+<｜DSML｜parameter name="path" string="true">/home/blockcell/.blockcell/skills</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>"#;
+
+        let (remaining, calls) = OpenAIProvider::parse_text_tool_calls(content);
+
+        assert!(remaining.is_empty(), "remaining: {:?}", remaining);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "list_dir");
+        assert_eq!(
+            calls[0].arguments["path"],
+            "/home/blockcell/.blockcell/workspace/skills"
+        );
+        assert_eq!(calls[1].name, "list_dir");
+        assert_eq!(
+            calls[1].arguments["path"],
+            "/home/blockcell/.blockcell/skills"
+        );
+    }
+
+    #[test]
+    fn test_stream_filter_suppresses_fragmented_dsml_markup() {
+        let mut filter = TextToolMarkupStreamFilter::new(true);
+
+        assert_eq!(
+            filter.push("Let me check.\n"),
+            Some("Let me check.\n".to_string())
+        );
+        assert_eq!(filter.push("<"), None);
+        assert_eq!(filter.push("｜DS"), None);
+        assert_eq!(
+            filter.push("ML｜tool_calls><｜DSML｜invoke name=\"list_dir\">"),
+            None
+        );
+        assert_eq!(
+            filter.push("<｜DSML｜parameter name=\"path\">/tmp</｜DSML｜parameter>"),
+            None
+        );
+        assert_eq!(filter.push("</｜DSML｜invoke></｜DSML｜tool_calls>"), None);
+        assert_eq!(filter.flush(), None);
+    }
+
+    #[test]
+    fn test_stream_filter_releases_plain_text_suffix_candidate() {
+        let mut filter = TextToolMarkupStreamFilter::new(true);
+
+        assert_eq!(filter.push("1 <"), Some("1 ".to_string()));
+        assert_eq!(filter.push(" 2"), Some("< 2".to_string()));
+        assert_eq!(filter.flush(), None);
+    }
+
+    #[test]
     fn test_parse_minimax_invoke_without_minimax_wrapper() {
         // Sometimes the model omits the </minimax:tool_call> wrapper
         let content = "Let me check.\n<invoke name=\"list_skills\">\n</invoke>\nDone.";
@@ -1742,6 +1967,25 @@ ls -la
             response.content.as_deref(),
             Some("我来帮您查看上一级目录。")
         );
+        assert_eq!(response.finish_reason, "tool_calls");
+    }
+
+    #[test]
+    fn test_finalize_stream_response_parses_dsml_tool_call_blocks() {
+        let response = finalize_stream_response(
+            ToolCallMode::Text,
+            true,
+            "<｜DSML｜tool_calls><｜DSML｜invoke name=\"list_dir\"><｜DSML｜parameter name=\"path\" string=\"true\">/tmp</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>".to_string(),
+            String::new(),
+            vec![],
+            "stop".to_string(),
+            Value::Null,
+        );
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "list_dir");
+        assert_eq!(response.tool_calls[0].arguments["path"], "/tmp");
+        assert!(response.content.is_none());
         assert_eq!(response.finish_reason, "tool_calls");
     }
 

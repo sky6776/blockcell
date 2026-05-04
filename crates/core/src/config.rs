@@ -2633,10 +2633,73 @@ where
     T: Serialize,
 {
     let content = stringify_json5_pretty(value)?;
+    write_text_atomic_durable(path, &content)
+}
+
+#[cfg(windows)]
+fn replace_file_atomic_durable(tmp_path: &Path, path: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let tmp_wide: Vec<u16> = tmp_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let ok = unsafe {
+        MoveFileExW(
+            tmp_wide.as_ptr(),
+            path_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+
+    if ok == 0 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomic_durable(tmp_path: &Path, path: &Path) -> Result<()> {
+    std::fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
+fn write_text_atomic_durable(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, content)?;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp_path = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        file_name,
+        std::process::id(),
+        nonce
+    ));
+
+    {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        use std::io::Write;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+    }
+
+    replace_file_atomic_durable(&tmp_path, path)?;
+
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+
     Ok(())
 }
 
@@ -2650,10 +2713,7 @@ pub fn validate_config_json5_file(path: &Path, content: &str) -> Result<Config> 
 
 pub fn write_raw_validated_config_json5(path: &Path, content: &str) -> Result<Config> {
     let config = validate_config_json5_str(content)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, content)?;
+    write_text_atomic_durable(path, content)?;
     Ok(config)
 }
 
