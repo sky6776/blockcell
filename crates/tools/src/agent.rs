@@ -75,7 +75,7 @@ Specify subagent_type for typed agents (background execution, returns task_id)."
         let prompt = params
             .get("prompt")
             .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty());
+            .filter(|s| !s.trim().is_empty());
 
         if prompt.is_none() {
             return Err(Error::Validation(
@@ -272,6 +272,7 @@ mod tests {
         assert!(tool.validate(&json!({})).is_err());
         // 无效: 空 prompt
         assert!(tool.validate(&json!({"prompt": ""})).is_err());
+        assert!(tool.validate(&json!({"prompt": "   \n\t"})).is_err());
     }
 
     #[test]

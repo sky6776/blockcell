@@ -26,9 +26,11 @@ use blockcell_tools::{MemoryFileStoreHandle, MemoryStoreHandle, SkillFileStoreHa
 use regex::Regex;
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
+use tokio::process::Command;
 
 /// Provider 获取重试配置
 const PROVIDER_RETRY_MAX_ATTEMPTS: usize = 3;
@@ -645,6 +647,23 @@ const MAX_OUTPUT_CHARS: usize = 50000;
 /// Skill 名称正则 (与主 skill_manage 工具一致): 小写字母、数字、点、下划线、连字符
 static VALID_SKILL_NAME_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new("^[a-z0-9][a-z0-9._-]*$").expect("VALID_SKILL_NAME_RE"));
+static DANGEROUS_COMMAND_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [
+        r"rm\s+-rf\s+/",
+        r"rm\s+-rf\s+~",
+        r"rm\s+-rf\s+\*",
+        r"\bdd\b.*\bif=",
+        r"\bformat\b",
+        r"\bshutdown\b",
+        r"\breboot\b",
+        r":\(\)\s*\{\s*:\|:\s*&\s*\}\s*;",
+        r">\s*/dev/sd",
+        r"mkfs\.",
+    ]
+    .iter()
+    .map(|pattern| Regex::new(pattern).expect("dangerous command regex"))
+    .collect()
+});
 
 /// 验证路径安全性（防御性检查）
 ///
@@ -762,6 +781,69 @@ fn validate_edit_content(
     Ok(())
 }
 
+fn is_dangerous_shell_command(command: &str) -> bool {
+    DANGEROUS_COMMAND_PATTERNS
+        .iter()
+        .any(|pattern| pattern.is_match(command))
+}
+
+fn truncate_output(content: String, max_chars: usize) -> String {
+    if content.len() <= max_chars {
+        return content;
+    }
+
+    let mut boundary = max_chars;
+    while boundary > 0 && !content.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!(
+        "{}...\n[Truncated, total {} chars]",
+        &content[..boundary],
+        content.len()
+    )
+}
+
+async fn execute_shell_command(
+    command: &str,
+    command_working_dir: Option<PathBuf>,
+) -> Result<String, ForkedAgentError> {
+    if is_dangerous_shell_command(command) {
+        return Err(ForkedAgentError::ToolError(
+            "Command matches dangerous pattern and is blocked".to_string(),
+        ));
+    }
+
+    let mut cmd = if cfg!(windows) {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg(command);
+        cmd
+    } else {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(command);
+        cmd
+    };
+
+    if let Some(dir) = command_working_dir {
+        cmd.current_dir(dir);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let output = tokio::time::timeout(Duration::from_secs(60), cmd.output())
+        .await
+        .map_err(|_| ForkedAgentError::ToolError("Command timed out after 60 seconds".to_string()))?
+        .map_err(|e| ForkedAgentError::ToolError(format!("Failed to execute command: {}", e)))?;
+
+    let stdout = truncate_output(String::from_utf8_lossy(&output.stdout).to_string(), 10_000);
+    let stderr = truncate_output(String::from_utf8_lossy(&output.stderr).to_string(), 10_000);
+
+    Ok(json!({
+        "exit_code": output.status.code(),
+        "stdout": stdout,
+        "stderr": stderr,
+    })
+    .to_string())
+}
+
 /// 在 skills_dir + external_skills_dirs 中查找 Skill 目录 (与主工具 find_skill_dir 对齐)
 ///
 /// 搜索顺序: skills_dir/{name} → skills_dir/{category}/{name} → 各 external_dir 同理
@@ -816,6 +898,7 @@ fn find_skill_dir_forked(
 /// - list_dir: 列出目录内容
 /// - file_edit / edit_file: 编辑文件（字符串替换）
 /// - file_write / write_file: 写入文件
+/// - exec: 执行 shell 命令
 /// - grep: 在文件中搜索模式（简化版）
 /// - glob: 匹配文件模式（简化版，支持基本通配符）
 /// - skill_manage: 技能管理（create/edit/patch/view/delete/write_file/remove_file）
@@ -966,6 +1049,24 @@ async fn execute_forked_tool(
             } else {
                 Ok(entries.join("\n"))
             }
+        },
+
+        "exec" => {
+            let command = input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    ForkedAgentError::ToolError("Missing command parameter".to_string())
+                })?;
+
+            let command_working_dir = input
+                .get("working_dir")
+                .and_then(|v| v.as_str())
+                .map(|dir| resolve_forked_path(dir, working_dir))
+                .transpose()?
+                .or_else(|| working_dir.clone());
+
+            execute_shell_command(command, command_working_dir).await
         },
 
         "file_edit" | "edit_file" => {
@@ -1783,7 +1884,7 @@ async fn execute_forked_tool(
 
         // 不支持的工具
         _ => {
-            Ok(format!("Tool '{}' is not supported in forked mode. Supported tools: read_file, file_edit, file_write, grep, glob, memory_upsert, memory_query, memory_forget, skill_manage, list_skills", tool_name))
+            Ok(format!("Tool '{}' is not supported in forked mode. Supported tools: read_file, file_edit, file_write, exec, grep, glob, memory_upsert, memory_query, memory_forget, skill_manage, list_skills", tool_name))
         }
     }
 }
@@ -2025,50 +2126,36 @@ pub async fn run_forked_agent(
         messages.insert(0, ChatMessage::system(&system_prompt));
     }
 
+    inject_preloaded_skills(
+        &mut messages,
+        &params.skills,
+        params.skills_dir.as_deref(),
+        &params.external_skills_dirs,
+    );
+
+    if !params.mcp_servers.is_empty() {
+        tracing::warn!(
+            fork_label = params.fork_label,
+            mcp_servers = ?params.mcp_servers,
+            "[forked_agent] Custom agent mcp_servers are parsed as metadata; forked direct MCP execution is not available yet"
+        );
+    }
+
     // 注入 initial_prompt（自定义 Agent 的首轮提示）
     if let Some(ref initial_prompt) = params.initial_prompt {
         tracing::debug!(
             initial_prompt_len = initial_prompt.len(),
             "[forked_agent] 注入 initial_prompt"
         );
-        // 在系统提示之后、用户消息之前插入
-        messages.push(ChatMessage::user(initial_prompt));
+        insert_initial_prompt(&mut messages, initial_prompt);
     }
 
     // 构建工具 schema（根据 tools 白名单和 disallowed_tools 黑名单过滤）
-    let filtered_tool_schemas = {
-        let schemas: Vec<_> = if let Some(ref allowed_tools) = params.tools {
-            // 白名单模式：只保留白名单中的工具
-            params
-                .tool_schemas
-                .iter()
-                .filter(|schema| {
-                    schema
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .map(|name| allowed_tools.iter().any(|t| t == name))
-                        .unwrap_or(true)
-                })
-                .cloned()
-                .collect()
-        } else {
-            // 无白名单：使用全部工具 schema
-            params.tool_schemas.clone()
-        };
-
-        // 黑名单过滤：排除 disallowed_tools 中的工具
-        // 这一步在白名单模式和无白名单模式下都需要执行
-        schemas
-            .into_iter()
-            .filter(|schema| {
-                schema
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .map(|name| !params.disallowed_tools.iter().any(|t| t == name))
-                    .unwrap_or(true)
-            })
-            .collect::<Vec<_>>()
-    };
+    let filtered_tool_schemas = filter_tool_schemas(
+        &params.tool_schemas,
+        params.tools.as_deref(),
+        &params.disallowed_tools,
+    );
 
     // 记录开始
     tracing::info!(
@@ -2105,6 +2192,7 @@ pub async fn run_forked_agent(
 
     let provider = match acquire_provider_with_retry(
         provider_pool,
+        params.model.as_deref(),
         PROVIDER_RETRY_MAX_ATTEMPTS,
         PROVIDER_RETRY_INITIAL_DELAY_MS,
         PROVIDER_RETRY_MAX_DELAY_MS,
@@ -2127,12 +2215,11 @@ pub async fn run_forked_agent(
     };
 
     // 模型覆盖提示（当自定义 Agent 指定了特定模型时）
-    // TODO: 未来通过 ProviderPool::acquire_by_model() 实现真正的模型覆盖
     if let Some(ref model_override) = params.model {
         tracing::info!(
             fork_label = params.fork_label,
             model_override,
-            "[forked_agent] 自定义 Agent 指定了模型覆盖 (当前版本暂未生效，使用默认模型)"
+            "[forked_agent] 自定义 Agent 指定的模型覆盖已生效"
         );
     }
 
@@ -2550,6 +2637,111 @@ pub async fn run_forked_agent(
     })
 }
 
+fn insert_initial_prompt(messages: &mut Vec<ChatMessage>, initial_prompt: &str) {
+    let insert_at = messages
+        .iter()
+        .position(|message| message.role != "system")
+        .unwrap_or(messages.len());
+    messages.insert(insert_at, ChatMessage::user(initial_prompt));
+}
+
+fn tool_schema_name(schema: &serde_json::Value) -> Option<&str> {
+    schema
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(|name| name.as_str())
+        .or_else(|| schema.get("name").and_then(|name| name.as_str()))
+}
+
+fn filter_tool_schemas(
+    tool_schemas: &[serde_json::Value],
+    allowed_tools: Option<&[String]>,
+    disallowed_tools: &[String],
+) -> Vec<serde_json::Value> {
+    let allows_all = allowed_tools
+        .map(|tools| tools.iter().any(|tool| tool == "*"))
+        .unwrap_or(true);
+
+    tool_schemas
+        .iter()
+        .filter(|schema| {
+            let Some(name) = tool_schema_name(schema) else {
+                return false;
+            };
+            let allowed = allowed_tools
+                .map(|tools| allows_all || tools.iter().any(|tool| tool == name))
+                .unwrap_or(true);
+            let disallowed = disallowed_tools.iter().any(|tool| tool == name);
+            allowed && !disallowed
+        })
+        .cloned()
+        .collect()
+}
+
+fn append_to_system_prompt(messages: &mut Vec<ChatMessage>, section: &str) {
+    if let Some(system_message) = messages.iter_mut().find(|message| message.role == "system") {
+        let existing = system_message.content.as_str().unwrap_or_default();
+        system_message.content = serde_json::Value::String(format!("{}{}", existing, section));
+    } else {
+        messages.insert(0, ChatMessage::system(section));
+    }
+}
+
+fn inject_preloaded_skills(
+    messages: &mut Vec<ChatMessage>,
+    skill_names: &[String],
+    skills_dir: Option<&Path>,
+    external_skills_dirs: &[PathBuf],
+) {
+    if skill_names.is_empty() {
+        return;
+    }
+
+    let Some(skills_dir) = skills_dir else {
+        tracing::warn!(
+            skills = ?skill_names,
+            "[forked_agent] Cannot preload custom agent skills without skills_dir"
+        );
+        return;
+    };
+
+    let mut section = String::from(
+        "\n\n## Preloaded Skills\nThese skills are preloaded by this custom agent definition. Treat them as active task guidance.\n",
+    );
+    let mut loaded = 0usize;
+
+    for skill_name in skill_names {
+        let Some(skill_dir) =
+            find_skill_dir_forked(skill_name, None, skills_dir, external_skills_dirs)
+        else {
+            tracing::warn!(skill = %skill_name, "[forked_agent] Preloaded skill not found");
+            continue;
+        };
+
+        match std::fs::read_to_string(skill_dir.join("SKILL.md")) {
+            Ok(content) => {
+                loaded += 1;
+                section.push_str(&format!(
+                    "\n### {}\n{}\n",
+                    skill_name,
+                    truncate_output(content, 8_000)
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    skill = %skill_name,
+                    error = %error,
+                    "[forked_agent] Failed to read preloaded skill"
+                );
+            }
+        }
+    }
+
+    if loaded > 0 {
+        append_to_system_prompt(messages, &section);
+    }
+}
+
 /// 带重试的 Provider 获取
 ///
 /// 使用指数退避策略重试获取 provider，避免因短暂不可用而直接失败。
@@ -2558,6 +2750,7 @@ pub async fn run_forked_agent(
 /// 如果已取消则立即返回 `ForkedAgentError::Aborted`。
 async fn acquire_provider_with_retry(
     provider_pool: &Arc<ProviderPool>,
+    model_override: Option<&str>,
     max_attempts: usize,
     initial_delay_ms: u64,
     max_delay_ms: u64,
@@ -2573,7 +2766,13 @@ async fn acquire_provider_with_retry(
             ));
         }
 
-        match provider_pool.acquire() {
+        let acquired = if let Some(model) = model_override {
+            provider_pool.acquire_by_model(model)
+        } else {
+            provider_pool.acquire()
+        };
+
+        match acquired {
             Some((_name, provider)) => {
                 if attempt > 0 {
                     tracing::info!(
@@ -2898,18 +3097,37 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                 }
             }
         }),
+        // exec
+        json!({
+            "type": "function",
+            "function": {
+                "name": "exec",
+                "description": "Execute a shell command. Use for explicit verification commands such as cargo check or targeted test runs.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The shell command to execute."
+                        },
+                        "working_dir": {
+                            "type": "string",
+                            "description": "Optional working directory for the command. Relative paths resolve within the agent working directory when isolated."
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }),
     ];
 
     // Filter out disallowed tools
     all_schemas
         .into_iter()
         .filter(|schema| {
-            let name = schema
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap_or("");
-            !disallowed_tools.iter().any(|d| d == name)
+            tool_schema_name(schema)
+                .map(|name| !disallowed_tools.iter().any(|d| d == name))
+                .unwrap_or(false)
         })
         .collect()
 }
@@ -2952,6 +3170,79 @@ mod tests {
 
         assert_eq!(m1.input_tokens, 300);
         assert_eq!(m1.output_tokens, 150);
+    }
+
+    fn schema_names(schemas: &[serde_json::Value]) -> Vec<String> {
+        schemas
+            .iter()
+            .filter_map(tool_schema_name)
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn test_insert_initial_prompt_before_first_user_message() {
+        let mut messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("main task"),
+        ];
+
+        insert_initial_prompt(&mut messages, "custom first instruction");
+
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(
+            messages[1].content.as_str(),
+            Some("custom first instruction")
+        );
+        assert_eq!(messages[2].content.as_str(), Some("main task"));
+    }
+
+    #[test]
+    fn test_inject_preloaded_skills_appends_skill_content_to_system_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        let skill_dir = skills_dir.join("review-flow");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Review Flow\nCheck the diff.").unwrap();
+        let mut messages = vec![ChatMessage::system("system")];
+
+        inject_preloaded_skills(
+            &mut messages,
+            &["review-flow".to_string()],
+            Some(&skills_dir),
+            &[],
+        );
+
+        let prompt = messages[0].content.as_str().unwrap_or_default();
+        assert!(prompt.contains("## Preloaded Skills"));
+        assert!(prompt.contains("# Review Flow"));
+    }
+
+    #[test]
+    fn test_filter_tool_schemas_respects_whitelist_and_blacklist() {
+        let schemas = build_forked_tool_schemas(&[]);
+        let allowed = vec!["read_file".to_string(), "exec".to_string()];
+        let disallowed = vec!["exec".to_string()];
+
+        let filtered = filter_tool_schemas(&schemas, Some(&allowed), &disallowed);
+        let names = schema_names(&filtered);
+
+        assert_eq!(names, vec!["read_file".to_string()]);
+    }
+
+    #[test]
+    fn test_filter_tool_schemas_wildcard_keeps_all_except_disallowed() {
+        let schemas = build_forked_tool_schemas(&[]);
+        let allowed = vec!["*".to_string()];
+        let disallowed = vec!["exec".to_string()];
+
+        let filtered = filter_tool_schemas(&schemas, Some(&allowed), &disallowed);
+        let names = schema_names(&filtered);
+
+        assert!(names.contains(&"read_file".to_string()));
+        assert!(names.contains(&"write_file".to_string()));
+        assert!(!names.contains(&"exec".to_string()));
     }
 
     // 注意：ForkedAgentParams 不再实现 Default trait

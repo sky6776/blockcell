@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::agent_prompts::{
@@ -336,11 +336,13 @@ impl AgentTypeRegistry {
         // 避免白名单和黑名单的矛盾
         if let Some(ref mut tools) = def.tools {
             let before_len = tools.len();
-            tools.retain(|t| !forbidden.contains(&t.as_str()));
+            let disallowed_tools: HashSet<&str> =
+                def.disallowed_tools.iter().map(String::as_str).collect();
+            tools.retain(|t| t == "*" || !disallowed_tools.contains(t.as_str()));
             if tools.len() != before_len {
                 tracing::warn!(
                     agent_type = %def.agent_type,
-                    "Removed forbidden tools from tools whitelist to prevent recursive spawning"
+                    "Removed disallowed tools from tools whitelist"
                 );
             }
         }
@@ -549,6 +551,27 @@ mod tests {
         };
         registry.register(custom_def);
         assert!(registry.get("custom").is_some());
+    }
+
+    #[test]
+    fn test_agent_type_registry_removes_all_disallowed_tools_from_whitelist() {
+        let mut registry = AgentTypeRegistry::new_empty();
+        let custom_def = AgentTypeDefinition {
+            agent_type: "custom".to_string(),
+            when_to_use: "自定义 Agent 类型".to_string(),
+            tools: Some(vec![
+                "read_file".to_string(),
+                "exec".to_string(),
+                "agent".to_string(),
+            ]),
+            disallowed_tools: vec!["exec".to_string()],
+            ..Default::default()
+        };
+
+        registry.register(custom_def);
+        let tools = registry.get("custom").unwrap().tools.as_ref().unwrap();
+
+        assert_eq!(tools, &vec!["read_file".to_string()]);
     }
 
     #[test]
