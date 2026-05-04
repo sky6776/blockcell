@@ -3,7 +3,6 @@
 //! 定义触发条件和提取逻辑。
 
 use super::template::validate_session_memory;
-use super::MAX_SECTION_LENGTH;
 use crate::forked::{
     create_memory_file_can_use_tool, run_forked_agent, CacheSafeParams, ForkedAgentParams,
 };
@@ -24,6 +23,14 @@ pub struct SessionMemoryConfig {
     pub minimum_tokens_between_update: usize,
     /// 工具调用间隔
     pub tool_calls_between_updates: usize,
+    /// 提取等待超时 (ms)
+    pub extraction_wait_timeout_ms: u64,
+    /// 提取过期阈值 (ms)
+    pub extraction_stale_threshold_ms: u64,
+    /// Section 最大长度
+    pub max_section_length: usize,
+    /// 总 Session Memory token 上限
+    pub max_total_session_memory_tokens: usize,
 }
 
 impl Default for SessionMemoryConfig {
@@ -32,6 +39,24 @@ impl Default for SessionMemoryConfig {
             minimum_message_tokens_to_init: 10_000,
             minimum_tokens_between_update: 5_000,
             tool_calls_between_updates: 3,
+            extraction_wait_timeout_ms: 15_000,
+            extraction_stale_threshold_ms: 60_000,
+            max_section_length: 2_000,
+            max_total_session_memory_tokens: 12_000,
+        }
+    }
+}
+
+impl From<blockcell_core::config::Layer3Config> for SessionMemoryConfig {
+    fn from(c: blockcell_core::config::Layer3Config) -> Self {
+        Self {
+            minimum_message_tokens_to_init: c.minimum_message_tokens_to_init,
+            minimum_tokens_between_update: c.minimum_tokens_between_update,
+            tool_calls_between_updates: c.tool_calls_between_updates,
+            extraction_wait_timeout_ms: c.extraction_wait_timeout_ms,
+            extraction_stale_threshold_ms: c.extraction_stale_threshold_ms,
+            max_section_length: c.max_section_length,
+            max_total_session_memory_tokens: c.max_total_session_memory_tokens,
         }
     }
 }
@@ -219,9 +244,11 @@ fn has_tool_calls_in_last_assistant_turn(messages: &[ChatMessage]) -> bool {
 /// - `memory_path`: Memory 文件路径
 /// - `current_memory`: 当前 Memory 内容
 /// - `template`: Memory 模板
+/// - `max_section_length`: Section 最大 token 数（可配置）
 ///
 /// ## 验证
 /// 提取完成后验证文件完整性，检查所有必需的 section headers 和 description lines。
+#[allow(clippy::too_many_arguments)]
 pub async fn extract_session_memory(
     provider_pool: Arc<ProviderPool>,
     system_prompt: &str,
@@ -230,6 +257,7 @@ pub async fn extract_session_memory(
     memory_path: &Path,
     current_memory: &str,
     template: &str,
+    max_section_length: usize,
 ) -> Result<(), ExtractionError> {
     // 记录 Layer 3 提取开始事件
     let message_count = messages.len();
@@ -246,7 +274,12 @@ pub async fn extract_session_memory(
     let can_use_tool = create_memory_file_can_use_tool(memory_path);
 
     // 构建更新提示
-    let user_prompt = build_session_memory_update_prompt(current_memory, memory_path, template);
+    let user_prompt = build_session_memory_update_prompt(
+        current_memory,
+        memory_path,
+        template,
+        max_section_length,
+    );
 
     // 创建 CacheSafeParams
     let cache_safe_params = CacheSafeParams {
@@ -370,6 +403,7 @@ fn build_session_memory_update_prompt(
     current_memory: &str,
     memory_path: &Path,
     template: &str,
+    max_section_length: usize,
 ) -> String {
     format!(
         r#"Update the session memory file at {}.
@@ -398,7 +432,7 @@ Use the file_edit tool to update the memory file."#,
         } else {
             current_memory
         },
-        MAX_SECTION_LENGTH,
+        max_section_length,
     )
 }
 
@@ -531,11 +565,13 @@ mod tests {
 
     #[test]
     fn test_should_extract_memory_already_initialized() {
-        let mut state = SessionMemoryState::default();
-        state.initialized = true;
-        state.last_memory_message_index = Some(100);
-        state.last_memory_message_id = Some("msg-100".to_string());
-        state.tokens_at_last_extraction = 10_000;
+        let state = SessionMemoryState {
+            initialized: true,
+            last_memory_message_index: Some(100),
+            last_memory_message_id: Some("msg-100".to_string()),
+            tokens_at_last_extraction: 10_000,
+            ..Default::default()
+        };
 
         // 已初始化，需要满足间隔条件（验证消息可构造）
         let _messages: Vec<ChatMessage> = (0..20)

@@ -385,6 +385,17 @@ async fn patch_skill(
     // 确定要 patch 的文件: 默认 SKILL.md, 可通过 file_path 指定其他文件
     let target_file = if let Some(fp) = file_path {
         validate_skill_file_path(fp)?; // 防止路径遍历
+                                       // 非 SKILL.md 的 file_path 必须在允许的子目录下 (与 write_file 一致)
+        if fp != "SKILL.md" {
+            let allowed_prefixes = ["references/", "templates/", "scripts/", "assets/"];
+            if !allowed_prefixes.iter().any(|prefix| fp.starts_with(prefix)) {
+                return Err(blockcell_core::Error::Validation(format!(
+                    "file_path must be SKILL.md or under one of: {}. Got: '{}'",
+                    allowed_prefixes.join(", "),
+                    fp
+                )));
+            }
+        }
         skill_dir.join(fp)
     } else {
         skill_dir.join("SKILL.md")
@@ -549,6 +560,9 @@ async fn edit_skill(
     let meta = extract_frontmatter(content);
     validate_frontmatter(&meta)?;
 
+    // 验证 body 内容 (frontmatter 之后必须有实质内容)
+    validate_skill_body(content)?;
+
     // 备份原内容
     let skill_md = skill_dir.join("SKILL.md");
     let original_content = if skill_md.exists() {
@@ -562,8 +576,9 @@ async fn edit_skill(
     // 原子写入
     atomic_write_text(&skill_md, content).await?;
 
-    // 安全扫描
-    let scan_result = scan_skill_content(content);
+    // 安全扫描 (根据 Skill 位置确定信任级别)
+    let trust_level = determine_trust_level(&skill_dir, external_dirs.first().map(|p| p.as_path()));
+    let scan_result = scan_skill_dir_with_trust(&skill_dir, trust_level);
     if !scan_result.passed {
         // 回滚
         if !original_content.is_empty() {
@@ -718,8 +733,15 @@ async fn remove_file_skill(
 
 /// 原子写入: 先写入临时文件, 再 rename 替换目标文件
 /// 防止进程崩溃留下半写文件 (参考 Hermes _atomic_write_text)
+///
+/// 使用包含进程 ID 和时间戳的唯一临时文件名，避免并发写入时的临时文件冲突。
 pub async fn atomic_write_text(path: &Path, content: &str) -> Result<()> {
-    let temp_path = path.with_extension("tmp");
+    let pid = std::process::id();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let temp_path = path.with_extension(format!("tmp.{}.{}", pid, timestamp));
 
     // 写入临时文件
     tokio::fs::write(&temp_path, content)
@@ -924,6 +946,30 @@ fn validate_frontmatter(frontmatter: &serde_json::Value) -> Result<()> {
             "Skill description exceeds maximum length of {} characters",
             MAX_DESCRIPTION_LENGTH
         )));
+    }
+    Ok(())
+}
+
+/// 验证 SKILL.md 内容在 frontmatter 之后有 body 内容
+/// (防止创建只有 frontmatter 没有实际内容的空 Skill)
+fn validate_skill_body(content: &str) -> Result<()> {
+    // 提取 body: 去掉 frontmatter 后的内容
+    let body = if let Some(rest) = content.trim().strip_prefix("---") {
+        if let Some(end_idx) = rest.find("---") {
+            rest[end_idx + 3..].trim()
+        } else {
+            content.trim()
+        }
+    } else {
+        content.trim()
+    };
+
+    // Body 必须有实质内容 (至少 10 个非空白字符)
+    let non_whitespace_count = body.chars().filter(|c| !c.is_whitespace()).count();
+    if non_whitespace_count < 10 {
+        return Err(blockcell_core::Error::Validation(
+            "Skill content must have body text after frontmatter (at least 10 non-whitespace characters)".to_string(),
+        ));
     }
     Ok(())
 }

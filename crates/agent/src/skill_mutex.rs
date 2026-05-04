@@ -1,7 +1,7 @@
-//! Skill 操作互斥锁 — 防止 Skill 并发修改冲突
+//! Per-skill concurrency guard
 //!
-//! 当 Agent 正在执行 Skill 步骤时, 阻止 skill_manage 的 patch/delete 操作。
-//! 参考 Hermes `agent_core/skill_mutex.py`
+//! **Deprecated**: Use [`crate::write_guard::WriteGuard`] instead.
+//! This module will be removed in a future version.
 
 use async_trait::async_trait;
 use blockcell_tools::{SkillMutexGuard, SkillMutexOps};
@@ -11,6 +11,10 @@ use std::sync::RwLock;
 
 /// Skill 操作互斥锁
 #[derive(Debug, Clone)]
+#[deprecated(
+    since = "0.2.0",
+    note = "Use crate::write_guard::WriteGuard instead. This will be removed in a future version."
+)]
 pub struct SkillMutex {
     /// 正在执行中的 Skill 名称集合
     /// 使用 std::sync::RwLock 而非 tokio::sync::RwLock,
@@ -25,6 +29,7 @@ pub struct AcquireError {
     pub skill_name: String,
 }
 
+#[allow(deprecated)]
 impl SkillMutex {
     pub fn new() -> Self {
         Self {
@@ -80,6 +85,7 @@ impl SkillMutex {
     }
 }
 
+#[allow(deprecated)]
 impl Default for SkillMutex {
     fn default() -> Self {
         Self::new()
@@ -89,6 +95,7 @@ impl Default for SkillMutex {
 /// 为 SkillMutex 实现 tools crate 的 SkillMutexOps trait
 /// 这样 tools crate 可以通过 opaque handle 调用 can_modify / try_acquire
 #[async_trait]
+#[allow(deprecated)]
 impl SkillMutexOps for SkillMutex {
     async fn can_modify(&self, skill_name: &str) -> bool {
         SkillMutex::can_modify(self, skill_name)
@@ -129,6 +136,8 @@ impl Drop for SkillGuard {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
+
     use super::*;
 
     #[test]

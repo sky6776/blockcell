@@ -1,7 +1,7 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -11,6 +11,9 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
+
+use crate::unified_security_scanner::scan_learned_skill_content;
+use crate::write_guard::{WriteGuard, WriteGuardError, WriteGuardRAII, WriteTarget};
 
 const SKILL_MD_CHAR_LIMIT: usize = 64_000;
 const AUX_FILE_CHAR_LIMIT: usize = 128_000;
@@ -32,6 +35,8 @@ pub struct SkillFileStore {
     snapshots_dir: PathBuf,
     toggles_file: PathBuf,
     lock_path: PathBuf,
+    /// Unified write guard for coordinated write protection across memory + skill files
+    write_guard: Option<Arc<WriteGuard>>,
     write_lock: Mutex<()>,
 }
 
@@ -46,8 +51,33 @@ impl SkillFileStore {
             snapshots_dir,
             toggles_file: paths.toggles_file(),
             lock_path: paths.skills_dir().join(".skill_file_store.lockdir"),
+            write_guard: None,
             write_lock: Mutex::new(()),
         })
+    }
+
+    /// Set the unified write guard for coordinated write protection
+    pub fn set_write_guard(&mut self, guard: Arc<WriteGuard>) {
+        self.write_guard = Some(guard);
+    }
+
+    /// Acquire the unified write guard for the given skill, if configured.
+    /// Returns Ok(RAII guard) on success, Err if the target is already being written.
+    /// If no write_guard is configured, returns Ok(None) (backward compat).
+    fn acquire_write_guard(&self, skill_name: &str) -> Result<Option<WriteGuardRAII>> {
+        let Some(ref guard) = self.write_guard else {
+            return Ok(None);
+        };
+        let write_target = WriteTarget::Skill {
+            category: String::new(),
+            name: skill_name.to_string(),
+        };
+        guard
+            .acquire(write_target)
+            .map(Some)
+            .map_err(|WriteGuardError { target }| {
+                Error::Other(format!("concurrent write in progress for {target}"))
+            })
     }
 
     pub fn view(&self, name: &str) -> Result<Value> {
@@ -80,6 +110,7 @@ impl SkillFileStore {
         let body = normalize_skill_body(content)?;
         scan_learned_skill_content(&description)?;
         scan_learned_skill_content(&body)?;
+        let _wg = self.acquire_write_guard(&skill_name)?;
         let _guard = self
             .write_lock
             .lock()
@@ -119,6 +150,7 @@ impl SkillFileStore {
         }
         let content = normalize_skill_body(content)?;
         scan_learned_skill_content(&content)?;
+        let _wg = self.acquire_write_guard(&skill_name)?;
         let _guard = self
             .write_lock
             .lock()
@@ -146,6 +178,7 @@ impl SkillFileStore {
         let skill_name = validate_skill_name(name)?;
         let content = normalize_skill_body(content)?;
         scan_learned_skill_content(&content)?;
+        let _wg = self.acquire_write_guard(&skill_name)?;
         let _guard = self
             .write_lock
             .lock()
@@ -170,6 +203,7 @@ impl SkillFileStore {
 
     pub fn delete(&self, name: &str) -> Result<SkillFileMutation> {
         let skill_name = validate_skill_name(name)?;
+        let _wg = self.acquire_write_guard(&skill_name)?;
         let _guard = self
             .write_lock
             .lock()
@@ -205,6 +239,7 @@ impl SkillFileStore {
             AUX_FILE_CHAR_LIMIT,
         )?;
         scan_learned_skill_content(content)?;
+        let _wg = self.acquire_write_guard(&skill_name)?;
         let _guard = self
             .write_lock
             .lock()
@@ -230,6 +265,7 @@ impl SkillFileStore {
 
     pub fn restore_latest(&self, name: &str) -> Result<SkillFileMutation> {
         let skill_name = validate_skill_name(name)?;
+        let _wg = self.acquire_write_guard(&skill_name)?;
         let _guard = self
             .write_lock
             .lock()
@@ -271,12 +307,12 @@ impl SkillFileStore {
     pub fn remove_file(&self, name: &str, relative_path: &str) -> Result<SkillFileMutation> {
         let skill_name = validate_skill_name(name)?;
         let relative_path = validate_skill_relative_path(relative_path)?;
-        if relative_path == PathBuf::from("SKILL.md") || relative_path == PathBuf::from("meta.yaml")
-        {
+        if relative_path == Path::new("SKILL.md") || relative_path == Path::new("meta.yaml") {
             return Err(Error::Validation(
                 "use delete to remove the whole skill".to_string(),
             ));
         }
+        let _wg = self.acquire_write_guard(&skill_name)?;
         let _guard = self
             .write_lock
             .lock()
@@ -352,7 +388,7 @@ impl SkillFileStore {
     }
 
     fn latest_snapshot_for(&self, skill_name: &str) -> Result<Option<PathBuf>> {
-        let prefix = format!("{}", skill_name) + "_";
+        let prefix = format!("{skill_name}_");
         let mut latest: Option<PathBuf> = None;
         for entry in fs::read_dir(&self.snapshots_dir)? {
             let entry = entry?;
@@ -533,38 +569,6 @@ fn ensure_len(label: &str, text: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
-fn scan_learned_skill_content(text: &str) -> Result<()> {
-    let lower = text.to_lowercase();
-    let blocked = [
-        "ignore previous instructions",
-        "ignore all previous instructions",
-        "system prompt",
-        "developer message",
-        "BEGIN RSA PRIVATE KEY",
-        "BEGIN OPENSSH PRIVATE KEY",
-        "api_key=",
-        "secret_access_key",
-        "password=",
-    ];
-    if blocked
-        .iter()
-        .any(|needle| lower.contains(&needle.to_lowercase()))
-    {
-        return Err(Error::Validation(
-            "learned skill content failed safety scan".to_string(),
-        ));
-    }
-    if text
-        .chars()
-        .any(|ch| matches!(ch, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
-    {
-        return Err(Error::Validation(
-            "learned skill content contains hidden direction controls".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 fn render_skill_md(name: &str, description: &str, body: &str) -> String {
     format!(
         "# {}\n\n{}\n\n## Shared {{#shared}}\n\nUse this learned skill only when the current task directly matches its procedure.\n\n## Prompt {{#prompt}}\n\n{}\n",
@@ -652,8 +656,11 @@ fn write_file_durable(path: &Path, content: &str) -> Result<()> {
 
 fn sync_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
-        let dir = File::open(parent)?;
-        dir.sync_all()?;
+        match File::open(parent) {
+            Ok(dir) => dir.sync_all()?,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(err) => return Err(err.into()),
+        }
     }
     Ok(())
 }

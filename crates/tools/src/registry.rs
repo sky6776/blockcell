@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
+use crate::agent::AgentTool;
 use crate::agent_status::AgentStatusTool;
 use crate::alert_rule::AlertRuleTool;
 use crate::app_control::AppControlTool;
@@ -30,6 +31,7 @@ use crate::message::MessageTool;
 use crate::network_monitor::NetworkMonitorTool;
 use crate::ocr::OcrTool;
 use crate::office_write::OfficeWriteTool;
+use crate::send_message::SendMessageTool;
 use crate::session_recall::SessionRecallTool;
 use crate::session_search::SessionSearchTool;
 use crate::skills::{ListSkillsTool, SkillManageTool, SkillViewTool};
@@ -50,6 +52,7 @@ pub const GLOBAL_CORE_TOOL_NAMES: &[&str] = &[
     "memory_upsert",
     "memory_forget",
     "spawn",
+    "agent",
     "list_tasks",
     "agent_status",
     "list_skills",
@@ -100,8 +103,12 @@ impl ToolRegistry {
         registry.register(Arc::new(MessageTool));
         registry.register(Arc::new(SpawnTool));
 
+        // Agent tool (typed agents and fork mode)
+        registry.register(Arc::new(AgentTool));
+
         // Task management
         registry.register(Arc::new(ListTasksTool));
+        registry.register(Arc::new(SendMessageTool));
 
         // Browser tools
         registry.register(Arc::new(BrowseTool));

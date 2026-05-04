@@ -69,6 +69,9 @@ impl SkillIndex {
         // 每个子目录可能是:
         //   1. 一个 category 目录 (包含多个 skill 子目录)
         //   2. 一个无 category 的 skill 目录 (直接包含 SKILL.md)
+        // 排除 .git/.github/.hub 等非 skill 目录 (参考 Hermes skill_index.py)
+        const EXCLUDED_DIRS: &[&str] = &[".git", ".github", ".hub", "__pycache__", "node_modules"];
+
         if let Ok(entries) = std::fs::read_dir(skills_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -80,6 +83,11 @@ impl SkillIndex {
                     .and_then(|n| n.to_str())
                     .unwrap_or("unknown")
                     .to_string();
+
+                // Skip excluded directories
+                if EXCLUDED_DIRS.contains(&dir_name.as_str()) {
+                    continue;
+                }
 
                 // 判断: 如果该目录直接包含 SKILL.md, 则它是一个无 category 的 skill
                 if path.join("SKILL.md").exists() {
@@ -93,17 +101,23 @@ impl SkillIndex {
                             if !skill_path.is_dir() {
                                 continue;
                             }
-                            // 只索引包含 SKILL.md 的目录 (跳过 .git, __pycache__ 等非 skill 目录)
-                            if !skill_path.join("SKILL.md").exists() {
-                                continue;
-                            }
-                            let skill_name = skill_path
+                            let skill_dir_name = skill_path
                                 .file_name()
                                 .and_then(|n| n.to_str())
                                 .unwrap_or("unknown")
                                 .to_string();
-                            let entry = Self::build_entry(&skill_name, &dir_name, &skill_path);
-                            index.entries.insert(skill_name.clone(), entry);
+
+                            // Skip excluded directories within categories too
+                            if EXCLUDED_DIRS.contains(&skill_dir_name.as_str()) {
+                                continue;
+                            }
+
+                            // 只索引包含 SKILL.md 的目录 (跳过非 skill 目录)
+                            if !skill_path.join("SKILL.md").exists() {
+                                continue;
+                            }
+                            let entry = Self::build_entry(&skill_dir_name, &dir_name, &skill_path);
+                            index.entries.insert(skill_dir_name.clone(), entry);
                         }
                     }
                 }
@@ -317,7 +331,18 @@ impl SkillIndex {
             return None;
         }
 
-        let content = std::fs::read_to_string(&skill_md).ok()?;
+        let content = match std::fs::read_to_string(&skill_md) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    skill_name = name,
+                    path = %skill_md.display(),
+                    error = %e,
+                    "[SkillIndex] Failed to read SKILL.md"
+                );
+                return None;
+            }
+        };
         self.loaded.insert(name.to_string(), content.clone());
 
         tracing::debug!(
@@ -479,12 +504,28 @@ impl SkillIndex {
     }
 
     /// 刷新索引 (重新扫描 skills 目录)
+    ///
+    /// 重新扫描后，已加载的技能内容缓存会被清除，
+    /// 因为磁盘上的文件可能已被修改（如 skill_manage patch/edit）。
     pub fn refresh(&mut self, skills_dir: &Path) {
         let new_index = Self::build_from_dir(skills_dir);
         self.entries = new_index.entries;
-        // 保留已加载的内容 (如果 skill 仍然存在)
-        self.loaded
-            .retain(|name, _| self.entries.contains_key(name));
+        // 清除已加载的内容缓存，强制下次 load_skill 从磁盘重新读取
+        // 原因: refresh 通常在 skill 被修改后调用，缓存可能已过时
+        self.loaded.clear();
+    }
+
+    /// 使指定技能的内容缓存失效
+    ///
+    /// 在 skill_manage patch/edit/delete 修改 SKILL.md 后调用，
+    /// 确保下次 load_skill 从磁盘重新读取最新内容。
+    pub fn invalidate_skill(&mut self, name: &str) {
+        if self.loaded.remove(name).is_some() {
+            tracing::debug!(
+                skill_name = name,
+                "[SkillIndex] Invalidated cached content for skill"
+            );
+        }
     }
 }
 

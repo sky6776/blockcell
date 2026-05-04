@@ -66,8 +66,8 @@ pub fn create_auto_mem_can_use_tool(memory_dir: &Path) -> CanUseToolFn {
             return ToolPermission::Allow;
         }
 
-        // 允许 Read/Grep/Glob（只读工具）
-        if matches!(tool_name, "read_file" | "grep" | "glob") {
+        // 允许 Read/Grep/Glob/ListDir（只读工具）
+        if matches!(tool_name, "read_file" | "grep" | "glob" | "list_dir") {
             return ToolPermission::Allow;
         }
 
@@ -117,7 +117,7 @@ pub fn create_dream_can_use_tool(memory_root: &Path) -> CanUseToolFn {
         }
 
         // 允许只读工具
-        if matches!(tool_name, "read_file" | "grep" | "glob" | "ls") {
+        if matches!(tool_name, "read_file" | "grep" | "glob" | "ls" | "list_dir") {
             return ToolPermission::Allow;
         }
 
@@ -182,7 +182,7 @@ pub fn create_compact_can_use_tool() -> CanUseToolFn {
 pub fn create_skill_review_can_use_tool() -> CanUseToolFn {
     Arc::new(|tool_name: &str, _input: &serde_json::Value| {
         match tool_name {
-            "skill_manage" | "list_skills" | "read_file" | "grep" | "glob" => {
+            "skill_manage" | "list_skills" | "read_file" | "grep" | "glob" | "list_dir" => {
                 ToolPermission::Allow
             }
             _ => ToolPermission::Deny {
@@ -204,15 +204,19 @@ pub fn create_skill_review_can_use_tool() -> CanUseToolFn {
 pub fn create_flush_can_use_tool() -> CanUseToolFn {
     Arc::new(
         |tool_name: &str, _input: &serde_json::Value| match tool_name {
-            "memory_upsert" => ToolPermission::Allow,
+            "memory_manage" => ToolPermission::Allow,
             _ => ToolPermission::Deny {
                 message: format!(
-                    "Flush mode only allows memory_upsert, attempted: {}",
+                    "Flush mode only allows memory_manage, attempted: {}",
                     tool_name
                 ),
             },
         },
     )
+}
+
+pub fn build_flush_tool_schemas() -> Vec<serde_json::Value> {
+    vec![build_memory_manage_schema()]
 }
 
 /// 创建 Memory Review 的工具权限检查
@@ -227,13 +231,13 @@ pub fn create_flush_can_use_tool() -> CanUseToolFn {
 pub fn create_memory_review_can_use_tool() -> CanUseToolFn {
     Arc::new(|tool_name: &str, _input: &serde_json::Value| {
         match tool_name {
-            "memory_upsert" | "memory_query" | "memory_search" | "memory_forget"
-            | "read_file" | "grep" | "glob" => {
+            "memory_manage" | "memory_query" | "memory_search"
+            | "read_file" | "grep" | "glob" | "list_dir" => {
                 ToolPermission::Allow
             }
             _ => ToolPermission::Deny {
                 message: format!(
-                    "Memory Review only allows memory_upsert/memory_query/memory_search/memory_forget/read_file/grep/glob, attempted: {}",
+                    "Memory Review only allows memory_manage/memory_query/memory_search/read_file/grep/glob, attempted: {}",
                     tool_name
                 ),
             },
@@ -256,13 +260,13 @@ pub fn create_combined_review_can_use_tool() -> CanUseToolFn {
     Arc::new(|tool_name: &str, _input: &serde_json::Value| {
         match tool_name {
             "skill_manage" | "list_skills"
-            | "memory_upsert" | "memory_query" | "memory_search" | "memory_forget"
-            | "read_file" | "grep" | "glob" => {
+            | "memory_manage" | "memory_query" | "memory_search"
+            | "read_file" | "grep" | "glob" | "list_dir" => {
                 ToolPermission::Allow
             }
             _ => ToolPermission::Deny {
                 message: format!(
-                    "Combined Review only allows skill_manage/list_skills/memory_upsert/memory_query/memory_search/memory_forget/read_file/grep/glob, attempted: {}",
+                    "Combined Review only allows skill_manage/list_skills/memory_manage/memory_query/memory_search/read_file/grep/glob, attempted: {}",
                     tool_name
                 ),
             },
@@ -280,19 +284,20 @@ pub fn build_skill_review_tool_schemas() -> Vec<serde_json::Value> {
         build_read_file_schema(),
         build_grep_schema(),
         build_glob_schema(),
+        build_list_dir_schema(),
     ]
 }
 
 /// 构建 Memory Review 模式的 LLM 工具 schema 列表
 pub fn build_memory_review_tool_schemas() -> Vec<serde_json::Value> {
     vec![
-        build_memory_upsert_schema(),
+        build_memory_manage_schema(),
         build_memory_query_schema(),
         build_memory_search_schema(),
-        build_memory_forget_schema(),
         build_read_file_schema(),
         build_grep_schema(),
         build_glob_schema(),
+        build_list_dir_schema(),
     ]
 }
 
@@ -301,13 +306,13 @@ pub fn build_combined_review_tool_schemas() -> Vec<serde_json::Value> {
     vec![
         build_skill_manage_schema(),
         build_list_skills_schema(),
-        build_memory_upsert_schema(),
+        build_memory_manage_schema(),
         build_memory_query_schema(),
         build_memory_search_schema(),
-        build_memory_forget_schema(),
         build_read_file_schema(),
         build_grep_schema(),
         build_glob_schema(),
+        build_list_dir_schema(),
     ]
 }
 
@@ -394,32 +399,33 @@ fn build_list_skills_schema() -> serde_json::Value {
     )
 }
 
-fn build_memory_upsert_schema() -> serde_json::Value {
+fn build_memory_manage_schema() -> serde_json::Value {
     wrap_tool_schema(
-        "memory_upsert",
-        "Write or update a memory item. Creates a new entry or updates an existing one.",
+        "memory_manage",
+        "Write durable declarative memory to USER.md or MEMORY.md. Use for stable user preferences, project facts, and reusable non-procedural lessons. Do not use for task logs or temporary progress.",
         serde_json::json!({
             "type": "object",
             "properties": {
-                "id": {
+                "action": {
                     "type": "string",
-                    "description": "Optional ID for the memory item. If provided, updates existing item."
+                    "enum": ["add", "replace", "remove", "undo_latest"],
+                    "description": "Memory operation."
                 },
-                "category": {
+                "target": {
                     "type": "string",
-                    "description": "Category of the memory item (e.g., 'preference', 'fact', 'instruction')"
+                    "enum": ["user", "memory"],
+                    "description": "user = user profile/preferences; memory = durable project/environment facts."
                 },
                 "content": {
                     "type": "string",
-                    "description": "The content to store"
+                    "description": "Entry content for add/replace."
                 },
-                "tags": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Optional tags for categorization"
-                },
+                "old_text": {
+                    "type": "string",
+                    "description": "Unique text identifying the entry for replace/remove."
+                }
             },
-            "required": ["content"]
+            "required": ["action", "target"]
         }),
     )
 }
@@ -483,32 +489,6 @@ fn build_memory_search_schema() -> serde_json::Value {
     )
 }
 
-fn build_memory_forget_schema() -> serde_json::Value {
-    wrap_tool_schema(
-        "memory_forget",
-        "Delete a memory item by ID or batch delete by filter. Provide 'id' for single delete, or 'category'/'tags' for batch delete.",
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "id": {
-                    "type": "string",
-                    "description": "The ID of the memory item to delete (for single delete)"
-                },
-                "category": {
-                    "type": "string",
-                    "description": "Delete all items in this category (batch mode)"
-                },
-                "tags": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Delete items matching these tags (batch mode)"
-                },
-            },
-            "required": []
-        }),
-    )
-}
-
 fn build_read_file_schema() -> serde_json::Value {
     wrap_tool_schema(
         "read_file",
@@ -564,6 +544,22 @@ fn build_glob_schema() -> serde_json::Value {
                 },
             },
             "required": ["pattern"]
+        }),
+    )
+}
+
+fn build_list_dir_schema() -> serde_json::Value {
+    wrap_tool_schema(
+        "list_dir",
+        "List the contents of a directory. Returns file and directory names.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The directory path to list. Defaults to current directory."
+                },
+            },
         }),
     )
 }
@@ -871,10 +867,22 @@ mod tests {
         assert!(!is_auto_mem_path("/tmp/reference.md", memory_dir));
         assert!(!is_auto_mem_path("/etc/cron.d/user.md", memory_dir));
 
-        // 路径在 memory_dir 内才应返回 true（如果路径存在且验证通过）
-        // 注意：由于路径不存在，此测试中会返回 false，这是正确的安全行为
+        // 路径在 memory_dir 内且不含 .. 组件时，即使路径不存在也返回 true
+        // 这是允许创建新文件的合理行为
         let result = is_auto_mem_path("/safe/memory/dir/user.md", memory_dir);
-        // 路径不存在时保守拒绝，符合安全优先原则
-        assert!(!result);
+        assert!(
+            result,
+            "path under memory_dir without .. should be allowed for new file creation"
+        );
+
+        // 路径遍历攻击：含 .. 组件的路径即使在 memory_dir 前缀下也应被拒绝
+        assert!(!is_auto_mem_path(
+            "/safe/memory/dir/../../../etc/passwd",
+            memory_dir
+        ));
+        assert!(!is_auto_mem_path(
+            "/safe/memory/dir/../../root/.ssh/id_rsa",
+            memory_dir
+        ));
     }
 }

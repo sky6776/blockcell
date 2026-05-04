@@ -62,6 +62,11 @@ pub struct OutboundMessage {
     pub media: Vec<String>,
     #[serde(default)]
     pub metadata: serde_json::Value,
+    /// When true, `outbound_to_ws_bridge` should NOT forward this as
+    /// `message_done` to WebSocket clients — the runtime already sent
+    /// `message_done` directly via `event_tx`. Prevents duplicate messages.
+    #[serde(default)]
+    pub skip_ws_echo: bool,
 }
 
 impl OutboundMessage {
@@ -74,6 +79,7 @@ impl OutboundMessage {
             reply_to: None,
             media: vec![],
             metadata: serde_json::Value::Null,
+            skip_ws_echo: false,
         }
     }
 }

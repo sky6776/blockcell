@@ -222,9 +222,11 @@ impl SkillNudgeEngine {
 
         if iterations >= self.config.skill_hard_threshold {
             self.last_skill_nudge_time = Some(Instant::now());
+            self.iterations_since_skill = 0; // Reset counter on nudge (matches Hermes behavior)
             NudgeResult::HardNudge { count: iterations }
         } else if iterations >= self.config.skill_soft_threshold {
             self.last_skill_nudge_time = Some(Instant::now());
+            self.iterations_since_skill = 0; // Reset counter on nudge (matches Hermes behavior)
             NudgeResult::SoftNudge { count: iterations }
         } else {
             NudgeResult::NoNudge
@@ -248,9 +250,11 @@ impl SkillNudgeEngine {
 
         if turns >= self.config.memory_hard_threshold {
             self.last_memory_nudge_time = Some(Instant::now());
+            self.turns_since_memory = 0; // Reset counter on nudge (matches Hermes behavior)
             NudgeResult::HardNudge { count: turns }
         } else if turns >= self.config.memory_soft_threshold {
             self.last_memory_nudge_time = Some(Instant::now());
+            self.turns_since_memory = 0; // Reset counter on nudge (matches Hermes behavior)
             NudgeResult::SoftNudge { count: turns }
         } else {
             NudgeResult::NoNudge

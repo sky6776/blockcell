@@ -108,7 +108,7 @@ pub(crate) fn query_file_memory_recall_items(
         right
             .score
             .cmp(&left.score)
-            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.source.cmp(right.source))
             .then_with(|| left.content.cmp(&right.content))
     });
     collected.truncate(limit);
@@ -198,6 +198,20 @@ fn recall_score(chunk: &str, query_tokens: &[String]) -> usize {
         .sum()
 }
 
+fn normalize_recall_tokens(raw_query: &str) -> Vec<String> {
+    const STOP_WORDS: &[&str] = &[
+        "a", "an", "and", "are", "do", "does", "how", "i", "if", "in", "is", "it", "like", "my",
+        "of", "on", "or", "the", "to", "usually", "we", "what", "written", "would", "you",
+    ];
+
+    raw_query
+        .split(|ch: char| !ch.is_alphanumeric())
+        .map(|token| token.trim().to_lowercase())
+        .filter(|token| !token.is_empty())
+        .filter(|token| !STOP_WORDS.contains(&token.as_str()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,18 +277,4 @@ mod tests {
             .expect("recall");
         assert!(message.is_none());
     }
-}
-
-fn normalize_recall_tokens(raw_query: &str) -> Vec<String> {
-    const STOP_WORDS: &[&str] = &[
-        "a", "an", "and", "are", "do", "does", "how", "i", "if", "in", "is", "it", "like", "my",
-        "of", "on", "or", "the", "to", "usually", "we", "what", "written", "would", "you",
-    ];
-
-    raw_query
-        .split(|ch: char| !ch.is_alphanumeric())
-        .map(|token| token.trim().to_lowercase())
-        .filter(|token| !token.is_empty())
-        .filter(|token| !STOP_WORDS.contains(&token.as_str()))
-        .collect()
 }

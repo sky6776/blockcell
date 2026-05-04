@@ -138,11 +138,13 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                             );
 
                             // 斜杠命令拦截：在创建 InboundMessage 之前检查
+                            let mut ws_metadata = serde_json::Value::Null;
                             if content.starts_with('/') {
                                 let session_key = format!("ws:{}", chat_id);
                                 let ctx = CommandContext::for_websocket(
                                     state.paths.clone(),
                                     state.task_manager.clone(),
+                                    state.checkpoint_manager.clone(),
                                     chat_id.clone(),
                                 )
                                 .with_clear_callback(
@@ -208,13 +210,18 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                         transformed_content,
                                         original_command,
                                     } => {
-                                        // 命令需要转发给 AgentRuntime（如 /learn）
+                                        // 命令需要转发给 AgentRuntime（如 /learn, /cancel-task, /resume）
                                         tracing::info!(
                                             command = %original_command,
                                             "Forwarding command to AgentRuntime"
                                         );
                                         // 使用转换后的内容替代原始内容
                                         content = transformed_content;
+                                        // 标记来源为斜杠命令，runtime 据此验证授权
+                                        ws_metadata = serde_json::json!({
+                                            "source": "slash_command",
+                                            "original_command": original_command
+                                        });
                                         // 继续正常流程，转发给 AgentRuntime
                                     }
                                 }
@@ -227,7 +234,7 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                 chat_id: chat_id.clone(),
                                 content,
                                 media,
-                                metadata: serde_json::Value::Null,
+                                metadata: ws_metadata,
                                 timestamp_ms: chrono::Utc::now().timestamp_millis(),
                             };
 

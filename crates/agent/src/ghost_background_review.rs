@@ -12,19 +12,14 @@ use crate::memory_file_store::MemoryFileStore;
 use crate::skill_file_store::SkillFileStore;
 use blockcell_tools::memory::MemoryManageTool;
 use blockcell_tools::session_search::SessionSearchTool;
-use blockcell_tools::skills::{SkillManageTool, SkillViewTool};
+use blockcell_tools::skills::SkillViewTool;
 use blockcell_tools::{SessionSearchOps, ToolContext, ToolRegistry};
 
 use crate::ghost_learning::GhostEpisodeSnapshot;
 
 const GHOST_BACKGROUND_REVIEWER: &str = "embedded_ghost_background_review_v1";
 const REVIEW_TOOL_LOOP_MAX_ROUNDS: usize = 8;
-const REVIEW_ALLOWED_TOOLS: &[&str] = &[
-    "memory_manage",
-    "session_search",
-    "skill_view",
-    "skill_manage",
-];
+const REVIEW_ALLOWED_TOOLS: &[&str] = &["memory_manage", "session_search", "skill_view"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GhostBackgroundReviewOutcome {
@@ -302,6 +297,8 @@ fn summarize_learning_action(action: &GhostReviewToolAction) -> Option<String> {
             _ => Some("Memory updated".to_string()),
         },
         "skill_manage" => {
+            // skill_manage is no longer allowed in ghost review;
+            // this arm is kept for backward compat with any stale tool results
             let skill_name = action
                 .result
                 .get("skillName")
@@ -327,18 +324,20 @@ fn restricted_review_tool_registry() -> ToolRegistry {
     registry.register(Arc::new(MemoryManageTool));
     registry.register(Arc::new(SessionSearchTool));
     registry.register(Arc::new(SkillViewTool));
-    registry.register(Arc::new(SkillManageTool));
+    // NOTE: skill_manage is intentionally excluded from ghost review.
+    // Ghost review only writes declarative knowledge (USER.md/MEMORY.md).
+    // Skill creation/modification is handled by SkillLearningChannel.
     registry
 }
 
 fn build_restricted_review_messages(snapshot: &GhostEpisodeSnapshot) -> Vec<ChatMessage> {
     vec![
         ChatMessage::system(
-            "You are a quiet Ghost learning reviewer. Learn only durable user preferences, stable project facts, reusable non-procedural memory, and reusable prompt-only skills. Use only the provided tools to update final memory or skill files directly. If no durable learning is useful, make no tool calls.",
+            "You are a quiet Ghost learning reviewer. Learn only durable user preferences, stable project facts, and reusable non-procedural memory. Use only the provided tools to update final memory files directly. Do not create, edit, or request skills. If no durable memory is useful, make no tool calls.",
         ),
         ChatMessage::user(
             &serde_json::json!({
-                "task": "Review this learning episode and directly update durable memory or prompt-only skills when useful.",
+                "task": "Review this learning episode and directly update durable memory when useful. Do not create or modify skills.",
                 "episode": snapshot,
                 "allowedTools": REVIEW_ALLOWED_TOOLS,
             })
@@ -373,6 +372,9 @@ fn review_tool_context(paths: &Paths, snapshot: &GhostEpisodeSnapshot) -> Result
         channel_contacts_file: Some(paths.channel_contacts_file()),
         response_cache: None,
         skill_mutex: None,
+        agent_type_registry: None,
+        runtime_handle: None,
+        agent_identity: None,
     })
 }
 
@@ -672,29 +674,16 @@ mod tests {
                     Ok(LLMResponse {
                         content: None,
                         reasoning_content: None,
-                        tool_calls: vec![
-                            ToolCallRequest {
-                                id: "review-memory".to_string(),
-                                name: "memory_manage".to_string(),
-                                arguments: serde_json::json!({
-                                    "action": "add",
-                                    "target": "user",
-                                    "content": "User prefers canary-first rollout."
-                                }),
-                                thought_signature: None,
-                            },
-                            ToolCallRequest {
-                                id: "review-skill".to_string(),
-                                name: "skill_manage".to_string(),
-                                arguments: serde_json::json!({
-                                    "action": "create",
-                                    "name": "release_verification",
-                                    "description": "Release verification checklist",
-                                    "content": "Confirm rollback plan before release verification."
-                                }),
-                                thought_signature: None,
-                            },
-                        ],
+                        tool_calls: vec![ToolCallRequest {
+                            id: "review-memory".to_string(),
+                            name: "memory_manage".to_string(),
+                            arguments: serde_json::json!({
+                                "action": "add",
+                                "target": "user",
+                                "content": "User prefers canary-first rollout."
+                            }),
+                            thought_signature: None,
+                        }],
                         finish_reason: "tool_calls".to_string(),
                         usage: serde_json::Value::Null,
                     })
@@ -788,6 +777,36 @@ mod tests {
             .expect("insert ghost episode")
     }
 
+    #[test]
+    fn restricted_review_prompt_is_memory_only() {
+        let snapshot = GhostEpisodeSnapshot {
+            boundary_kind: crate::ghost_learning::GhostLearningBoundaryKind::TurnEnd,
+            session_key: Some("cli:ghost-review".to_string()),
+            subject_key: Some("chat:ghost-review".to_string()),
+            user_intent_summary: "learn deploy preference".to_string(),
+            assistant_outcome_summary: "prefer canary-first rollout".to_string(),
+            tool_call_count: 0,
+            memory_write_count: 0,
+            correction_count: 0,
+            preference_correction_count: 0,
+            complexity_score: 1,
+            reusable_lesson: None,
+            decision: crate::ghost_learning::LearningDecision::ReviewAfterResponse,
+        };
+
+        let messages = build_restricted_review_messages(&snapshot);
+        let prompt = messages
+            .iter()
+            .filter_map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(prompt.contains("durable memory"));
+        assert!(prompt.contains("Do not create, edit, or request skills"));
+        assert!(!prompt.contains("prompt-only skills"));
+        assert!(!REVIEW_ALLOWED_TOOLS.contains(&"skill_manage"));
+    }
+
     fn test_runtime_with_background_review(
         paths: Paths,
         provider: Arc<dyn Provider>,
@@ -862,21 +881,17 @@ mod tests {
             vec![
                 "memory_manage".to_string(),
                 "session_search".to_string(),
-                "skill_manage".to_string(),
                 "skill_view".to_string(),
             ]
         );
 
         let user_memory = std::fs::read_to_string(paths.user_md()).expect("read USER.md");
         assert!(user_memory.contains("canary-first rollout"));
-        let skill_text = std::fs::read_to_string(
-            paths
-                .skills_dir()
-                .join("release_verification")
-                .join("SKILL.md"),
-        )
-        .expect("read SKILL.md");
-        assert!(skill_text.contains("Confirm rollback plan"));
+        assert!(!paths
+            .skills_dir()
+            .join("release_verification")
+            .join("SKILL.md")
+            .exists());
 
         let ledger = GhostLedger::open(&paths.ghost_ledger_db()).expect("open ghost ledger");
         assert_eq!(ledger.review_run_count().unwrap(), 1);
@@ -888,13 +903,10 @@ mod tests {
             run.result["mode"],
             serde_json::json!("restricted_tool_loop")
         );
-        assert_eq!(run.result["actionCount"], serde_json::json!(2));
+        assert_eq!(run.result["actionCount"], serde_json::json!(1));
         assert_eq!(
             run.result["learningFeedback"],
-            serde_json::json!([
-                "User profile updated",
-                "Skill 'release_verification' created"
-            ])
+            serde_json::json!(["User profile updated"])
         );
     }
 

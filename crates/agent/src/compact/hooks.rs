@@ -246,6 +246,8 @@ impl PostCompactHook for DefaultPostCompactHook {
 ///     session_id,
 ///     template,
 ///     max_tokens,
+///     extraction_wait_timeout_ms,
+///     extraction_stale_threshold_ms,
 /// ));
 /// ```
 #[allow(dead_code)]
@@ -260,6 +262,10 @@ pub struct SessionMemoryRecoveryHook {
     max_tokens: usize,
     /// 提取开始时间
     extraction_started_at: Option<std::time::Instant>,
+    /// 提取等待超时 (ms)
+    extraction_wait_timeout_ms: u64,
+    /// 提取过期阈值 (ms)
+    extraction_stale_threshold_ms: u64,
 }
 
 impl SessionMemoryRecoveryHook {
@@ -270,6 +276,8 @@ impl SessionMemoryRecoveryHook {
         template: String,
         max_tokens: usize,
         extraction_started_at: Option<std::time::Instant>,
+        extraction_wait_timeout_ms: u64,
+        extraction_stale_threshold_ms: u64,
     ) -> Self {
         Self {
             workspace_dir,
@@ -277,6 +285,8 @@ impl SessionMemoryRecoveryHook {
             template,
             max_tokens,
             extraction_started_at,
+            extraction_wait_timeout_ms,
+            extraction_stale_threshold_ms,
         }
     }
 }
@@ -291,18 +301,25 @@ impl PostCompactHook for SessionMemoryRecoveryHook {
         let template = self.template.clone();
         let max_tokens = self.max_tokens;
         let extraction_started_at = self.extraction_started_at;
+        let extraction_wait_timeout_ms = self.extraction_wait_timeout_ms;
+        let extraction_stale_threshold_ms = self.extraction_stale_threshold_ms;
 
         Box::pin(async move {
             use crate::session_memory::recovery::{
                 get_session_memory_content_for_compact, get_session_memory_path,
-                wait_for_session_memory_extraction,
+                wait_for_session_memory_extraction_with_timeout,
             };
 
             let memory_path = get_session_memory_path(&workspace_dir, &session_id);
 
-            // 1. 等待提取完成
-            if let Err(e) =
-                wait_for_session_memory_extraction(&memory_path, extraction_started_at).await
+            // 1. 等待提取完成（使用可配置超时）
+            if let Err(e) = wait_for_session_memory_extraction_with_timeout(
+                &memory_path,
+                extraction_started_at,
+                extraction_wait_timeout_ms,
+                extraction_stale_threshold_ms,
+            )
+            .await
             {
                 tracing::warn!(
                     path = %memory_path.display(),
@@ -363,7 +380,8 @@ pub fn create_session_memory_recovery_hook(
     session_id: String,
     template: String,
     max_tokens: usize,
-    extraction_started_at: Option<std::time::Instant>,
+    extraction_wait_timeout_ms: u64,
+    extraction_stale_threshold_ms: u64,
 ) -> impl Fn(PostCompactContext) -> Pin<Box<dyn Future<Output = PostCompactResult> + Send>>
        + Send
        + Sync
@@ -373,7 +391,9 @@ pub fn create_session_memory_recovery_hook(
         session_id,
         template,
         max_tokens,
-        extraction_started_at,
+        None,
+        extraction_wait_timeout_ms,
+        extraction_stale_threshold_ms,
     );
 
     move |ctx: PostCompactContext| {
@@ -391,6 +411,8 @@ impl Clone for SessionMemoryRecoveryHook {
             template: self.template.clone(),
             max_tokens: self.max_tokens,
             extraction_started_at: self.extraction_started_at,
+            extraction_wait_timeout_ms: self.extraction_wait_timeout_ms,
+            extraction_stale_threshold_ms: self.extraction_stale_threshold_ms,
         }
     }
 }

@@ -4,6 +4,7 @@
 //! 可变状态必须克隆以保持隔离，共享状态保证缓存命中。
 
 use blockcell_core::types::ChatMessage;
+use blockcell_core::AbortToken;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -13,6 +14,7 @@ pub use crate::response_cache::ContentReplacementState;
 /// 子代理上下文覆盖选项
 ///
 /// 用于创建与父代理隔离但可共享特定状态的子代理上下文。
+/// 推荐使用 `SubagentOverrides::with_abort_token()` 构造，确保取消链完整。
 #[derive(Clone, Default)]
 pub struct SubagentOverrides {
     /// 覆盖 agent_id
@@ -23,8 +25,11 @@ pub struct SubagentOverrides {
     pub messages: Option<Vec<ChatMessage>>,
     /// 覆盖文件状态缓存
     pub file_state: Option<FileStateCache>,
-    /// 覆盖 abort controller
+    /// 覆盖 abort controller (legacy)
     pub abort_controller: Option<Arc<AbortController>>,
+    /// 新的 AbortToken (推荐)
+    /// 必须通过 `with_abort_token()` 或显式设置来提供，否则取消链会断裂。
+    pub abort_token: Option<AbortToken>,
     /// 覆盖内容替换状态
     pub content_replacement_state: Option<ContentReplacementState>,
     /// 显式共享父代理的 abort_controller
@@ -37,6 +42,24 @@ pub struct SubagentOverrides {
     pub max_output_tokens: Option<u32>,
     /// 最大轮次
     pub max_turns: Option<u32>,
+    /// 工作目录（用于 worktree 隔离）
+    pub working_dir: Option<std::path::PathBuf>,
+}
+
+impl SubagentOverrides {
+    /// 创建带有 AbortToken 的 SubagentOverrides（推荐构造方式）
+    /// 确保取消链完整，子代理可以被父代理取消。
+    pub fn with_abort_token(token: AbortToken) -> Self {
+        Self {
+            abort_token: Some(token),
+            ..Default::default()
+        }
+    }
+
+    /// 检查取消链是否完整（abort_token 已设置）
+    pub fn has_abort_chain(&self) -> bool {
+        self.abort_token.is_some() || self.abort_controller.is_some()
+    }
 }
 
 /// 文件状态缓存
@@ -141,8 +164,9 @@ impl AbortController {
 
     /// 中止操作
     pub fn abort(&self, reason: Option<String>) {
-        self.aborted
-            .store(true, std::sync::atomic::Ordering::Release);
+        // 先写入 reason，再设置 AtomicBool。
+        // 这确保 is_aborted() == true 时 reason() 已可用，
+        // 避免调用者看到 aborted=true 但 reason=None 的瞬态。
         if let Some(r) = reason {
             match self.reason.write() {
                 Ok(mut guard) => {
@@ -159,6 +183,8 @@ impl AbortController {
                 }
             }
         }
+        self.aborted
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// 检查是否已中止
@@ -204,6 +230,7 @@ pub fn create_subagent_context(
     parent_file_state: Option<&FileStateCache>,
     parent_replacement_state: Option<&ContentReplacementState>,
     parent_abort_controller: Option<&AbortController>,
+    parent_abort_token: Option<&AbortToken>,
     overrides: SubagentOverrides,
 ) -> SubagentContext {
     // 文件状态克隆
@@ -218,7 +245,28 @@ pub fn create_subagent_context(
         .or_else(|| parent_replacement_state.map(|s| s.clone_state()))
         .unwrap_or_default();
 
-    // AbortController
+    // AbortToken (优先使用新的)
+    let has_override = overrides.abort_token.is_some();
+    let abort_token = match overrides.abort_token {
+        Some(token) => token,
+        None => {
+            if let Some(parent) = parent_abort_token {
+                parent.child()
+            } else {
+                // 当 overrides.abort_token=None 且 parent_abort_token=None 时，
+                // 子代理的取消链断裂，父代理取消无法传播到子代理。
+                tracing::warn!(
+                    has_override,
+                    has_parent = parent_abort_token.is_some(),
+                    "Subagent abort chain is broken: no AbortToken provided and no parent to inherit from. \
+                     Use SubagentOverrides::with_abort_token() to ensure cancellation propagates."
+                );
+                AbortToken::default()
+            }
+        }
+    };
+
+    // AbortController (legacy 兼容)
     let abort_controller = overrides
         .abort_controller
         .or_else(|| {
@@ -240,6 +288,7 @@ pub fn create_subagent_context(
         file_state,
         content_replacement_state,
         abort_controller,
+        abort_token,
         query_tracking,
         agent_id: overrides.agent_id,
         agent_type: overrides.agent_type,
@@ -248,6 +297,7 @@ pub fn create_subagent_context(
         require_can_use_tool: overrides.require_can_use_tool,
         max_output_tokens: overrides.max_output_tokens,
         max_turns: overrides.max_turns,
+        working_dir: overrides.working_dir,
     }
 }
 
@@ -259,8 +309,10 @@ pub struct SubagentContext {
     pub file_state: FileStateCache,
     /// 内容替换状态
     pub content_replacement_state: ContentReplacementState,
-    /// Abort Controller
+    /// Abort Controller (legacy)
     pub abort_controller: Arc<AbortController>,
+    /// Abort Token (推荐，支持链式取消)
+    pub abort_token: AbortToken,
     /// 查询追踪
     pub query_tracking: QueryTracking,
     /// Agent ID
@@ -277,6 +329,8 @@ pub struct SubagentContext {
     pub max_output_tokens: Option<u32>,
     /// 最大轮次
     pub max_turns: Option<u32>,
+    /// 工作目录（用于 worktree 隔离）
+    pub working_dir: Option<std::path::PathBuf>,
 }
 
 #[cfg(test)]

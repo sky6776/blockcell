@@ -3,7 +3,7 @@
 //! 加载四种类型记忆文件并注入到 Agent 系统提示中，
 //! 按优先级顺序注入，遵守 token 预算限制。
 
-use super::{MemoryType, MAX_MEMORY_FILE_TOKENS};
+use super::{MemoryType, DEFAULT_INJECTION_MAX_TOKENS};
 use crate::token::estimate_tokens;
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,12 +20,26 @@ pub struct InjectionConfig {
 impl Default for InjectionConfig {
     fn default() -> Self {
         Self {
-            max_tokens: MAX_MEMORY_FILE_TOKENS,
+            max_tokens: DEFAULT_INJECTION_MAX_TOKENS,
             priority_order: vec![
                 MemoryType::User,      // 用户信息最优先
                 MemoryType::Feedback,  // 反馈次之
                 MemoryType::Project,   // 项目信息
                 MemoryType::Reference, // 参考信息最后
+            ],
+        }
+    }
+}
+
+impl From<blockcell_core::config::Layer5Config> for InjectionConfig {
+    fn from(c: blockcell_core::config::Layer5Config) -> Self {
+        Self {
+            max_tokens: c.injection_max_tokens,
+            priority_order: vec![
+                MemoryType::User,
+                MemoryType::Feedback,
+                MemoryType::Project,
+                MemoryType::Reference,
             ],
         }
     }
@@ -63,10 +77,24 @@ impl MemoryInjector {
     pub async fn load_memories(&mut self, memory_dir: &Path) -> std::io::Result<()> {
         for memory_type in MemoryType::all() {
             let path = memory_dir.join(memory_type.filename());
-            if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                // 只缓存非空内容
-                if !content.trim().is_empty() {
-                    self.cache.insert(memory_type, content);
+            match tokio::fs::read_to_string(&path).await {
+                Ok(content) => {
+                    // 只缓存非空内容
+                    if !content.trim().is_empty() {
+                        self.cache.insert(memory_type, content);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // 新安装时文件不存在是正常的，不需要警告
+                }
+                Err(e) => {
+                    // 权限错误、磁盘错误等需要警告
+                    tracing::warn!(
+                        memory_type = memory_type.name(),
+                        path = %path.display(),
+                        error = %e,
+                        "[MemoryInjector] Failed to load memory file"
+                    );
                 }
             }
         }

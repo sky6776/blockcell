@@ -13,7 +13,7 @@ use std::sync::LazyLock;
 /// - Builtin: 系统内置 Skill, 仅阻止 Critical 级别问题, 跳过 obfuscation/jailbreak/markdown_exfil 规则
 /// - Trusted: 用户信任的 Skill, 仅阻止 Critical 级别问题
 /// - Community: 社区 Skill, 阻止 Critical + Warning 级别问题
-/// - AgentCreated: Agent 创建的 Skill, 阻止所有级别问题 (最严格)
+/// - AgentCreated: Agent 创建的 Skill, 阻止 Critical + Warning 级别问题 (与 Community 相同严格度)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustLevel {
@@ -35,7 +35,9 @@ impl TrustLevel {
             TrustLevel::Builtin => level == IssueLevel::Critical,
             TrustLevel::Trusted => level == IssueLevel::Critical,
             TrustLevel::Community => level == IssueLevel::Critical || level == IssueLevel::Warning,
-            TrustLevel::AgentCreated => true,
+            TrustLevel::AgentCreated => {
+                level == IssueLevel::Critical || level == IssueLevel::Warning
+            }
         }
     }
 
@@ -540,12 +542,10 @@ pub fn scan_skill_content_with_trust(content: &str, trust_level: TrustLevel) -> 
 
     // 根据信任级别判断是否通过:
     // - 不被阻止的 Warning 仍保留在 issues 中 (供调用方展示/记录)
-    // - passed 仅检查是否有 Critical issue (Critical 总是被阻止的)
-    let has_blocking_critical = issues
-        .iter()
-        .any(|i| i.level == IssueLevel::Critical && trust_level.should_block(i.level));
+    // - passed 检查所有 issue 是否被 trust_level 阻止
+    let has_blocking_issue = issues.iter().any(|i| trust_level.should_block(i.level));
 
-    let passed = !has_blocking_critical;
+    let passed = !has_blocking_issue;
 
     SecurityReport { passed, issues }
 }
@@ -712,7 +712,7 @@ pub fn scan_skill_dir_with_trust(
         });
     }
 
-    let passed = !all_issues.iter().any(|i| i.level == IssueLevel::Critical);
+    let passed = !all_issues.iter().any(|i| trust_level.should_block(i.level));
 
     SecurityReport {
         passed,
@@ -739,6 +739,18 @@ fn scan_dir_recursive(
                 scan_dir_recursive(&entry.path(), issues, file_count, total_size, trust_level);
             }
         }
+        return;
+    }
+
+    // 检查符号链接逃逸 (必须在 is_file 之前，因为 symlink to file 也返回 is_file=true)
+    if path.is_symlink() {
+        let rel = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        issues.push(SecurityIssue {
+            level: IssueLevel::Critical,
+            rule: "structure:symlink_escape".to_string(),
+            message: format!("Skill 包含符号链接 '{}' (可能逃逸目录)", rel),
+            line: None,
+        });
         return;
     }
 
@@ -782,18 +794,6 @@ fn scan_dir_recursive(
             });
             return;
         }
-    }
-
-    // 检查符号链接逃逸
-    if path.is_symlink() {
-        let rel = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-        issues.push(SecurityIssue {
-            level: IssueLevel::Critical,
-            rule: "structure:symlink_escape".to_string(),
-            message: format!("Skill 包含符号链接 '{}' (可能逃逸目录)", rel),
-            line: None,
-        });
-        return;
     }
 
     // 读取文件内容并扫描 (带信任级别)
@@ -842,9 +842,9 @@ mod tests {
     #[test]
     fn test_sensitive_file_warning() {
         let content = "cat ~/.ssh/id_rsa";
-        // Community 级别会保留 Warning issues
+        // Community 级别会阻止 Warning issues
         let report = scan_skill_content_with_trust(content, TrustLevel::Community);
-        assert!(report.passed); // Warning 不阻止 passed 状态
+        assert!(!report.passed); // Community 阻止 Warning
         assert!(report
             .issues
             .iter()
@@ -854,9 +854,9 @@ mod tests {
     #[test]
     fn test_env_leak_warning() {
         let content = "echo $API_KEY";
-        // Community 级别会保留 Warning issues
+        // Community 级别会阻止 Warning issues
         let report = scan_skill_content_with_trust(content, TrustLevel::Community);
-        assert!(report.passed); // Warning 不阻止 passed 状态
+        assert!(!report.passed); // Community 阻止 Warning
         assert!(report.issues.iter().any(|i| i.rule.contains("env_leak")));
     }
 

@@ -26,14 +26,15 @@ use super::memory_type::MemoryType;
 ///
 /// 默认 5 分钟 = 300 秒
 ///
-/// **注意**: 此常量保留供未来配置接口使用。
-/// 当前实现在调用 `check_time_cooldown` 或 `should_extract_full` 时接收参数，
-/// 不使用此默认值。未来可能添加配置文件支持，届时可使用此常量作为默认值。
-#[allow(dead_code)]
+/// 仅用作 AutoMemoryConfig::default() 的回退值，
+/// 运行时使用 Layer5Config.extraction_time_cooldown_secs
 pub const TIME_COOLDOWN_SECS: u64 = 300;
 
 /// 内容变化阈值（字符数）
-/// 内容变化需要超过此阈值才触发提取
+///
+/// 默认值 500，可通过 Layer5Config.content_change_threshold 配置。
+/// 仅用作 AutoMemoryConfig::default() 的回退值，
+/// 运行时使用 Layer5Config.content_change_threshold
 pub const CONTENT_CHANGE_THRESHOLD: usize = 500;
 
 /// 单个记忆类型的游标
@@ -51,6 +52,8 @@ pub struct ExtractionCursor {
     pub extraction_count: usize,
     /// 上次提取时的内容签名（用于检测内容变化）
     pub last_content_signature: Option<u64>,
+    /// 上次提取时的内容长度（用于精确计算内容变化量）
+    pub last_content_length: Option<usize>,
     /// 上次提取的 monotonic 时间点（不序列化，运行时使用）
     #[serde(skip)]
     pub last_extraction_instant: Option<Instant>,
@@ -66,6 +69,7 @@ impl ExtractionCursor {
             last_extraction_time: None,
             extraction_count: 0,
             last_content_signature: None,
+            last_content_length: None,
             last_extraction_instant: None,
         }
     }
@@ -116,22 +120,33 @@ impl ExtractionCursor {
     /// 检查内容是否有实质性变化
     ///
     /// 通过计算内容签名来检测变化
-    pub fn check_content_change(&self, current_content: &str) -> bool {
+    /// `content_change_threshold` 来自 Layer5Config.content_change_threshold
+    pub fn check_content_change(
+        &self,
+        current_content: &str,
+        content_change_threshold: usize,
+    ) -> bool {
         let current_signature = compute_content_signature(current_content);
 
         match self.last_content_signature {
             Some(last_sig) => {
-                // 计算签名差异
-                // 简单实现：签名不同就算有变化
-                // 更复杂实现：可以计算内容长度差异
-                current_signature != last_sig
-                    && current_content
-                        .len()
-                        .saturating_sub(estimate_content_len_from_signature(last_sig))
-                        >= CONTENT_CHANGE_THRESHOLD
+                if current_signature == last_sig {
+                    return false; // 签名相同，内容未变
+                }
+                // 签名不同，检查内容长度变化量
+                let last_len = self.last_content_length.unwrap_or(0);
+                let content_delta = current_content.len().abs_diff(last_len);
+                content_delta >= content_change_threshold
             }
             None => true, // 从未提取过，内容变化通过
         }
+    }
+
+    /// 检查内容是否有实质性变化（使用默认阈值）
+    ///
+    /// 便捷方法，使用 CONTENT_CHANGE_THRESHOLD 常量作为默认值
+    pub fn check_content_change_default(&self, current_content: &str) -> bool {
+        self.check_content_change(current_content, CONTENT_CHANGE_THRESHOLD)
     }
 
     /// 综合检查是否应该提取
@@ -140,6 +155,8 @@ impl ExtractionCursor {
     /// 1. 消息计数冷却
     /// 2. 时间冷却
     /// 3. 内容变化（可选，根据 need_content_change 参数）
+    ///
+    /// `content_change_threshold` 来自 Layer5Config.content_change_threshold
     pub fn should_extract_full(
         &self,
         current_message_count: usize,
@@ -147,6 +164,7 @@ impl ExtractionCursor {
         message_cooldown: usize,
         time_cooldown_secs: u64,
         require_content_change: bool,
+        content_change_threshold: usize,
     ) -> ExtractionDecision {
         // 1. 消息计数冷却
         let messages_since_last = current_message_count.saturating_sub(self.last_message_count);
@@ -194,7 +212,8 @@ impl ExtractionCursor {
 
         // 3. 内容变化（可选）
         if require_content_change {
-            let content_changed = self.check_content_change(current_content);
+            let content_changed =
+                self.check_content_change(current_content, content_change_threshold);
             if !content_changed {
                 return ExtractionDecision::Wait {
                     reason: ExtractionWaitReason::NoContentChange,
@@ -229,10 +248,11 @@ impl ExtractionCursor {
         self.extraction_count += 1;
     }
 
-    /// 更新游标（包含内容签名）
+    /// 更新游标（包含内容签名和长度）
     pub fn update_with_content(&mut self, message_uuid: Uuid, message_count: usize, content: &str) {
         self.update(message_uuid, message_count);
         self.last_content_signature = Some(compute_content_signature(content));
+        self.last_content_length = Some(content.len());
     }
 }
 
@@ -271,13 +291,6 @@ fn compute_content_signature(content: &str) -> u64 {
     hasher.finish()
 }
 
-/// 从签名估算内容长度（粗略估计）
-fn estimate_content_len_from_signature(_signature: u64) -> usize {
-    // 简单实现：签名不包含长度信息，返回 0
-    // 实际实现可以存储更多信息在签名中
-    0
-}
-
 /// 游标管理器
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractionCursorManager {
@@ -304,11 +317,19 @@ impl ExtractionCursorManager {
             if let Ok(manager) = serde_json::from_str::<ExtractionCursorManager>(&content) {
                 self.cursors = manager.cursors;
             } else {
-                // JSON 解析失败，记录警告但继续使用默认值
+                // JSON 解析失败，备份损坏文件后使用默认值
                 tracing::warn!(
                     path = %self.cursor_file_path.display(),
-                    "[cursor] Failed to parse cursor file, using defaults"
+                    "[cursor] Failed to parse cursor file, backing up and using defaults"
                 );
+                // 备份损坏的文件，避免数据永久丢失
+                let backup_path = self.cursor_file_path.with_extension("cursors.json.bak");
+                if let Err(e) = fs::rename(&self.cursor_file_path, &backup_path).await {
+                    tracing::warn!(
+                        error = %e,
+                        "[cursor] Failed to backup corrupted cursor file"
+                    );
+                }
             }
         }
         Ok(())

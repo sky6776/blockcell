@@ -310,8 +310,10 @@ mod tests {
 
     #[test]
     fn ghost_learning_policy_reviews_on_configured_turn_interval() {
-        let mut config = GhostLearningConfig::default();
-        config.turn_review_interval = 2;
+        let config = GhostLearningConfig {
+            turn_review_interval: 2,
+            ..Default::default()
+        };
         let policy = GhostLearningPolicy::from_config(&config);
 
         let boundary = sample_trivial_success_turn();
