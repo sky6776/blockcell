@@ -20,6 +20,7 @@ mod memory_type;
 pub mod scanner;
 
 pub use cursor::{ExtractionCursor, ExtractionCursorManager};
+pub(crate) use extractor::build_message_content_signature;
 pub use extractor::{
     should_extract_auto_memory, should_extract_auto_memory_with_config, AutoMemoryConfig,
     AutoMemoryExtractor, ExtractionParams, ExtractionResult,

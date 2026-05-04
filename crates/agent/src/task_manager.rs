@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use blockcell_core::system_event::{DeliveryPolicy, EventPriority, SystemEvent};
-use blockcell_core::{AgentResult, Error};
+use blockcell_core::{AbortToken, AgentResult, Error};
 use blockcell_tools::{EventEmitterHandle, TaskManagerOps};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -133,6 +133,8 @@ pub struct TaskManager {
     /// Uses StdMutex (std::sync::Mutex) because drain_pending_messages is called
     /// in non-async context (from execution loop).
     message_queues: Arc<StdMutex<HashMap<String, VecDeque<String>>>>,
+    /// Cooperative cancellation tokens for typed/background agent tasks.
+    abort_tokens: Arc<StdMutex<HashMap<String, AbortToken>>>,
     /// Progress callback channel for reporting agent execution progress.
     progress_tx: Option<mpsc::Sender<AgentProgress>>,
     /// 任务完成事件广播通道，用于Lead Agent订阅子Agent完成事件
@@ -168,6 +170,7 @@ impl TaskManager {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             event_emitters: Arc::new(StdMutex::new(HashMap::new())),
             message_queues: Arc::new(StdMutex::new(HashMap::new())),
+            abort_tokens: Arc::new(StdMutex::new(HashMap::new())),
             progress_tx: None,
             completed_events_tx,
             workspace_dir: None,
@@ -181,6 +184,7 @@ impl TaskManager {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             event_emitters: Arc::new(StdMutex::new(HashMap::new())),
             message_queues: Arc::new(StdMutex::new(HashMap::new())),
+            abort_tokens: Arc::new(StdMutex::new(HashMap::new())),
             progress_tx: None,
             completed_events_tx,
             workspace_dir: Some(workspace_dir.to_path_buf()),
@@ -194,6 +198,7 @@ impl TaskManager {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             event_emitters: Arc::new(StdMutex::new(HashMap::new())),
             message_queues: Arc::new(StdMutex::new(HashMap::new())),
+            abort_tokens: Arc::new(StdMutex::new(HashMap::new())),
             progress_tx: Some(progress_tx),
             completed_events_tx,
             workspace_dir: None,
@@ -210,6 +215,7 @@ impl TaskManager {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             event_emitters: Arc::new(StdMutex::new(HashMap::new())),
             message_queues: Arc::new(StdMutex::new(HashMap::new())),
+            abort_tokens: Arc::new(StdMutex::new(HashMap::new())),
             progress_tx: Some(progress_tx),
             completed_events_tx,
             workspace_dir: Some(workspace_dir.to_path_buf()),
@@ -229,6 +235,51 @@ impl TaskManager {
     /// Get a clone of the progress_tx sender, if configured.
     pub fn progress_tx(&self) -> Option<mpsc::Sender<AgentProgress>> {
         self.progress_tx.clone()
+    }
+
+    /// Register a cooperative cancellation token for a task.
+    pub fn register_abort_token(&self, task_id: &str, token: AbortToken) {
+        let mut tokens = match self.abort_tokens.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        tokens.insert(task_id.to_string(), token);
+    }
+
+    /// Remove a task's cancellation token once the task reaches a terminal state.
+    pub fn unregister_abort_token(&self, task_id: &str) {
+        let mut tokens = match self.abort_tokens.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        tokens.remove(task_id);
+    }
+
+    fn cancel_registered_abort_token(&self, task_id: &str) -> bool {
+        let token = {
+            let tokens = match self.abort_tokens.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            tokens.get(task_id).cloned()
+        };
+
+        if let Some(token) = token {
+            token.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn cleanup_task_runtime_state(&self, task_id: &str) {
+        self.cancel_registered_abort_token(task_id);
+        self.unregister_abort_token(task_id);
+        let mut queues = match self.message_queues.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        queues.remove(task_id);
     }
 
     /// Persist task to disk if workspace_dir is configured.
@@ -535,6 +586,7 @@ impl TaskManager {
                 "Messages arrived after task completion, discarding"
             );
         }
+        self.unregister_abort_token(task_id);
 
         if let Some(task) = updated {
             self.emit_lifecycle_event(&task, "completed");
@@ -576,6 +628,7 @@ impl TaskManager {
                 "Messages in queue when task failed, discarding"
             );
         }
+        self.unregister_abort_token(task_id);
 
         if let Some(task) = updated {
             self.emit_lifecycle_event(&task, "failed");
@@ -619,8 +672,8 @@ impl TaskManager {
             .collect()
     }
 
-    /// 取消运行中的任务
-    /// 将任务状态设为 Cancelled，AbortToken 的取消由调用方处理
+    /// 取消运行中的任务。
+    /// 将任务状态设为 Cancelled，并触发已注册的 AbortToken。
     pub async fn cancel_task(&self, task_id: &str) -> Result<(), Error> {
         let updated = {
             let mut tasks = self.tasks.lock().await;
@@ -650,6 +703,11 @@ impl TaskManager {
         }
 
         if let Some(task) = updated {
+            let token_cancelled = self.cancel_registered_abort_token(task_id);
+            self.unregister_abort_token(task_id);
+            if token_cancelled {
+                tracing::info!(task_id = %task_id, "Cancelled registered AbortToken for task");
+            }
             self.emit_lifecycle_event(&task, "cancelled");
             self.persist_if_configured(&task).await;
             Ok(())
@@ -727,6 +785,15 @@ impl TaskManager {
                     queues.remove(id);
                 }
             }
+            {
+                let mut tokens = match self.abort_tokens.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                for id in &removed_ids {
+                    tokens.remove(id);
+                }
+            }
 
             // Also delete persisted JSON files to prevent disk leak
             // (done after releasing the mutex to avoid holding lock across await)
@@ -754,10 +821,9 @@ impl TaskManager {
             let mut tasks = self.tasks.lock().await;
             tasks.remove(task_id);
         }
-        // Clean up message_queues entry
-        {
-            let mut queues = self.message_queues.lock().unwrap();
-            queues.remove(task_id);
+        self.cleanup_task_runtime_state(task_id);
+        if let Some(ref workspace_dir) = self.workspace_dir {
+            self.cleanup_task_file(workspace_dir, task_id).await;
         }
     }
 
@@ -835,11 +901,10 @@ impl TaskManager {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(queue) = queues.get_mut(task_id) {
-            queue.drain(..).collect::<Vec<String>>()
-        } else {
-            Vec::new()
-        }
+        queues
+            .remove(task_id)
+            .map(|queue| queue.into_iter().collect())
+            .unwrap_or_default()
     }
 
     /// Check if a task is ONE_SHOT type (cannot receive SendMessage).
@@ -890,23 +955,24 @@ impl TaskManager {
                 "Messages in queue when task completed, discarding"
             );
         }
+        self.unregister_abort_token(task_id);
 
         // 持久化任务状态 + 发送生命周期事件
         if let Some(task) = &task_info {
             self.emit_lifecycle_event(task, "completed");
             self.persist_if_configured(task).await;
+
+            // 广播完成事件
+            let event = TaskCompletedEvent {
+                task_id: task_id.to_string(),
+                agent_type,
+                result,
+                completed_at: Utc::now(),
+            };
+
+            // Broadcast completion event (ignore no-subscriber errors)
+            self.completed_events_tx.send(event).ok();
         }
-
-        // 广播完成事件
-        let event = TaskCompletedEvent {
-            task_id: task_id.to_string(),
-            agent_type,
-            result,
-            completed_at: Utc::now(),
-        };
-
-        // Broadcast completion event (ignore no-subscriber errors)
-        self.completed_events_tx.send(event).ok();
     }
 
     /// 标记任务已通知，返回是否首次设置
@@ -964,6 +1030,7 @@ impl TaskManager {
                     "Messages in queue when task failed (grace), discarding"
                 );
             }
+            self.unregister_abort_token(task_id);
 
             self.emit_lifecycle_event(&task, "failed");
             self.persist_if_configured(&task).await;
@@ -1057,10 +1124,13 @@ impl TaskManager {
                                 "Task restored from disk after restart; not re-executed automatically".to_string()
                             );
 
+                            let restored_task_for_persist = restored_task.clone();
                             self.tasks
                                 .lock()
                                 .await
                                 .insert(task.id.clone(), restored_task);
+                            self.persist_task_to_disk(workspace_dir, &restored_task_for_persist)
+                                .await;
                             count += 1;
 
                             tracing::info!(
@@ -1137,6 +1207,15 @@ impl TaskManager {
             let mut queues = self.message_queues.lock().unwrap();
             for id in &evicted_ids {
                 queues.remove(id);
+            }
+        }
+        if !evicted_ids.is_empty() {
+            let mut tokens = match self.abort_tokens.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for id in &evicted_ids {
+                tokens.remove(id);
             }
         }
 
@@ -1373,6 +1452,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cancel_task_cancels_registered_abort_token() {
+        let manager = TaskManager::new();
+        let token = AbortToken::new();
+        manager
+            .create_and_start_task(
+                "task-cancel-token",
+                "demo",
+                "cancel token test",
+                "cli",
+                "chat-1",
+                None,
+                false,
+                Some("explore"),
+                true,
+            )
+            .await;
+        manager.register_abort_token("task-cancel-token", token.clone());
+
+        manager.cancel_task("task-cancel-token").await.unwrap();
+
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_complete_task_does_not_broadcast_after_cancelled() {
+        let manager = TaskManager::new();
+        let mut completed_rx = manager.subscribe_completed_events();
+        manager
+            .create_and_start_task(
+                "task-cancel-complete",
+                "demo",
+                "cancel complete test",
+                "cli",
+                "chat-1",
+                None,
+                false,
+                Some("explore"),
+                true,
+            )
+            .await;
+
+        manager.cancel_task("task-cancel-complete").await.unwrap();
+        manager
+            .complete_task(
+                "task-cancel-complete",
+                "explore".to_string(),
+                AgentResult::success("late result".to_string()),
+            )
+            .await;
+
+        let recv_result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), completed_rx.recv()).await;
+        assert!(recv_result.is_err());
+        assert_eq!(
+            manager
+                .get_task("task-cancel-complete")
+                .await
+                .unwrap()
+                .status,
+            TaskStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
     async fn test_task_manager_removes_task() {
         let manager = TaskManager::new();
         manager
@@ -1436,6 +1579,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_remove_task_deletes_persisted_file() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let workspace = temp_dir.path();
+        let manager = TaskManager::with_workspace(workspace);
+        manager
+            .create_task(
+                "remove-persisted-1",
+                "demo",
+                "remove persisted test",
+                "cli",
+                "chat-1",
+                None,
+                false,
+                None,
+                false,
+            )
+            .await;
+
+        let file_path = workspace
+            .join(".blockcell")
+            .join("tasks")
+            .join("remove-persisted-1.json");
+        assert!(file_path.exists(), "Task file should exist after creation");
+
+        manager.remove_task("remove-persisted-1").await;
+
+        assert!(
+            !file_path.exists(),
+            "Task file should be deleted after remove_task"
+        );
+    }
+
+    #[tokio::test]
     async fn test_cleanup_task_file() {
         use tempfile::TempDir;
 
@@ -1479,6 +1657,47 @@ mod tests {
             !file_path.exists(),
             "Task file should be deleted after cleanup_task_file"
         );
+    }
+
+    #[tokio::test]
+    async fn test_restore_from_disk_persists_failed_state() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let workspace = temp_dir.path();
+        let manager = TaskManager::with_workspace(workspace);
+        manager
+            .create_and_start_task(
+                "restore-running-1",
+                "restore",
+                "restore test",
+                "cli",
+                "chat-1",
+                None,
+                false,
+                Some("explore"),
+                true,
+            )
+            .await;
+
+        let restored_manager = TaskManager::with_workspace(workspace);
+        assert_eq!(restored_manager.restore_from_disk(workspace).await, 1);
+
+        let restored = restored_manager
+            .get_task("restore-running-1")
+            .await
+            .expect("restored task");
+        assert_eq!(restored.status, TaskStatus::Failed);
+
+        let file_path = workspace
+            .join(".blockcell")
+            .join("tasks")
+            .join("restore-running-1.json");
+        let content = tokio::fs::read_to_string(&file_path)
+            .await
+            .expect("read restored task file");
+        let persisted: TaskInfo = serde_json::from_str(&content).expect("parse restored task file");
+        assert_eq!(persisted.status, TaskStatus::Failed);
     }
 
     #[tokio::test]

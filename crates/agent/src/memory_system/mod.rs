@@ -355,11 +355,13 @@ impl MemorySystem {
     }
 
     /// 检查是否应该触发自动记忆提取
-    pub fn should_extract_auto_memory(&self, message_count: usize) -> Vec<MemoryType> {
+    pub fn should_extract_auto_memory(&self, messages: &[ChatMessage]) -> Vec<MemoryType> {
         let config = crate::auto_memory::AutoMemoryConfig::from(self.config.layer5.clone());
+        let current_content = crate::auto_memory::build_message_content_signature(messages);
         crate::auto_memory::should_extract_auto_memory_with_config(
             &self.cursor_manager,
-            message_count,
+            messages.len(),
+            &current_content,
             &config,
         )
     }
@@ -579,9 +581,8 @@ pub fn evaluate_memory_hooks(
 
     // 3. 检查自动记忆提取
     if memory_system.config().auto_memory_enabled {
-        let message_count = messages.len();
         // 使用已加载的 cursor_manager，确保冷却机制正确工作
-        let types_to_extract = memory_system.should_extract_auto_memory(message_count);
+        let types_to_extract = memory_system.should_extract_auto_memory(messages);
 
         if !types_to_extract.is_empty() {
             return PostSamplingAction::ExtractAutoMemory(types_to_extract);

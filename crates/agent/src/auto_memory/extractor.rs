@@ -15,6 +15,21 @@ use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
 
+pub(crate) fn build_message_content_signature(messages: &[ChatMessage]) -> String {
+    let mut content = String::new();
+    for message in messages {
+        content.push_str(&message.role);
+        content.push('\n');
+        if let Some(text) = message.content.as_str() {
+            content.push_str(text);
+        } else {
+            content.push_str(&message.content.to_string());
+        }
+        content.push('\n');
+    }
+    content
+}
+
 /// 原子回滚写入: 先写入唯一临时文件, 再 rename 替换目标文件
 ///
 /// 与 `tokio::fs::write` 不同，此函数使用原子写入模式，
@@ -140,7 +155,11 @@ impl AutoMemoryExtractor {
     }
 
     /// 检查是否需要提取
-    pub fn should_extract(&self, current_message_count: usize) -> Vec<MemoryType> {
+    pub fn should_extract(
+        &self,
+        current_message_count: usize,
+        current_content: &str,
+    ) -> Vec<MemoryType> {
         if current_message_count < self.config.min_messages_for_extraction {
             return Vec::new();
         }
@@ -149,9 +168,16 @@ impl AutoMemoryExtractor {
             .all_cursors()
             .iter()
             .filter(|c| {
-                c.should_extract(
-                    current_message_count,
-                    self.config.extraction_cooldown_messages,
+                matches!(
+                    c.should_extract_full(
+                        current_message_count,
+                        current_content,
+                        self.config.extraction_cooldown_messages,
+                        self.config.extraction_time_cooldown_secs,
+                        true,
+                        self.config.content_change_threshold,
+                    ),
+                    super::cursor::ExtractionDecision::Proceed
                 )
             })
             .map(|c| c.memory_type)
@@ -174,6 +200,7 @@ impl AutoMemoryExtractor {
         } = params;
 
         let memory_path = get_memory_file_path(&self.config_dir, memory_type);
+        let message_content_signature = build_message_content_signature(&messages);
 
         // 璇诲彇褰撳墠璁板繂鍐呭
         let current_content = tokio::fs::read_to_string(&memory_path)
@@ -261,7 +288,11 @@ impl AutoMemoryExtractor {
 
                 // 鏇存柊娓告爣
                 let mut cursor = self.cursor_manager.get_cursor(memory_type);
-                cursor.update(last_message_uuid, message_count);
+                cursor.update_with_content(
+                    last_message_uuid,
+                    message_count,
+                    &message_content_signature,
+                );
                 self.cursor_manager.update_cursor(cursor);
 
                 // 保存游标状态
@@ -380,6 +411,7 @@ Use the file_edit tool to update the memory file at the configured path.
 pub fn should_extract_auto_memory_with_config(
     cursor_manager: &ExtractionCursorManager,
     current_message_count: usize,
+    current_content: &str,
     config: &AutoMemoryConfig,
 ) -> Vec<MemoryType> {
     if current_message_count < config.min_messages_for_extraction {
@@ -389,7 +421,19 @@ pub fn should_extract_auto_memory_with_config(
     cursor_manager
         .all_cursors()
         .iter()
-        .filter(|c| c.should_extract(current_message_count, config.extraction_cooldown_messages))
+        .filter(|c| {
+            matches!(
+                c.should_extract_full(
+                    current_message_count,
+                    current_content,
+                    config.extraction_cooldown_messages,
+                    config.extraction_time_cooldown_secs,
+                    true,
+                    config.content_change_threshold,
+                ),
+                super::cursor::ExtractionDecision::Proceed
+            )
+        })
         .map(|c| c.memory_type)
         .collect()
 }
@@ -416,19 +460,30 @@ pub async fn extract_auto_memory(
 ) -> ExtractionResult {
     // 使用 cursor 验证是否满足提取条件
     let current_message_count = messages.len();
-    if !cursor.should_extract(current_message_count, EXTRACTION_COOLDOWN_MESSAGES) {
+    let message_content_signature = build_message_content_signature(&messages);
+    if !matches!(
+        cursor.should_extract_full(
+            current_message_count,
+            &message_content_signature,
+            EXTRACTION_COOLDOWN_MESSAGES,
+            AutoMemoryConfig::default().extraction_time_cooldown_secs,
+            true,
+            AutoMemoryConfig::default().content_change_threshold,
+        ),
+        super::cursor::ExtractionDecision::Proceed
+    ) {
         tracing::debug!(
             memory_type = memory_type.name(),
             last_count = cursor.last_message_count,
             current_count = current_message_count,
-            "[auto_memory] extraction skipped - cooldown not met"
+            "[auto_memory] extraction skipped - cooldown/content conditions not met"
         );
         return ExtractionResult {
             memory_type,
             success: false,
             input_tokens: 0,
             output_tokens: 0,
-            error: Some("Extraction cooldown not met".to_string()),
+            error: Some("Extraction cooldown/content conditions not met".to_string()),
             cursor_save_failed: false,
         };
     }
@@ -544,10 +599,12 @@ pub async fn extract_auto_memory(
 pub fn should_extract_auto_memory(
     cursor_manager: &ExtractionCursorManager,
     current_message_count: usize,
+    current_content: &str,
 ) -> Vec<MemoryType> {
     should_extract_auto_memory_with_config(
         cursor_manager,
         current_message_count,
+        current_content,
         &AutoMemoryConfig::default(),
     )
 }
@@ -567,14 +624,58 @@ mod tests {
     #[test]
     fn test_should_extract_auto_memory() {
         let manager = ExtractionCursorManager::new(Path::new("/config"));
+        let content = "user\nremember that I prefer concise answers\n";
 
         // 消息数不足
-        let types = should_extract_auto_memory(&manager, 5);
+        let types = should_extract_auto_memory(&manager, 5, content);
         assert!(types.is_empty());
 
         // 消息数足够
-        let types = should_extract_auto_memory(&manager, 15);
+        let types = should_extract_auto_memory(&manager, 15, content);
         assert!(!types.is_empty());
         assert!(types.contains(&MemoryType::User));
+    }
+
+    #[test]
+    fn test_should_extract_auto_memory_respects_content_change() {
+        let mut manager = ExtractionCursorManager::new(Path::new("/config"));
+        let content = "user\nremember that I prefer concise answers\n";
+        let mut cursor = ExtractionCursor::new(MemoryType::User);
+        cursor.update_with_content(Uuid::new_v4(), 10, content);
+        manager.update_cursor(cursor);
+        let config = AutoMemoryConfig {
+            min_messages_for_extraction: 0,
+            extraction_cooldown_messages: 5,
+            max_memory_file_tokens: 4000,
+            extraction_time_cooldown_secs: 0,
+            content_change_threshold: 10,
+        };
+
+        let unchanged = should_extract_auto_memory_with_config(&manager, 20, content, &config);
+        assert!(!unchanged.contains(&MemoryType::User));
+
+        let changed = format!("{content}{}", "x".repeat(20));
+        let changed_types = should_extract_auto_memory_with_config(&manager, 20, &changed, &config);
+        assert!(changed_types.contains(&MemoryType::User));
+    }
+
+    #[test]
+    fn test_should_extract_auto_memory_respects_time_cooldown() {
+        let mut manager = ExtractionCursorManager::new(Path::new("/config"));
+        let content = "user\nremember that I prefer concise answers\n";
+        let mut cursor = ExtractionCursor::new(MemoryType::User);
+        cursor.update_with_content(Uuid::new_v4(), 10, content);
+        manager.update_cursor(cursor);
+        let config = AutoMemoryConfig {
+            min_messages_for_extraction: 0,
+            extraction_cooldown_messages: 5,
+            max_memory_file_tokens: 4000,
+            extraction_time_cooldown_secs: 3600,
+            content_change_threshold: 0,
+        };
+
+        let changed = format!("{content}{}", "x".repeat(20));
+        let types = should_extract_auto_memory_with_config(&manager, 20, &changed, &config);
+        assert!(!types.contains(&MemoryType::User));
     }
 }

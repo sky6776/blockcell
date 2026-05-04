@@ -132,7 +132,8 @@ impl CheckpointManager {
                     Ok(cp) if !cp.completed => {
                         result.push(cp);
                         if result.len() >= MAX_FIND_UNFINISHED {
-                            break;
+                            result.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                            result.truncate(MAX_FIND_UNFINISHED);
                         }
                     }
                     Ok(_) => {} // 已完成的 checkpoint，跳过
@@ -283,6 +284,29 @@ mod tests {
         let unfinished = manager.find_unfinished();
         assert_eq!(unfinished.len(), 1);
         assert_eq!(unfinished[0].task_id, "task-1");
+    }
+
+    #[test]
+    fn test_find_unfinished_keeps_newest_when_over_limit() {
+        let dir = TempDir::new().unwrap();
+        let manager = CheckpointManager::new(dir.path());
+        let base_time = Utc::now();
+
+        for i in 0..105 {
+            let checkpoint = TaskCheckpoint {
+                task_id: format!("cp-{i:03}"),
+                messages: vec![],
+                turn: i,
+                created_at: base_time + chrono::Duration::seconds(i as i64),
+                completed: false,
+            };
+            manager.save(&checkpoint).unwrap();
+        }
+
+        let unfinished = manager.find_unfinished();
+        assert_eq!(unfinished.len(), 100);
+        assert!(unfinished.iter().any(|cp| cp.task_id == "cp-104"));
+        assert!(!unfinished.iter().any(|cp| cp.task_id == "cp-000"));
     }
 
     #[test]

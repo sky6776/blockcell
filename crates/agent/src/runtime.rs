@@ -413,7 +413,7 @@ fn inject_skill_cards_into_system_prompt(
 async fn inject_running_tasks_into_system_prompt(
     messages: &mut [ChatMessage],
     task_manager: &TaskManager,
-) {
+) -> Vec<String> {
     let task_list = task_manager.list_tasks(Some(&TaskStatus::Running)).await;
 
     // 只保留 typed agent 任务（有 agent_type 的），排除 msg_ 会话任务
@@ -437,13 +437,13 @@ async fn inject_running_tasks_into_system_prompt(
     if running_agents.is_empty() && uninject_completed.is_empty() {
         // 没有运行中的后台任务，注入明确信息到 system prompt
         let Some(system_message) = messages.first_mut() else {
-            return;
+            return Vec::new();
         };
         if system_message.role != "system" {
-            return;
+            return Vec::new();
         }
         let Some(existing_prompt) = system_message.content.as_str() else {
-            return;
+            return Vec::new();
         };
         let section = "\n\n## Background Tasks\nNo background agent tasks are currently running. You can safely start new tasks using the `agent` tool.\n";
         system_message.content =
@@ -461,20 +461,22 @@ async fn inject_running_tasks_into_system_prompt(
                 }
             }
         }
-        return;
+        return Vec::new();
     }
 
     let Some(system_message) = messages.first_mut() else {
-        return;
+        return Vec::new();
     };
     if system_message.role != "system" {
-        return;
+        return Vec::new();
     }
     let Some(existing_prompt) = system_message.content.as_str() else {
-        return;
+        return Vec::new();
     };
 
     let mut section = String::from("\n\n## Background Tasks\n");
+    let injected_completed_task_ids: Vec<String> =
+        uninject_completed.iter().map(|t| t.id.clone()).collect();
 
     if !running_agents.is_empty() {
         section.push_str("The following agent tasks are currently running in the background:\n\n");
@@ -551,13 +553,11 @@ async fn inject_running_tasks_into_system_prompt(
         }
         section.push_str("- You should integrate and summarize these results for the user.\n- If the user asks for details, reference the specific task_id.\n");
 
-        // 标记这些任务的结果已注入
-        for t in &uninject_completed {
-            task_manager.mark_result_injected(&t.id).await;
-        }
+        // 只返回已注入的任务 ID，调用方在主响应成功后再标记 result_injected。
     }
 
     system_message.content = serde_json::Value::String(format!("{}{}", existing_prompt, section));
+    injected_completed_task_ids
 }
 
 fn normalize_selected_skill_name(
@@ -5295,7 +5295,8 @@ impl AgentRuntime {
 
         // 注入当前后台任务状态到 system prompt
         // 让 LLM 知道哪些 typed agent 任务正在运行，避免基于过时对话历史误判
-        inject_running_tasks_into_system_prompt(&mut messages, &self.task_manager).await;
+        let prompt_injected_completed_task_ids =
+            inject_running_tasks_into_system_prompt(&mut messages, &self.task_manager).await;
 
         // Now add user message to history for session persistence
         history.push(ChatMessage::user(&msg.content));
@@ -5501,6 +5502,7 @@ impl AgentRuntime {
         };
 
         let mut final_response = String::new();
+        let mut llm_failed_after_retries = false;
         let mut message_tool_sent_media = false;
         let mut tool_fail_counts: HashMap<String, u32> = HashMap::new();
         let mut resource_missing_hints_sent: HashSet<String> = HashSet::new();
@@ -5571,6 +5573,7 @@ impl AgentRuntime {
             let response = match llm_result {
                 Ok(r) => r,
                 Err(e) => {
+                    llm_failed_after_retries = true;
                     let max_retries = self.config.agents.defaults.llm_max_retries;
                     warn!(error = %e, iteration = ?tool_call_counts, retries = max_retries, "LLM call failed after all retries");
                     final_response = llm_exhausted_error(max_retries, &e);
@@ -6641,6 +6644,12 @@ impl AgentRuntime {
                 cron_deliver_target,
             })
             .await?;
+
+        if !llm_failed_after_retries {
+            for task_id in &prompt_injected_completed_task_ids {
+                self.task_manager.mark_result_injected(task_id).await;
+            }
+        }
 
         if let Some(manager) = self.ghost_memory_lifecycle.as_ref() {
             manager.sync_all(&msg.content, &delivered_response, &session_key);
@@ -8769,6 +8778,8 @@ impl AgentRuntime {
             .map(|t| t.session_key.clone());
         // Create child AbortToken for chain cancellation
         let child_abort_token = self.abort_token.child();
+        self.task_manager
+            .register_abort_token(&task_id, child_abort_token.clone());
 
         // 检查是否需要 worktree 隔离（基于 AgentTypeDefinition.isolation 配置）
         let needs_worktree = self.requires_worktree(def);
@@ -8894,48 +8905,66 @@ impl AgentRuntime {
                     let content = output
                         .final_content
                         .unwrap_or_else(|| "Task completed with no output".to_string());
-                    task_manager.set_completed(&task_id_clone, &content).await;
-                    info!(task_id = %task_id_clone, "Typed agent completed successfully");
+                    let was_cancelled = task_manager
+                        .get_task(&task_id_clone)
+                        .await
+                        .is_some_and(|task| task.status == TaskStatus::Cancelled);
+                    if was_cancelled {
+                        info!(task_id = %task_id_clone, "Typed agent finished after cancellation; suppressing result delivery");
+                        task_manager.unregister_abort_token(&task_id_clone);
+                    } else {
+                        task_manager.set_completed(&task_id_clone, &content).await;
+                        info!(task_id = %task_id_clone, "Typed agent completed successfully");
 
-                    // 将结果发送到 origin channel/chat_id，让用户看到输出
-                    let session_store = SessionStore::new(paths.clone());
-                    deliver_subagent_result_to_origin(
-                        &channel,
-                        &chat_id,
-                        &content,
-                        &task_id_clone,
-                        parent_agent_id.as_deref(),
-                        outbound_tx.clone(),
-                        event_tx.clone(),
-                        Some(&session_store),
-                        session_key_for_persist.as_deref(),
-                    )
-                    .await;
+                        // 将结果发送到 origin channel/chat_id，让用户看到输出
+                        let session_store = SessionStore::new(paths.clone());
+                        deliver_subagent_result_to_origin(
+                            &channel,
+                            &chat_id,
+                            &content,
+                            &task_id_clone,
+                            parent_agent_id.as_deref(),
+                            outbound_tx.clone(),
+                            event_tx.clone(),
+                            Some(&session_store),
+                            session_key_for_persist.as_deref(),
+                        )
+                        .await;
+                    }
                 }
                 Err(e) => {
                     let err_msg = format!("{}", e);
-                    task_manager.set_failed(&task_id_clone, &err_msg).await;
-                    warn!(task_id = %task_id_clone, error = %e, "Typed agent failed");
+                    let was_cancelled = task_manager
+                        .get_task(&task_id_clone)
+                        .await
+                        .is_some_and(|task| task.status == TaskStatus::Cancelled);
+                    if was_cancelled {
+                        info!(task_id = %task_id_clone, "Typed agent stopped after cancellation");
+                        task_manager.unregister_abort_token(&task_id_clone);
+                    } else {
+                        task_manager.set_failed(&task_id_clone, &err_msg).await;
+                        warn!(task_id = %task_id_clone, error = %e, "Typed agent failed");
 
-                    // 将失败信息也发送到 origin
-                    let short_id = truncate_str(&task_id_clone, 8);
-                    let failure_message = format!(
-                        "\n❌ 后台任务失败: **{}** (ID: {})\n错误: {}",
-                        agent_type_for_log, short_id, err_msg
-                    );
-                    let session_store = SessionStore::new(paths.clone());
-                    deliver_subagent_result_to_origin(
-                        &channel,
-                        &chat_id,
-                        &failure_message,
-                        &task_id_clone,
-                        parent_agent_id.as_deref(),
-                        outbound_tx.clone(),
-                        event_tx.clone(),
-                        Some(&session_store),
-                        session_key_for_persist.as_deref(),
-                    )
-                    .await;
+                        // 将失败信息也发送到 origin
+                        let short_id = truncate_str(&task_id_clone, 8);
+                        let failure_message = format!(
+                            "\n❌ 后台任务失败: **{}** (ID: {})\n错误: {}",
+                            agent_type_for_log, short_id, err_msg
+                        );
+                        let session_store = SessionStore::new(paths.clone());
+                        deliver_subagent_result_to_origin(
+                            &channel,
+                            &chat_id,
+                            &failure_message,
+                            &task_id_clone,
+                            parent_agent_id.as_deref(),
+                            outbound_tx.clone(),
+                            event_tx.clone(),
+                            Some(&session_store),
+                            session_key_for_persist.as_deref(),
+                        )
+                        .await;
+                    }
                 }
             }
 
@@ -9430,6 +9459,8 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
         let paths_for_persist = self.paths.clone();
         // Create child AbortToken for chain cancellation
         let child_abort_token = self.abort_token.child();
+        self.task_manager
+            .register_abort_token(&task_id, child_abort_token.clone());
         // Clone skill_mutex and memory_store for the spawned agent
         let skill_mutex_for_spawn = Arc::new(self.skill_mutex.clone());
         let memory_store_for_spawn = self.memory_store.clone();
@@ -9556,48 +9587,66 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
                     let content = output
                         .final_content
                         .unwrap_or_else(|| "Task completed with no output".to_string());
-                    task_manager.set_completed(&task_id_clone, &content).await;
-                    info!(task_id = %task_id_clone, "Typed agent completed successfully");
+                    let was_cancelled = task_manager
+                        .get_task(&task_id_clone)
+                        .await
+                        .is_some_and(|task| task.status == TaskStatus::Cancelled);
+                    if was_cancelled {
+                        info!(task_id = %task_id_clone, "Typed agent finished after cancellation; suppressing result delivery");
+                        task_manager.unregister_abort_token(&task_id_clone);
+                    } else {
+                        task_manager.set_completed(&task_id_clone, &content).await;
+                        info!(task_id = %task_id_clone, "Typed agent completed successfully");
 
-                    // 将结果发送到 origin channel/chat_id，让用户看到输出
-                    let session_store = SessionStore::new(paths_for_persist.clone());
-                    deliver_subagent_result_to_origin(
-                        &channel,
-                        &chat_id,
-                        &content,
-                        &task_id_clone,
-                        parent_agent_id.as_deref(),
-                        outbound_tx.clone(),
-                        event_tx.clone(),
-                        Some(&session_store),
-                        session_key_for_persist.as_deref(),
-                    )
-                    .await;
+                        // 将结果发送到 origin channel/chat_id，让用户看到输出
+                        let session_store = SessionStore::new(paths_for_persist.clone());
+                        deliver_subagent_result_to_origin(
+                            &channel,
+                            &chat_id,
+                            &content,
+                            &task_id_clone,
+                            parent_agent_id.as_deref(),
+                            outbound_tx.clone(),
+                            event_tx.clone(),
+                            Some(&session_store),
+                            session_key_for_persist.as_deref(),
+                        )
+                        .await;
+                    }
                 }
                 Err(e) => {
                     let err_msg = format!("{}", e);
-                    task_manager.set_failed(&task_id_clone, &err_msg).await;
-                    warn!(task_id = %task_id_clone, error = %e, "Typed agent failed");
+                    let was_cancelled = task_manager
+                        .get_task(&task_id_clone)
+                        .await
+                        .is_some_and(|task| task.status == TaskStatus::Cancelled);
+                    if was_cancelled {
+                        info!(task_id = %task_id_clone, "Typed agent stopped after cancellation");
+                        task_manager.unregister_abort_token(&task_id_clone);
+                    } else {
+                        task_manager.set_failed(&task_id_clone, &err_msg).await;
+                        warn!(task_id = %task_id_clone, error = %e, "Typed agent failed");
 
-                    // 将失败信息也发送到 origin
-                    let short_id = truncate_str(&task_id_clone, 8);
-                    let failure_message = format!(
-                        "\n❌ 后台任务失败: **{}** (ID: {})\n错误: {}",
-                        agent_type_for_log, short_id, err_msg
-                    );
-                    let session_store = SessionStore::new(paths_for_persist.clone());
-                    deliver_subagent_result_to_origin(
-                        &channel,
-                        &chat_id,
-                        &failure_message,
-                        &task_id_clone,
-                        parent_agent_id.as_deref(),
-                        outbound_tx.clone(),
-                        event_tx.clone(),
-                        Some(&session_store),
-                        session_key_for_persist.as_deref(),
-                    )
-                    .await;
+                        // 将失败信息也发送到 origin
+                        let short_id = truncate_str(&task_id_clone, 8);
+                        let failure_message = format!(
+                            "\n❌ 后台任务失败: **{}** (ID: {})\n错误: {}",
+                            agent_type_for_log, short_id, err_msg
+                        );
+                        let session_store = SessionStore::new(paths_for_persist.clone());
+                        deliver_subagent_result_to_origin(
+                            &channel,
+                            &chat_id,
+                            &failure_message,
+                            &task_id_clone,
+                            parent_agent_id.as_deref(),
+                            outbound_tx.clone(),
+                            event_tx.clone(),
+                            Some(&session_store),
+                            session_key_for_persist.as_deref(),
+                        )
+                        .await;
+                    }
                 }
             }
 
@@ -13572,6 +13621,48 @@ description: local demo
         assert!(result.is_ok());
         let captured_type = captured.lock().unwrap();
         assert_eq!(captured_type.as_deref(), Some("explore"));
+    }
+
+    #[tokio::test]
+    async fn test_completed_agent_prompt_injection_does_not_mark_before_response() {
+        let task_manager = TaskManager::new();
+        task_manager
+            .create_and_start_task(
+                "task-inject-1",
+                "explore",
+                "inspect code",
+                "cli",
+                "chat-1",
+                None,
+                false,
+                Some("explore"),
+                true,
+            )
+            .await;
+        task_manager
+            .set_completed("task-inject-1", "found the relevant implementation")
+            .await;
+
+        let mut messages = vec![
+            ChatMessage::system("base prompt"),
+            ChatMessage::user("summarize the agent result"),
+        ];
+        let injected_ids =
+            inject_running_tasks_into_system_prompt(&mut messages, &task_manager).await;
+
+        assert_eq!(injected_ids, vec!["task-inject-1".to_string()]);
+        assert!(
+            !task_manager
+                .get_task("task-inject-1")
+                .await
+                .unwrap()
+                .result_injected
+        );
+        assert!(messages[0]
+            .content
+            .as_str()
+            .unwrap()
+            .contains("Completed Agent Results"));
     }
 
     // ========== Mock Provider for Inter-Agent Tests ==========
