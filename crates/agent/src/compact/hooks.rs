@@ -410,7 +410,9 @@ impl Clone for SessionMemoryRecoveryHook {
             session_id: self.session_id.clone(),
             template: self.template.clone(),
             max_tokens: self.max_tokens,
-            extraction_started_at: self.extraction_started_at,
+            // Reset extraction_started_at to None in the clone to avoid
+            // carrying stale timing from the original instance.
+            extraction_started_at: None,
             extraction_wait_timeout_ms: self.extraction_wait_timeout_ms,
             extraction_stale_threshold_ms: self.extraction_stale_threshold_ms,
         }

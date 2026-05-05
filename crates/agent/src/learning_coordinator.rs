@@ -67,7 +67,7 @@ pub enum SkillTrigger {
 /// into a single decision point.
 pub struct LearningCoordinator {
     nudge_engine: Mutex<SkillNudgeEngine>,
-    ghost_policy: GhostLearningPolicy,
+    ghost_policy: Mutex<GhostLearningPolicy>,
     throttle: LearningThrottle,
     dedup: LearningDedup,
     ghost_learning_enabled: bool,
@@ -82,7 +82,10 @@ impl std::fmt::Debug for LearningCoordinator {
                 "self_improve_review_enabled",
                 &self.self_improve_review_enabled,
             )
-            .field("ghost_policy", &self.ghost_policy)
+            .field(
+                "ghost_policy",
+                &self.ghost_policy.lock().unwrap_or_else(recover_mutex),
+            )
             .finish()
     }
 }
@@ -103,7 +106,7 @@ impl LearningCoordinator {
     ) -> Self {
         Self {
             nudge_engine: Mutex::new(nudge_engine),
-            ghost_policy,
+            ghost_policy: Mutex::new(ghost_policy),
             throttle,
             dedup,
             ghost_learning_enabled,
@@ -154,25 +157,20 @@ impl LearningCoordinator {
             return LearningAction::Skip;
         }
 
-        if !self.throttle.can_start_review() {
+        if !self.throttle.try_start_review() {
             return LearningAction::Skip;
         }
 
-        // Check memory nudge (based on user turns)
-        // NOTE: check_memory_nudge() resets the counter internally on trigger,
-        // so we must capture the count BEFORE calling it to report the correct value.
+        // First, check thresholds WITHOUT resetting counters (read-only check)
+        // This allows dedup to block the review without losing counter values
         let mut engine = self.nudge_engine.lock().unwrap_or_else(recover_mutex);
         let turns_before = engine.turns_since_memory();
-        let memory_nudge = engine.check_memory_nudge();
-        let memory_due = memory_nudge != NudgeResult::NoNudge && has_memory_store;
-
-        // Check skill nudge (based on tool iterations)
-        // Same: capture count before check resets it
         let iterations_before = engine.iterations_since_skill();
-        let skill_nudge = engine.check_skill_nudge();
-        let skill_due = skill_nudge != NudgeResult::NoNudge && has_skill_tool;
 
-        // Dedup check
+        let memory_due = engine.would_memory_nudge() && has_memory_store;
+        let skill_due = engine.would_skill_nudge() && has_skill_tool;
+
+        // Dedup check — BEFORE resetting counters
         let dedup_key = if memory_due && skill_due {
             "combined_nudge".to_string()
         } else if memory_due {
@@ -180,15 +178,21 @@ impl LearningCoordinator {
         } else if skill_due {
             "skill_nudge".to_string()
         } else {
+            self.throttle.review_completed(); // rollback — no nudge due
             return existing_action.cloned().unwrap_or(LearningAction::Skip);
         };
 
         if self.dedup.is_duplicate(&dedup_key) {
+            // Counters NOT reset — next turn will still see the same counts
+            self.throttle.review_completed(); // rollback — dedup blocked
             return existing_action.cloned().unwrap_or(LearningAction::Skip);
         }
 
-        // Determine action — use pre-captured counts, not NudgeResult.count
-        // (NudgeResult.count is always 0 because check_*_nudge resets the counter on trigger)
+        // Now that dedup passed, actually trigger the nudge (which resets counters)
+        let _memory_nudge = engine.check_memory_nudge();
+        let _skill_nudge = engine.check_skill_nudge();
+
+        // Determine action — use pre-captured counts
         let new_action = if memory_due && skill_due {
             LearningAction::CombinedReview {
                 memory_trigger: MemoryTrigger::NudgeThreshold {
@@ -211,27 +215,36 @@ impl LearningCoordinator {
                 },
             }
         } else {
+            self.throttle.review_completed(); // rollback — no nudge due after actual check
             return existing_action.cloned().unwrap_or(LearningAction::Skip);
         };
 
         // Note: counters are already reset by check_memory_nudge()/check_skill_nudge()
         // when they trigger, so no additional reset needed here.
 
-        // If there's an existing action, merge/upgrade
+        // If there's an existing action, merge/upgrade — use actual counts from new_action
         match (&new_action, existing_action) {
             (
-                LearningAction::SkillReview { .. },
-                Some(LearningAction::MemoryReview { trigger }),
+                LearningAction::SkillReview {
+                    trigger: new_skill_trigger,
+                },
+                Some(LearningAction::MemoryReview {
+                    trigger: mem_trigger,
+                }),
             ) => LearningAction::CombinedReview {
-                memory_trigger: trigger.clone(),
-                skill_trigger: SkillTrigger::NudgeThreshold { count: 0 },
+                memory_trigger: mem_trigger.clone(),
+                skill_trigger: new_skill_trigger.clone(),
             },
             (
-                LearningAction::MemoryReview { .. },
-                Some(LearningAction::SkillReview { trigger }),
+                LearningAction::MemoryReview {
+                    trigger: new_mem_trigger,
+                },
+                Some(LearningAction::SkillReview {
+                    trigger: skill_trigger,
+                }),
             ) => LearningAction::CombinedReview {
-                memory_trigger: MemoryTrigger::NudgeThreshold { count: 0 },
-                skill_trigger: trigger.clone(),
+                memory_trigger: new_mem_trigger.clone(),
+                skill_trigger: skill_trigger.clone(),
             },
             _ => new_action,
         }
@@ -244,7 +257,11 @@ impl LearningCoordinator {
     /// is checked once before the loop, while skill nudge is
     /// checked each iteration.
     pub fn check_memory_nudge(&self, has_memory_store: bool) -> Option<MemoryTrigger> {
-        if !self.self_improve_review_enabled || !self.throttle.can_start_review() {
+        if !self.self_improve_review_enabled {
+            return None;
+        }
+        // Atomically check throttle + increment counter
+        if !self.throttle.try_start_review() {
             return None;
         }
 
@@ -255,10 +272,12 @@ impl LearningCoordinator {
         let memory_due = memory_nudge != NudgeResult::NoNudge && has_memory_store;
 
         if !memory_due {
+            self.throttle.review_completed(); // rollback the try_start_review increment
             return None;
         }
 
         if self.dedup.is_duplicate("memory_nudge") {
+            self.throttle.review_completed(); // rollback the try_start_review increment
             return None;
         }
 
@@ -277,7 +296,11 @@ impl LearningCoordinator {
         has_skill_tool: bool,
         existing_memory: bool,
     ) -> Option<SkillTrigger> {
-        if !self.self_improve_review_enabled || !self.throttle.can_start_review() {
+        if !self.self_improve_review_enabled {
+            return None;
+        }
+        // Atomically check throttle + increment counter
+        if !self.throttle.try_start_review() {
             return None;
         }
 
@@ -288,6 +311,7 @@ impl LearningCoordinator {
         let skill_due = skill_nudge != NudgeResult::NoNudge && has_skill_tool;
 
         if !skill_due {
+            self.throttle.review_completed(); // rollback
             return None;
         }
 
@@ -298,6 +322,7 @@ impl LearningCoordinator {
         };
 
         if self.dedup.is_duplicate(dedup_key) {
+            self.throttle.review_completed(); // rollback
             return None;
         }
 
@@ -345,7 +370,10 @@ impl LearningCoordinator {
         if !self.ghost_learning_enabled {
             return LearningDecision::Ignore;
         }
-        self.ghost_policy.decide(boundary)
+        self.ghost_policy
+            .lock()
+            .unwrap_or_else(recover_mutex)
+            .decide(boundary)
     }
 
     /// Get the ghost learning policy decision with turn count
@@ -358,7 +386,17 @@ impl LearningCoordinator {
             return LearningDecision::Ignore;
         }
         self.ghost_policy
+            .lock()
+            .unwrap_or_else(recover_mutex)
             .decide_with_turn_count(boundary, turn_count)
+    }
+
+    /// 从配置更新 ghost 学习策略（支持热重载）
+    pub fn update_ghost_policy(&self, config: &blockcell_core::config::GhostLearningConfig) {
+        let new_policy = GhostLearningPolicy::from_config(config);
+        if let Ok(mut guard) = self.ghost_policy.lock() {
+            *guard = new_policy;
+        }
     }
 
     /// Check if self-improve review is enabled

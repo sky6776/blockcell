@@ -448,6 +448,14 @@ pub fn should_extract_auto_memory_with_config(
 /// - `model`: 模型名称
 /// - `messages`: 消息历史
 /// - `cursor`: 用于验证提取条件的游标
+///
+/// ## Deprecated
+/// This standalone function uses hardcoded constants instead of runtime `Layer5Config` values.
+/// Use `AutoMemoryExtractor::extract()` instead, which respects the full config.
+#[deprecated(
+    since = "0.1.5",
+    note = "Use `AutoMemoryExtractor::extract()` instead; this function ignores runtime Layer5Config"
+)]
 #[allow(dead_code)]
 pub async fn extract_auto_memory(
     provider_pool: Arc<ProviderPool>,

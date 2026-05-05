@@ -122,12 +122,19 @@ pub fn should_extract_memory(messages: &[ChatMessage], state: &SessionMemoryStat
     }
 
     // 3. 工具调用检查（优先使用消息 ID）
-    let tool_calls = count_tool_calls_since(
-        messages,
-        state.last_memory_message_id.as_deref(),
-        state.last_memory_message_index,
-    );
-    let has_met_tool_threshold = tool_calls >= state.config.tool_calls_between_updates;
+    // On first extraction (!state.initialized), skip the tool call threshold
+    // because count_tool_calls_since returns 0 when last_memory_message_index
+    // is None, which would block the first extraction in tool-intensive conversations.
+    let has_met_tool_threshold = if !state.initialized {
+        true
+    } else {
+        let tool_calls = count_tool_calls_since(
+            messages,
+            state.last_memory_message_id.as_deref(),
+            state.last_memory_message_index,
+        );
+        tool_calls >= state.config.tool_calls_between_updates
+    };
 
     // 4. 安全条件：最后一条消息无 tool_calls
     let has_tool_calls_in_last = has_tool_calls_in_last_assistant_turn(messages);

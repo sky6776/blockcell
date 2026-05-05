@@ -397,11 +397,11 @@ impl GhostLedger {
             id,
             boundary_kind,
             subject_key,
-            status,
+            _status,
             summary,
             metadata_json,
             created_at,
-            updated_at,
+            _updated_at,
         ) in rows
         {
             tx.execute(
@@ -417,11 +417,11 @@ impl GhostLedger {
                 id,
                 boundary_kind,
                 subject_key,
-                status,
+                status: "reviewing".to_string(), // 返回事务提交后的实际状态
                 summary,
                 metadata: decode_json(&metadata_json)?,
                 created_at,
-                updated_at,
+                updated_at: now.clone(), // 更新为当前时间
             });
         }
 
@@ -914,9 +914,11 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(claimed_ids, vec![pending_id.as_str(), failed_id.as_str()]);
-        assert!(claimed.iter().all(|episode| {
-            episode.status == "pending_review" || episode.status == "review_failed"
-        }));
+        // After the fix, claim_reviewable_episodes returns records with
+        // the post-claim status ("reviewing"), not the pre-claim status.
+        assert!(claimed
+            .iter()
+            .all(|episode| { episode.status == "reviewing" }));
         assert_eq!(
             ledger.get_episode(&pending_id).unwrap().unwrap().status,
             "reviewing"

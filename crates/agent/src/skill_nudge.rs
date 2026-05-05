@@ -271,6 +271,34 @@ impl SkillNudgeEngine {
         self.turns_since_memory
     }
 
+    /// Read-only check: would a memory nudge trigger WITHOUT resetting counters?
+    /// Used by LearningCoordinator to check dedup before committing to a nudge.
+    pub fn would_memory_nudge(&self) -> bool {
+        if !self.config.enabled {
+            return false;
+        }
+        if let Some(last) = self.last_memory_nudge_time {
+            if last.elapsed().as_secs() < self.min_nudge_interval_secs {
+                return false;
+            }
+        }
+        self.turns_since_memory >= self.config.memory_soft_threshold
+    }
+
+    /// Read-only check: would a skill nudge trigger WITHOUT resetting counters?
+    /// Used by LearningCoordinator to check dedup before committing to a nudge.
+    pub fn would_skill_nudge(&self) -> bool {
+        if !self.config.enabled {
+            return false;
+        }
+        if let Some(last) = self.last_skill_nudge_time {
+            if last.elapsed().as_secs() < self.min_nudge_interval_secs {
+                return false;
+            }
+        }
+        self.iterations_since_skill >= self.config.skill_soft_threshold
+    }
+
     /// 重置所有计数器
     pub fn reset(&mut self) {
         self.iterations_since_skill = 0;

@@ -551,20 +551,20 @@ pub enum PostSamplingAction {
 /// ## 游标状态同步
 /// 如果后台任务设置了 `cursor_reload_flag`，会先重新加载游标状态。
 /// 这确保了后台提取任务完成后，主线程使用最新的游标状态。
-pub fn evaluate_memory_hooks(
+///
+/// ## 为什么是 async
+/// 此函数从 async 运行时循环中调用。之前使用 `block_in_place + block_on`
+/// 在单线程 runtime 或 `multi_thread` 且只有 1 个 worker 时会死锁，
+/// 因为 `block_on` 需要另一个 worker 来驱动被阻塞的 future。
+/// 改为直接 await 可安全适用于所有 runtime 配置。
+pub async fn evaluate_memory_hooks(
     memory_system: &mut MemorySystem,
     messages: &[ChatMessage],
     current_tokens: usize,
 ) -> PostSamplingAction {
     // 检查是否需要重新加载游标状态（后台提取完成后）
     if memory_system.check_and_clear_cursor_reload() {
-        // 注意：这里使用 block_in_place 是安全的，因为：
-        // 1. 这是在主 runtime 循环中调用，tokio runtime 已经存在
-        // 2. cursor_manager.load() 是快速操作（读取一个小文件）
-        // 3. 我们需要同步地获取最新状态才能做决策
-        if let Err(e) = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(memory_system.reload_cursors())
-        }) {
+        if let Err(e) = memory_system.reload_cursors().await {
             tracing::warn!(error = %e, "[evaluate_memory_hooks] Failed to reload cursor state");
         }
     }
@@ -671,8 +671,8 @@ mod tests {
         assert!(!memory_system.should_compact(1_000_000));
     }
 
-    #[test]
-    fn test_evaluate_memory_hooks_none() {
+    #[tokio::test]
+    async fn test_evaluate_memory_hooks_none() {
         let config = MemorySystemConfig::default();
         let mut memory_system = MemorySystem::new(
             config,
@@ -683,12 +683,12 @@ mod tests {
 
         let messages = vec![ChatMessage::user("Hello"), ChatMessage::assistant("Hi!")];
 
-        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100);
+        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100).await;
         assert!(matches!(action, PostSamplingAction::None));
     }
 
-    #[test]
-    fn test_evaluate_memory_hooks_compact() {
+    #[tokio::test]
+    async fn test_evaluate_memory_hooks_compact() {
         let config = MemorySystemConfig {
             token_budget: 100,
             layer4: Layer4Config {
@@ -705,7 +705,7 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("Test")];
-        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100);
+        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100).await;
 
         assert!(matches!(action, PostSamplingAction::Compact));
     }
@@ -820,8 +820,8 @@ mod tests {
         assert!(recovery.is_empty());
     }
 
-    #[test]
-    fn test_post_sampling_action_order() {
+    #[tokio::test]
+    async fn test_post_sampling_action_order() {
         // 测试 Compact 优先级高于其他操作
         let config = MemorySystemConfig {
             token_budget: 100,
@@ -849,7 +849,7 @@ mod tests {
             })
             .collect();
 
-        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100);
+        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100).await;
 
         // Compact 优先级最高
         assert!(matches!(action, PostSamplingAction::Compact));

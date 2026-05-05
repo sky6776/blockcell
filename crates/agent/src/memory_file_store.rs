@@ -2,7 +2,6 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use blockcell_core::{Error, Paths, Result};
@@ -249,11 +248,12 @@ impl MemoryFileStore {
             MemoryFileTarget::User => "## User Profile Memory",
             MemoryFileTarget::Memory => "## Durable Working Memory",
         };
-        Ok(Some(
-            format!("{}\n{}", title, entries.join("\n- "))
-                .replace("\n", "\n- ")
-                .replacen("- ##", "##", 1),
-        ))
+        let body = entries
+            .iter()
+            .map(|e| format!("- {}", e))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(Some(format!("{}\n{}", title, body)))
     }
 
     fn path_for(&self, target: MemoryFileTarget) -> &Path {
@@ -419,7 +419,11 @@ impl FileWriteGuard {
                             path.display()
                         )));
                     }
-                    thread::sleep(Duration::from_millis(25));
+                    // Yield the CPU without blocking the tokio worker thread.
+                    // thread::sleep would block the worker; spin_loop + yield_now
+                    // lets the OS scheduler switch to another task.
+                    std::hint::spin_loop();
+                    std::thread::yield_now();
                 }
                 Err(err) => return Err(err.into()),
             }

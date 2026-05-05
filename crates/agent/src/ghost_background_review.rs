@@ -248,6 +248,12 @@ async fn run_restricted_review_tool_loop(
     let mut rounds_used = 0usize;
     let mut stop_reason = "max_rounds".to_string();
 
+    // Create stores once before the loop — avoids re-opening per tool call
+    let memory_file_store: blockcell_tools::MemoryFileStoreHandle =
+        Arc::new(MemoryFileStore::open(paths)?);
+    let skill_file_store: blockcell_tools::SkillFileStoreHandle =
+        Arc::new(SkillFileStore::open(paths)?);
+
     for _round in 0..REVIEW_TOOL_LOOP_MAX_ROUNDS {
         rounds_used += 1;
         let response = provider.chat(&messages, &tools).await?;
@@ -277,7 +283,13 @@ async fn run_restricted_review_tool_loop(
             let result = registry
                 .execute(
                     &call.name,
-                    review_tool_context(paths, snapshot, config)?,
+                    review_tool_context_with_stores(
+                        paths,
+                        snapshot,
+                        config,
+                        &memory_file_store,
+                        &skill_file_store,
+                    )?,
                     call.arguments.clone(),
                 )
                 .await;
@@ -376,10 +388,12 @@ fn build_restricted_review_messages(snapshot: &GhostEpisodeSnapshot) -> Vec<Chat
     ]
 }
 
-fn review_tool_context(
+fn review_tool_context_with_stores(
     paths: &Paths,
     snapshot: &GhostEpisodeSnapshot,
     config: &Config,
+    memory_file_store: &blockcell_tools::MemoryFileStoreHandle,
+    skill_file_store: &blockcell_tools::SkillFileStoreHandle,
 ) -> Result<ToolContext> {
     Ok(ToolContext {
         workspace: paths.workspace(),
@@ -394,9 +408,9 @@ fn review_tool_context(
         permissions: PermissionSet::new(),
         task_manager: None,
         memory_store: None,
-        memory_file_store: Some(Arc::new(MemoryFileStore::open(paths)?)),
+        memory_file_store: Some(Arc::clone(memory_file_store)),
         ghost_memory_lifecycle: None,
-        skill_file_store: Some(Arc::new(SkillFileStore::open(paths)?)),
+        skill_file_store: Some(Arc::clone(skill_file_store)),
         session_search: Some(Arc::new(EpisodeSessionSearch::new(snapshot)?)),
         outbound_tx: None,
         spawn_handle: None,

@@ -155,36 +155,44 @@ impl Tool for MemoryManageTool {
         let action = params
             .get("action")
             .and_then(|value| value.as_str())
-            .unwrap();
+            .ok_or_else(|| Error::Tool("Missing or non-string parameter: action".to_string()))?;
         let target = params
             .get("target")
             .and_then(|value| value.as_str())
-            .unwrap();
+            .ok_or_else(|| Error::Tool("Missing or non-string parameter: target".to_string()))?;
         let result = match action {
             "add" => store.add_file_memory_json(
                 target,
                 params
                     .get("content")
                     .and_then(|value| value.as_str())
-                    .unwrap(),
+                    .ok_or_else(|| {
+                        Error::Tool("Missing or non-string parameter: content".to_string())
+                    })?,
             ),
             "replace" => store.replace_file_memory_json(
                 target,
                 params
                     .get("old_text")
                     .and_then(|value| value.as_str())
-                    .unwrap(),
+                    .ok_or_else(|| {
+                        Error::Tool("Missing or non-string parameter: old_text".to_string())
+                    })?,
                 params
                     .get("content")
                     .and_then(|value| value.as_str())
-                    .unwrap(),
+                    .ok_or_else(|| {
+                        Error::Tool("Missing or non-string parameter: content".to_string())
+                    })?,
             ),
             "remove" => store.remove_file_memory_json(
                 target,
                 params
                     .get("old_text")
                     .and_then(|value| value.as_str())
-                    .unwrap(),
+                    .ok_or_else(|| {
+                        Error::Tool("Missing or non-string parameter: old_text".to_string())
+                    })?,
             ),
             "undo_latest" => store.restore_latest_file_memory_json(target),
             _ => unreachable!("validated action"),
@@ -399,7 +407,10 @@ impl Tool for MemoryUpsertTool {
     async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
         let store = get_memory_store(&ctx)?;
 
-        let content = params["content"].as_str().unwrap();
+        let content = params
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Tool("Missing or non-string parameter: content".to_string()))?;
         let scope = params
             .get("scope")
             .and_then(|v| v.as_str())
@@ -541,11 +552,16 @@ impl Tool for MemoryForgetTool {
 
     async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
         let store = get_memory_store(&ctx)?;
-        let action = params["action"].as_str().unwrap();
+        let action = params
+            .get("action")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Tool("Missing or non-string parameter: action".to_string()))?;
 
         match action {
             "delete" => {
-                let id = params["id"].as_str().unwrap();
+                let id = params.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
+                    Error::Tool("Missing or non-string parameter: id".to_string())
+                })?;
                 let deleted = store.soft_delete(id)?;
                 Ok(json!({
                     "action": "delete",
@@ -569,7 +585,9 @@ impl Tool for MemoryForgetTool {
                 }))
             }
             "restore" => {
-                let id = params["id"].as_str().unwrap();
+                let id = params.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
+                    Error::Tool("Missing or non-string parameter: id".to_string())
+                })?;
                 let restored = store.restore(id)?;
                 Ok(json!({
                     "action": "restore",

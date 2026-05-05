@@ -59,8 +59,8 @@ mod tests {
     }
 
     /// 测试 Post-Sampling Hook 评估
-    #[test]
-    fn test_post_sampling_hook_none() {
+    #[tokio::test]
+    async fn test_post_sampling_hook_none() {
         let config = MemorySystemConfig::default();
         let mut memory_system = MemorySystem::new(
             config,
@@ -71,13 +71,13 @@ mod tests {
 
         let messages = vec![ChatMessage::user("Hello"), ChatMessage::assistant("Hi!")];
 
-        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100);
+        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100).await;
         assert!(matches!(action, PostSamplingAction::None));
     }
 
     /// 测试 Post-Sampling Hook Compact 触发
-    #[test]
-    fn test_post_sampling_hook_compact() {
+    #[tokio::test]
+    async fn test_post_sampling_hook_compact() {
         let config = MemorySystemConfig {
             token_budget: 100,
             layer4: Layer4Config {
@@ -94,7 +94,7 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("Test")];
-        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100);
+        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100).await;
 
         assert!(matches!(action, PostSamplingAction::Compact));
     }
@@ -1322,8 +1322,8 @@ _No errors encountered._
     /// 测试 PostSamplingAction 优先级
     ///
     /// 验证 Compact > Session Memory > Auto Memory 的优先级顺序
-    #[test]
-    fn test_post_sampling_action_priority() {
+    #[tokio::test]
+    async fn test_post_sampling_action_priority() {
         // Compact 最高优先级
         let config = MemorySystemConfig {
             token_budget: 100,
@@ -1353,7 +1353,7 @@ _No errors encountered._
             .collect();
 
         // 当 Token 超过阈值时，应返回 Compact 而不是其他 Action
-        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100);
+        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100).await;
 
         // Compact 优先级最高
         assert!(matches!(action, PostSamplingAction::Compact));

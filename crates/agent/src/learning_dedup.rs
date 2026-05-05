@@ -26,6 +26,12 @@ impl LearningDedup {
     /// Returns `true` if the key is a duplicate (seen within the window).
     /// Returns `false` and records the key if it's new or expired.
     pub fn is_duplicate(&self, key: &str) -> bool {
+        // When dedup_window_secs is 0, deduplication is effectively disabled.
+        // Return early to avoid wasteful inserts into the map.
+        if self.dedup_window_secs == 0 {
+            return false;
+        }
+
         let mut recent = self.recent.lock().unwrap_or_else(|e| {
             tracing::warn!("LearningDedup Mutex poisoned, recovering");
             e.into_inner()

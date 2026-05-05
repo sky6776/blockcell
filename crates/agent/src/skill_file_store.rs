@@ -2,7 +2,6 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use blockcell_core::{Error, Paths, Result};
@@ -586,7 +585,7 @@ fn render_meta_yaml(name: &str, description: &str) -> String {
 
 fn yaml_scalar(value: &str) -> String {
     serde_yaml::to_string(value)
-        .unwrap_or_else(|_| format!("\"{}\"", value.replace('"', "\\\"")))
+        .unwrap_or_else(|_| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
         .trim()
         .trim_start_matches("---")
         .trim()
@@ -632,7 +631,9 @@ impl FileWriteGuard {
                             path.display()
                         )));
                     }
-                    thread::sleep(Duration::from_millis(25));
+                    // Yield the CPU without blocking the tokio worker thread.
+                    std::hint::spin_loop();
+                    std::thread::yield_now();
                 }
                 Err(err) => return Err(err.into()),
             }
@@ -882,6 +883,19 @@ fn copy_dir_recursive(source: &Path, dest: &Path) -> Result<()> {
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let source_path = entry.path();
+
+        // Check for symbolic links to prevent symlink attacks
+        // Use symlink_metadata to detect symlinks without following them
+        if let Ok(meta) = fs::symlink_metadata(&source_path) {
+            if meta.file_type().is_symlink() {
+                tracing::warn!(
+                    path = %source_path.display(),
+                    "Skipping symbolic link in skill directory to prevent path traversal"
+                );
+                continue;
+            }
+        }
+
         let dest_path = dest.join(entry.file_name());
         if source_path.is_dir() {
             copy_dir_recursive(&source_path, &dest_path)?;

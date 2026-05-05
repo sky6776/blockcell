@@ -25,22 +25,6 @@ fn looks_like_ghost_maintenance_log(text: &str) -> bool {
         || t.contains("feed routine")
 }
 
-fn extract_result_ids(results: &Value) -> Vec<String> {
-    results
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|r| {
-                    r.get("item")
-                        .and_then(|i| i.get("id"))
-                        .and_then(|id| id.as_str())
-                        .map(|s| s.to_string())
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-}
-
 fn prune_ghost_maintenance_logs(store: &crate::MemoryStoreHandle, dry_run: bool) -> Result<Value> {
     let query_params = json!({
         "scope": "short_term",
@@ -50,27 +34,37 @@ fn prune_ghost_maintenance_logs(store: &crate::MemoryStoreHandle, dry_run: bool)
     });
 
     let results = store.query_json(query_params)?;
-    let mut ids = extract_result_ids(&results);
-    ids.sort();
-    ids.dedup();
 
     let mut matched = 0usize;
     let mut deleted = 0usize;
+    let mut matched_ids: Vec<String> = Vec::new();
 
     for r in results.as_array().unwrap_or(&vec![]) {
         let item = match r.get("item") {
             Some(i) => i,
             None => continue,
         };
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
         let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
         let content = item.get("content").and_then(|v| v.as_str()).unwrap_or("");
         if looks_like_ghost_maintenance_log(title) || looks_like_ghost_maintenance_log(content) {
             matched += 1;
+            matched_ids.push(id);
         }
     }
 
+    matched_ids.sort();
+    matched_ids.dedup();
+
     if !dry_run {
-        for id in ids {
+        for id in matched_ids {
             if store.soft_delete(&id)? {
                 deleted += 1;
             }

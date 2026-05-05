@@ -3202,6 +3202,9 @@ impl AgentRuntime {
         if !self.ghost_learning_enabled() {
             return Ok(None);
         }
+        // 从当前配置刷新 ghost 策略（支持热重载）
+        self.learning_coordinator
+            .update_ghost_policy(&self.config.agents.ghost.learning);
         let decision = self.learning_coordinator.ghost_decide(&boundary);
         persist_ghost_learning_boundary_with_decision(
             &self.config,
@@ -3333,8 +3336,12 @@ impl AgentRuntime {
             .iter()
             .filter(|message| message.role == "user")
             .count() as u32;
-        let decision = GhostLearningPolicy::from_config(&self.config.agents.ghost.learning)
-            .decide_with_turn_count(&boundary, Some(turn_count));
+        // 从当前配置刷新 ghost 策略（支持热重载）
+        self.learning_coordinator
+            .update_ghost_policy(&self.config.agents.ghost.learning);
+        let decision = self
+            .learning_coordinator
+            .ghost_decide_with_turn_count(&boundary, Some(turn_count));
 
         persist_ghost_learning_boundary_with_decision(
             &self.config,
@@ -6406,7 +6413,8 @@ impl AgentRuntime {
                 memory_system,
                 &history,
                 current_tokens,
-            );
+            )
+            .await;
 
             match action {
                 crate::memory_system::PostSamplingAction::ExtractSessionMemory => {
