@@ -306,3 +306,46 @@ impl ToolCallAccumulator {
         }
     }
 }
+
+/// DeepSeek thinking mode 要求：所有包含 tool_calls 的 assistant 消息
+/// 必须携带 `reasoning_content` 字段回传 API，否则会触发 400 错误。
+/// 此函数检查并修复缺失的 reasoning_content。
+///
+/// 仅在 thinking mode 开启且模型为 DeepSeek thinking 模型时生效。
+pub fn sanitize_thinking_mode_messages(
+    messages: &mut Vec<ChatMessage>,
+    model: &str,
+    reasoning_effort: Option<&str>,
+) {
+    // 如果 thinking mode 未开启，不做任何处理
+    if reasoning_effort.is_none() || reasoning_effort == Some("off") {
+        return;
+    }
+    // 如果模型不是 DeepSeek thinking 模型，跳过
+    if !is_thinking_model(model) {
+        return;
+    }
+    // 对于有 tool_calls 但没有 reasoning_content 的 assistant 消息，
+    // 注入空 reasoning_content 占位符以避免 400 错误
+    for msg in messages.iter_mut() {
+        if msg.role == "assistant" {
+            if msg
+                .tool_calls
+                .as_ref()
+                .is_some_and(|tc| !tc.is_empty())
+            {
+                if msg.reasoning_content.is_none() {
+                    msg.reasoning_content = Some(String::new());
+                }
+            }
+        }
+    }
+}
+
+/// 判断模型是否为 DeepSeek thinking 模型（需要 reasoning_content 回传）。
+pub fn is_thinking_model(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("deepseek-v4")
+        || lower.contains("deepseek-reasoner")
+        || lower.contains("deepseek-r1")
+}

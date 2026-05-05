@@ -78,7 +78,7 @@ pub enum ToolCallMode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelEntry {
-    /// 模型名称，例如 "deepseek-chat"、"claude-3-5-sonnet"
+    /// 模型名称，例如 "deepseek-v4-pro"、"claude-3-5-sonnet"
     pub model: String,
     /// 对应 providers 表中的 key，例如 "deepseek"、"anthropic"
     pub provider: String,
@@ -163,6 +163,13 @@ pub struct AgentDefaults {
     /// Allowed MCP tool names visible to this agent.
     #[serde(default)]
     pub allowed_mcp_tools: Vec<String>,
+    /// 推理强度控制（DeepSeek V4 thinking mode 等）：
+    /// - "off": 禁用思考 (thinking.type = disabled)
+    /// - "low"/"medium"/"high": reasoning_effort = high (DeepSeek 默认)
+    /// - "max": reasoning_effort = max (最深推理)
+    /// - None: 不发送任何参数，由 provider 自行决定
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 fn default_workspace() -> String {
@@ -170,7 +177,7 @@ fn default_workspace() -> String {
 }
 
 fn default_model() -> String {
-    "".to_string()
+    "deepseek-v4-pro".to_string()
 }
 
 fn default_max_tokens() -> u32 {
@@ -194,7 +201,7 @@ fn default_llm_retry_delay_ms() -> u64 {
 }
 
 fn default_max_context_tokens() -> u32 {
-    32000
+    1_048_576 // 1M 上下文，适配 DeepSeek V4 Pro 等 1M 上下文模型
 }
 
 fn default_true() -> bool {
@@ -219,6 +226,7 @@ impl Default for AgentDefaults {
             model_pool: Vec::new(),
             allowed_mcp_servers: Vec::new(),
             allowed_mcp_tools: Vec::new(),
+            reasoning_effort: None,
         }
     }
 }

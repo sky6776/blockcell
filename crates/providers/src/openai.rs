@@ -7,7 +7,7 @@ use blockcell_core::{Error, Result};
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
@@ -37,6 +37,12 @@ pub struct OpenAIProvider {
     max_tokens: u32,
     temperature: f32,
     tool_call_mode: AtomicU8,
+    /// Provider 名称（如 "deepseek"、"openrouter"、"nvidia-nim" 等），
+    /// 用于判断 reasoning_effort 参数的注入方式。
+    provider_name: String,
+    /// 推理强度配置（如 "off"、"high"、"max"），
+    /// None 表示不注入任何 thinking/reasoning_effort 参数。
+    reasoning_effort: Option<String>,
 }
 
 struct TextToolMarkupStreamFilter {
@@ -192,6 +198,8 @@ impl OpenAIProvider {
             None,
             &[],
             ToolCallMode::Native,
+            "",
+            None,
         )
     }
 
@@ -206,6 +214,8 @@ impl OpenAIProvider {
         global_proxy: Option<&str>,
         no_proxy: &[String],
         tool_call_mode: ToolCallMode,
+        provider_name: &str,
+        reasoning_effort: Option<&str>,
     ) -> Self {
         let resolved_base = api_base
             .unwrap_or("https://api.openai.com/v1")
@@ -226,6 +236,8 @@ impl OpenAIProvider {
             max_tokens,
             temperature,
             tool_call_mode: AtomicU8::new(Self::mode_to_u8(tool_call_mode)),
+            provider_name: provider_name.to_string(),
+            reasoning_effort: reasoning_effort.map(|s| s.to_string()),
         }
     }
 
@@ -1102,6 +1114,57 @@ impl OpenAIProvider {
         result
     }
 
+    /// 根据 reasoning_effort 配置和 provider 名称，向请求 body 注入
+    /// thinking / reasoning_effort / chat_template_kwargs 参数。
+    ///
+    /// 仅对已知支持 thinking/reasoning 的 provider 注入参数：
+    /// - DeepSeek 原生及 OpenRouter/Novita/Fireworks/SGLang 等中继使用
+    ///   顶层 `thinking` 和 `reasoning_effort` 字段
+    /// - NVIDIA NIM 使用 `chat_template_kwargs` 包装
+    /// - 其他 provider（OpenAI、Groq、Kimi、Zhipu 等）不支持，不注入
+    pub fn apply_reasoning_effort(
+        body: &mut Value,
+        effort: Option<&str>,
+        provider_name: &str,
+    ) {
+        let Some(effort) = effort else { return };
+        // 仅对支持 thinking/reasoning 的 provider 生效
+        if !supports_thinking_mode(provider_name) {
+            return;
+        }
+        let normalized = effort.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "off" | "disabled" | "none" | "false" => {
+                if is_nvidia_nim(provider_name) {
+                    body["chat_template_kwargs"] = json!({"thinking": false});
+                } else {
+                    body["thinking"] = json!({"type": "disabled"});
+                }
+            }
+            "low" | "minimal" | "medium" | "mid" | "high" | "" => {
+                if is_nvidia_nim(provider_name) {
+                    body["chat_template_kwargs"] =
+                        json!({"thinking": true, "reasoning_effort": "high"});
+                } else {
+                    body["reasoning_effort"] = json!("high");
+                    body["thinking"] = json!({"type": "enabled"});
+                }
+            }
+            "xhigh" | "max" | "highest" => {
+                if is_nvidia_nim(provider_name) {
+                    body["chat_template_kwargs"] =
+                        json!({"thinking": true, "reasoning_effort": "max"});
+                } else {
+                    body["reasoning_effort"] = json!("max");
+                    body["thinking"] = json!({"type": "enabled"});
+                }
+            }
+            _ => {
+                // 未知值不修改，由 provider 自行决定
+            }
+        }
+    }
+
     /// Send a chat request to the API.
     async fn send_request(
         &self,
@@ -1145,7 +1208,15 @@ impl OpenAIProvider {
         };
         info!(url = %url, model = %self.model, tools_count = tools.len(), messages_count = messages.len(), mode = %mode, "Calling LLM");
 
-        let request_body = serde_json::to_string(&request)
+        // 序列化为 Value 以便注入 reasoning_effort/thinking/chat_template_kwargs
+        let mut body: Value = serde_json::to_value(&request)
+            .map_err(|e| Error::Provider(format!("Failed to serialize request: {}", e)))?;
+        Self::apply_reasoning_effort(
+            &mut body,
+            self.reasoning_effort.as_deref(),
+            &self.provider_name,
+        );
+        let request_body = serde_json::to_string(&body)
             .map_err(|e| Error::Provider(format!("Failed to serialize request: {}", e)))?;
         debug!(body_len = request_body.len(), "Request body prepared");
         debug!(target: "chat::request", request_body, "Request detail");
@@ -1338,6 +1409,15 @@ struct StreamRequest {
     max_tokens: u32,
     temperature: f32,
     stream: bool,
+    /// 流式请求中包含 token 用量统计（DeepSeek V4 等）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+}
+
+/// 流式请求选项：让服务端在最后一个 chunk 中返回 usage 统计。
+#[derive(Debug, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[async_trait]
@@ -1512,17 +1592,29 @@ impl Provider for OpenAIProvider {
             max_tokens: self.max_tokens,
             temperature: self.temperature,
             stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
         };
 
+        // 序列化为 Value 以便注入 reasoning_effort/thinking/chat_template_kwargs
+        let mut body: Value = serde_json::to_value(&request)
+            .map_err(|e| Error::Provider(format!("Failed to serialize stream request: {}", e)))?;
+        Self::apply_reasoning_effort(
+            &mut body,
+            self.reasoning_effort.as_deref(),
+            &self.provider_name,
+        );
+
         info!(url = %url, model = %self.model, "Starting streaming LLM call");
-        debug!(target: "chat::request", request = serde_json::to_string(&request).unwrap_or_default(), "Request detail");
+        debug!(target: "chat::request", request = serde_json::to_string(&body).unwrap_or_default(), "Request detail");
 
         let response = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
-            .json(&request)
+            .json(&body)
             .send()
             .await
             .map_err(|e| Error::Provider(format!("Stream request failed: {}", e)))?;
@@ -1697,6 +1789,101 @@ impl Provider for OpenAIProvider {
 mod tests {
     use super::*;
     use blockcell_core::types::ChatMessage;
+
+    #[test]
+    fn test_apply_reasoning_effort_deepseek_max() {
+        let mut body = json!({"model": "deepseek-v4-pro", "messages": []});
+        OpenAIProvider::apply_reasoning_effort(&mut body, Some("max"), "deepseek");
+        assert_eq!(body["reasoning_effort"].as_str(), Some("max"));
+        assert_eq!(
+            body.pointer("/thinking/type").and_then(Value::as_str),
+            Some("enabled")
+        );
+    }
+
+    #[test]
+    fn test_apply_reasoning_effort_deepseek_off() {
+        let mut body = json!({"model": "deepseek-v4-pro", "messages": []});
+        OpenAIProvider::apply_reasoning_effort(&mut body, Some("off"), "deepseek");
+        assert_eq!(
+            body.pointer("/thinking/type").and_then(Value::as_str),
+            Some("disabled")
+        );
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_apply_reasoning_effort_nvidia_nim_max() {
+        let mut body = json!({"model": "deepseek-v4-pro", "messages": []});
+        OpenAIProvider::apply_reasoning_effort(&mut body, Some("max"), "nvidia-nim");
+        assert_eq!(
+            body.pointer("/chat_template_kwargs/thinking")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            body.pointer("/chat_template_kwargs/reasoning_effort")
+                .and_then(Value::as_str),
+            Some("max")
+        );
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_apply_reasoning_effort_nvidia_nim_off() {
+        let mut body = json!({"model": "deepseek-v4-pro", "messages": []});
+        OpenAIProvider::apply_reasoning_effort(&mut body, Some("off"), "nvidia-nim");
+        assert_eq!(
+            body.pointer("/chat_template_kwargs/thinking")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(body
+            .pointer("/chat_template_kwargs/reasoning_effort")
+            .is_none());
+    }
+
+    #[test]
+    fn test_apply_reasoning_effort_none_does_nothing() {
+        let mut body = json!({"model": "deepseek-v4-pro", "messages": []});
+        OpenAIProvider::apply_reasoning_effort(&mut body, None, "deepseek");
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn test_apply_reasoning_effort_unsupported_provider_not_affected() {
+        // OpenAI、Groq、Kimi 等不支持 thinking 模式，不应注入任何参数
+        let mut body = json!({"model": "gpt-4o", "messages": []});
+        OpenAIProvider::apply_reasoning_effort(&mut body, Some("high"), "openai");
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("chat_template_kwargs").is_none());
+
+        let mut body2 = json!({"model": "moonshot-v1", "messages": []});
+        OpenAIProvider::apply_reasoning_effort(&mut body2, Some("max"), "kimi");
+        assert!(body2.get("thinking").is_none());
+        assert!(body2.get("reasoning_effort").is_none());
+
+        let mut body3 = json!({"model": "llama3", "messages": []});
+        OpenAIProvider::apply_reasoning_effort(&mut body3, Some("high"), "groq");
+        assert!(body3.get("thinking").is_none());
+        assert!(body3.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_apply_reasoning_effort_openrouter_supported() {
+        // OpenRouter 作为 DeepSeek 中继，应支持 thinking 模式
+        let mut body = json!({"model": "deepseek-v4-pro", "messages": []});
+        OpenAIProvider::apply_reasoning_effort(&mut body, Some("high"), "openrouter");
+        assert_eq!(body["reasoning_effort"].as_str(), Some("high"));
+        assert_eq!(
+            body.pointer("/thinking/type").and_then(Value::as_str),
+            Some("enabled")
+        );
+    }
 
     #[test]
     fn test_parse_xml_tool_call() {
@@ -2049,4 +2236,24 @@ ls -la
         assert_eq!(sanitized[2].role, "tool");
         assert_eq!(sanitized[2].tool_call_id.as_deref(), Some("call-1"));
     }
+}
+
+/// 判断 provider 是否为 NVIDIA NIM 类型。
+/// NVIDIA NIM 使用 `chat_template_kwargs` 而非顶层 `thinking`/`reasoning_effort`。
+fn is_nvidia_nim(provider_name: &str) -> bool {
+    let lower = provider_name.to_ascii_lowercase();
+    lower.contains("nvidia") || lower.contains("nim")
+}
+
+/// 判断 provider 是否支持 thinking/reasoning 模式参数。
+/// 仅 DeepSeek 系列及其中继（OpenRouter/Novita/Fireworks/SGLang）和 NVIDIA NIM 支持。
+/// OpenAI、Groq、Kimi、Zhipu 等不支持，注入这些参数会导致 API 报错。
+fn supports_thinking_mode(provider_name: &str) -> bool {
+    let lower = provider_name.to_ascii_lowercase();
+    lower.contains("deepseek")
+        || lower.contains("openrouter")
+        || lower.contains("novita")
+        || lower.contains("fireworks")
+        || lower.contains("sglang")
+        || is_nvidia_nim(provider_name)
 }

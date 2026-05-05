@@ -117,10 +117,12 @@ const EXAMPLE_CONFIG: &str = r#"{
       "maxTokens": 8192,
       "temperature": 0.7,
       "maxToolIterations": 20,
+      "maxContextTokens": 1048576,
+      "reasoningEffort": "high",
       "modelPool": [
         {
           "provider": "deepseek",
-          "model": "deepseek-chat",
+          "model": "deepseek-v4-pro",
           "weight": 1,
           "priority": 1
         }

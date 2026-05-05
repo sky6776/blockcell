@@ -101,6 +101,7 @@ pub fn create_provider_with_tool_mode(
 ) -> anyhow::Result<Box<dyn Provider>> {
     let max_tokens = config.agents.defaults.max_tokens;
     let temperature = temperature_override.unwrap_or(config.agents.defaults.temperature);
+    let reasoning_effort = config.agents.defaults.reasoning_effort.as_deref();
 
     // 优先级1：显式指定
     // 优先级2：model 前缀推断
@@ -258,6 +259,8 @@ pub fn create_provider_with_tool_mode(
                         global_proxy,
                         no_proxy,
                         tool_call_mode.unwrap_or(ToolCallMode::Native),
+                        effective_provider,
+                        reasoning_effort,
                     )) as Box<dyn Provider>)
                 }
             }

@@ -559,7 +559,7 @@ fn normalize_channel(input: &str) -> Option<&'static str> {
 
 fn default_model_for_provider(provider: &str) -> &'static str {
     match provider {
-        "deepseek" => "deepseek-chat",
+        "deepseek" => "deepseek-v4-pro",
         "openai" => "gpt-4o",
         "anthropic" => "claude-sonnet-4-20250514",
         "kimi" => "moonshot-v1-8k",
@@ -674,7 +674,7 @@ mod tests {
 
     #[test]
     fn test_default_model() {
-        assert_eq!(default_model_for_provider("deepseek"), "deepseek-chat");
+        assert_eq!(default_model_for_provider("deepseek"), "deepseek-v4-pro");
         assert_eq!(default_model_for_provider("openai"), "gpt-4o");
         assert_eq!(default_model_for_provider("kimi"), "moonshot-v1-8k");
         assert_eq!(default_model_for_provider("zhipu"), "glm-4");

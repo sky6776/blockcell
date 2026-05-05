@@ -181,6 +181,8 @@ pub(super) async fn handle_config_test_provider(
         None,
         &[],
         blockcell_core::config::ToolCallMode::Native,
+        "",
+        None,
     );
 
     match provider.chat(&test_messages, &[]).await {
