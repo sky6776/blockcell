@@ -261,6 +261,16 @@ impl SkillNudgeEngine {
         }
     }
 
+    /// 获取当前 iterations_since_skill 计数 (用于 coordinator 在 check 前捕获值)
+    pub fn iterations_since_skill(&self) -> u32 {
+        self.iterations_since_skill
+    }
+
+    /// 获取当前 turns_since_memory 计数 (用于 coordinator 在 check 前捕获值)
+    pub fn turns_since_memory(&self) -> u32 {
+        self.turns_since_memory
+    }
+
     /// 重置所有计数器
     pub fn reset(&mut self) {
         self.iterations_since_skill = 0;

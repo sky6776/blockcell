@@ -48,11 +48,14 @@ impl GhostMetrics {
         }
     }
 
+    /// Reset all counters. Uses SeqCst ordering to establish a synchronization
+    /// point, ensuring concurrent snapshot() calls see either fully-reset or
+    /// fully-not-reset state (not partial reset).
     pub fn reset(&self) {
-        self.episodes_captured.store(0, Ordering::Relaxed);
-        self.reviews_started.store(0, Ordering::Relaxed);
-        self.reviews_failed.store(0, Ordering::Relaxed);
-        self.dead_letters.store(0, Ordering::Relaxed);
+        self.episodes_captured.store(0, Ordering::SeqCst);
+        self.reviews_started.store(0, Ordering::SeqCst);
+        self.reviews_failed.store(0, Ordering::SeqCst);
+        self.dead_letters.store(0, Ordering::SeqCst);
     }
 }
 

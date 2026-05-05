@@ -42,10 +42,19 @@ fn default_version() -> String {
 /// Skill Progressive Index
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillIndex {
-    /// 所有已索引的 Skill
+    /// 所有已索引的 Skill (key: "category/name" or "name" for no-category skills)
     entries: HashMap<String, SkillIndexEntry>,
     /// 已加载完整内容的 Skill (name → content)
     loaded: HashMap<String, String>,
+}
+
+/// Build a composite key for the entries map to avoid name collisions across categories
+fn composite_key(category: &str, name: &str) -> String {
+    if category.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", category, name)
+    }
 }
 
 impl SkillIndex {
@@ -92,7 +101,7 @@ impl SkillIndex {
                 // 判断: 如果该目录直接包含 SKILL.md, 则它是一个无 category 的 skill
                 if path.join("SKILL.md").exists() {
                     let entry = Self::build_entry(&dir_name, "", &path);
-                    index.entries.insert(dir_name.clone(), entry);
+                    index.entries.insert(composite_key("", &dir_name), entry);
                 } else {
                     // 该目录是一个 category, 遍历其下的 skill 子目录
                     if let Ok(skill_entries) = std::fs::read_dir(&path) {
@@ -117,7 +126,9 @@ impl SkillIndex {
                                 continue;
                             }
                             let entry = Self::build_entry(&skill_dir_name, &dir_name, &skill_path);
-                            index.entries.insert(skill_dir_name.clone(), entry);
+                            index
+                                .entries
+                                .insert(composite_key(&dir_name, &skill_dir_name), entry);
                         }
                     }
                 }
@@ -323,8 +334,11 @@ impl SkillIndex {
             return Some(content.clone());
         }
 
-        // 从索引查找路径
-        let entry = self.entries.get(name)?;
+        // 从索引查找路径 — try exact key first, then search by name suffix
+        let entry = self
+            .entries
+            .get(name)
+            .or_else(|| self.entries.values().find(|e| e.name == name))?;
         let skill_md = entry.path.join("SKILL.md");
 
         if !skill_md.exists() {
@@ -579,10 +593,10 @@ mod tests {
 
         let index = SkillIndex::build_from_dir(&dir);
         assert_eq!(index.entries().len(), 2);
-        assert!(index.entries().contains_key("flask-deploy"));
-        assert!(index.entries().contains_key("hello"));
+        assert!(index.entries().contains_key("devops/flask-deploy"));
+        assert!(index.entries().contains_key("general/hello"));
 
-        let flask = index.entries().get("flask-deploy").unwrap();
+        let flask = index.entries().get("devops/flask-deploy").unwrap();
         assert_eq!(flask.category, "devops");
         assert_eq!(flask.description, "Deploy Flask apps");
         assert_eq!(flask.tools, vec!["exec", "write_file"]);
@@ -816,7 +830,7 @@ mod tests {
         std::fs::write(skill_dir.join("SKILL.md"), "# Versioned Skill").unwrap();
 
         let index = SkillIndex::build_from_dir(&dir);
-        let entry = index.entries().get("versioned-skill").unwrap();
+        let entry = index.entries().get("general/versioned-skill").unwrap();
         assert_eq!(entry.version, "2.1.0");
         assert_eq!(entry.updated_at.as_deref(), Some("2025-01-15T10:30:00Z"));
 
