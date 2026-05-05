@@ -159,11 +159,16 @@ impl LearningCoordinator {
         }
 
         // Check memory nudge (based on user turns)
+        // NOTE: check_memory_nudge() resets the counter internally on trigger,
+        // so we must capture the count BEFORE calling it to report the correct value.
         let mut engine = self.nudge_engine.lock().unwrap_or_else(recover_mutex);
+        let turns_before = engine.turns_since_memory();
         let memory_nudge = engine.check_memory_nudge();
         let memory_due = memory_nudge != NudgeResult::NoNudge && has_memory_store;
 
         // Check skill nudge (based on tool iterations)
+        // Same: capture count before check resets it
+        let iterations_before = engine.iterations_since_skill();
         let skill_nudge = engine.check_skill_nudge();
         let skill_due = skill_nudge != NudgeResult::NoNudge && has_skill_tool;
 
@@ -182,49 +187,35 @@ impl LearningCoordinator {
             return existing_action.cloned().unwrap_or(LearningAction::Skip);
         }
 
-        // Determine action
+        // Determine action — use pre-captured counts, not NudgeResult.count
+        // (NudgeResult.count is always 0 because check_*_nudge resets the counter on trigger)
         let new_action = if memory_due && skill_due {
-            let memory_count = match memory_nudge {
-                NudgeResult::SoftNudge { count } | NudgeResult::HardNudge { count } => count,
-                _ => 0,
-            };
-            let skill_count = match skill_nudge {
-                NudgeResult::SoftNudge { count } | NudgeResult::HardNudge { count } => count,
-                _ => 0,
-            };
             LearningAction::CombinedReview {
                 memory_trigger: MemoryTrigger::NudgeThreshold {
-                    count: memory_count,
+                    count: turns_before,
                 },
-                skill_trigger: SkillTrigger::NudgeThreshold { count: skill_count },
+                skill_trigger: SkillTrigger::NudgeThreshold {
+                    count: iterations_before,
+                },
             }
         } else if memory_due {
-            let count = match memory_nudge {
-                NudgeResult::SoftNudge { count } | NudgeResult::HardNudge { count } => count,
-                _ => 0,
-            };
             LearningAction::MemoryReview {
-                trigger: MemoryTrigger::NudgeThreshold { count },
+                trigger: MemoryTrigger::NudgeThreshold {
+                    count: turns_before,
+                },
             }
         } else if skill_due {
-            let count = match skill_nudge {
-                NudgeResult::SoftNudge { count } | NudgeResult::HardNudge { count } => count,
-                _ => 0,
-            };
             LearningAction::SkillReview {
-                trigger: SkillTrigger::NudgeThreshold { count },
+                trigger: SkillTrigger::NudgeThreshold {
+                    count: iterations_before,
+                },
             }
         } else {
             return existing_action.cloned().unwrap_or(LearningAction::Skip);
         };
 
-        // Reset counters for triggered nudge types
-        if memory_due {
-            engine.reset_memory();
-        }
-        if skill_due {
-            engine.reset_skill();
-        }
+        // Note: counters are already reset by check_memory_nudge()/check_skill_nudge()
+        // when they trigger, so no additional reset needed here.
 
         // If there's an existing action, merge/upgrade
         match (&new_action, existing_action) {
@@ -258,6 +249,8 @@ impl LearningCoordinator {
         }
 
         let mut engine = self.nudge_engine.lock().unwrap_or_else(recover_mutex);
+        // Capture count before check resets it
+        let turns_before = engine.turns_since_memory();
         let memory_nudge = engine.check_memory_nudge();
         let memory_due = memory_nudge != NudgeResult::NoNudge && has_memory_store;
 
@@ -269,13 +262,10 @@ impl LearningCoordinator {
             return None;
         }
 
-        let count = match memory_nudge {
-            NudgeResult::SoftNudge { count } | NudgeResult::HardNudge { count } => count,
-            _ => 0,
-        };
-
-        engine.reset_memory();
-        Some(MemoryTrigger::NudgeThreshold { count })
+        // Use pre-captured count (check_memory_nudge already reset the counter)
+        Some(MemoryTrigger::NudgeThreshold {
+            count: turns_before,
+        })
     }
 
     /// Check skill nudge only (called each iteration)
@@ -292,6 +282,8 @@ impl LearningCoordinator {
         }
 
         let mut engine = self.nudge_engine.lock().unwrap_or_else(recover_mutex);
+        // Capture count before check resets it
+        let iterations_before = engine.iterations_since_skill();
         let skill_nudge = engine.check_skill_nudge();
         let skill_due = skill_nudge != NudgeResult::NoNudge && has_skill_tool;
 
@@ -309,13 +301,10 @@ impl LearningCoordinator {
             return None;
         }
 
-        let count = match skill_nudge {
-            NudgeResult::SoftNudge { count } | NudgeResult::HardNudge { count } => count,
-            _ => 0,
-        };
-
-        engine.reset_skill();
-        Some(SkillTrigger::NudgeThreshold { count })
+        // Use pre-captured count (check_skill_nudge already reset the counter)
+        Some(SkillTrigger::NudgeThreshold {
+            count: iterations_before,
+        })
     }
 
     /// Reset skill counter after a skill write tool is used

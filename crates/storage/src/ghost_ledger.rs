@@ -721,10 +721,21 @@ impl GhostLedger {
     }
 
     fn latest_episode_field(&self, field: &str) -> Result<Option<String>> {
+        // Whitelist allowed field names to prevent SQL injection
+        let column = match field {
+            "status" => "status",
+            "boundary_kind" => "boundary_kind",
+            _ => {
+                return Err(Error::Storage(format!(
+                    "Invalid field name for latest_episode_field: {}",
+                    field
+                )))
+            }
+        };
         let conn = self.lock_conn()?;
         let sql = format!(
             "SELECT {} FROM episodes ORDER BY created_at DESC, id DESC LIMIT 1",
-            field
+            column
         );
         conn.query_row(&sql, [], |row| row.get::<_, String>(0))
             .optional()

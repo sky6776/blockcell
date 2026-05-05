@@ -81,11 +81,9 @@ pub(crate) fn build_memory_context_block(
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
-    let truncated = text.chars().take(max_chars).collect::<String>();
-    if text.chars().count() > max_chars {
-        format!("{truncated}...")
-    } else {
-        truncated
+    match text.char_indices().nth(max_chars) {
+        Some((idx, _)) => format!("{}...", &text[..idx]),
+        None => text.to_string(),
     }
 }
 

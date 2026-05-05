@@ -3189,6 +3189,7 @@ impl AgentRuntime {
                 self.paths.clone(),
                 Arc::clone(&self.provider_pool),
                 8,
+                self.config.clone(),
             );
         }
     }

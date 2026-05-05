@@ -47,8 +47,9 @@ pub async fn run_background_review_for_episode(
     paths: &Paths,
     provider_pool: Arc<ProviderPool>,
     episode_id: &str,
+    config: &Config,
+    ledger: &GhostLedger,
 ) -> Result<GhostBackgroundReviewOutcome> {
-    let ledger = GhostLedger::open(&paths.ghost_ledger_db())?;
     let Some(episode) = ledger.get_episode(episode_id)? else {
         return Err(Error::NotFound(format!(
             "Ghost episode not found for background review: {}",
@@ -62,7 +63,7 @@ pub async fn run_background_review_for_episode(
     let Some((provider_idx, provider)) = provider_pool.acquire() else {
         metrics.record_review_failed();
         return record_failed_review_run(
-            &ledger,
+            ledger,
             episode_id,
             "No provider available for ghost background review",
             None,
@@ -70,7 +71,7 @@ pub async fn run_background_review_for_episode(
         );
     };
 
-    match run_restricted_review_tool_loop(paths, provider.as_ref(), &snapshot).await {
+    match run_restricted_review_tool_loop(paths, provider.as_ref(), &snapshot, config).await {
         Ok(loop_outcome) if loop_outcome.stopped && all_tool_actions_succeeded(&loop_outcome) => {
             provider_pool.report(provider_idx, CallResult::Success);
             let learning_feedback = summarize_learning_feedback(&loop_outcome.actions);
@@ -103,7 +104,7 @@ pub async fn run_background_review_for_episode(
                 "Restricted ghost review tool loop exceeded max rounds"
             };
             record_failed_review_run(
-                &ledger,
+                ledger,
                 episode_id,
                 error,
                 None,
@@ -125,7 +126,7 @@ pub async fn run_background_review_for_episode(
             );
             provider_pool.report(provider_idx, ProviderPool::classify_error(&err.to_string()));
             metrics.record_review_failed();
-            record_failed_review_run(&ledger, episode_id, &err.to_string(), None, None)
+            record_failed_review_run(ledger, episode_id, &err.to_string(), None, None)
         }
     }
 }
@@ -134,9 +135,29 @@ pub fn spawn_background_review_for_episode(
     paths: Paths,
     provider_pool: Arc<ProviderPool>,
     episode_id: String,
+    config: Config,
 ) {
     tokio::spawn(async move {
-        match run_background_review_for_episode(&paths, provider_pool, &episode_id).await {
+        let ledger = match GhostLedger::open(&paths.ghost_ledger_db()) {
+            Ok(l) => l,
+            Err(err) => {
+                warn!(
+                    episode_id = %episode_id,
+                    error = %err,
+                    "Failed to open GhostLedger for background review"
+                );
+                return;
+            }
+        };
+        match run_background_review_for_episode(
+            &paths,
+            provider_pool,
+            &episode_id,
+            &config,
+            &ledger,
+        )
+        .await
+        {
             Ok(outcome) => {
                 info!(
                     episode_id = %episode_id,
@@ -160,6 +181,7 @@ pub async fn run_pending_background_reviews(
     paths: &Paths,
     provider_pool: Arc<ProviderPool>,
     limit: usize,
+    config: &Config,
 ) -> Result<Vec<GhostBackgroundReviewOutcome>> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -170,8 +192,14 @@ pub async fn run_pending_background_reviews(
     let mut outcomes = Vec::with_capacity(episodes.len());
     for episode in episodes {
         outcomes.push(
-            run_background_review_for_episode(paths, Arc::clone(&provider_pool), &episode.id)
-                .await?,
+            run_background_review_for_episode(
+                paths,
+                Arc::clone(&provider_pool),
+                &episode.id,
+                config,
+                &ledger,
+            )
+            .await?,
         );
     }
     Ok(outcomes)
@@ -181,13 +209,14 @@ pub fn spawn_pending_background_reviews(
     paths: Paths,
     provider_pool: Arc<ProviderPool>,
     limit: usize,
+    config: Config,
 ) {
     if limit == 0 {
         return;
     }
 
     tokio::spawn(async move {
-        match run_pending_background_reviews(&paths, provider_pool, limit).await {
+        match run_pending_background_reviews(&paths, provider_pool, limit, &config).await {
             Ok(outcomes) if !outcomes.is_empty() => {
                 info!(
                     reviewed_count = outcomes.len(),
@@ -209,6 +238,7 @@ async fn run_restricted_review_tool_loop(
     paths: &Paths,
     provider: &dyn blockcell_providers::Provider,
     snapshot: &GhostEpisodeSnapshot,
+    config: &Config,
 ) -> Result<GhostReviewToolLoopOutcome> {
     let registry = restricted_review_tool_registry();
     let tools = registry.get_filtered_schemas(REVIEW_ALLOWED_TOOLS);
@@ -247,7 +277,7 @@ async fn run_restricted_review_tool_loop(
             let result = registry
                 .execute(
                     &call.name,
-                    review_tool_context(paths, snapshot)?,
+                    review_tool_context(paths, snapshot, config)?,
                     call.arguments.clone(),
                 )
                 .await;
@@ -346,7 +376,11 @@ fn build_restricted_review_messages(snapshot: &GhostEpisodeSnapshot) -> Vec<Chat
     ]
 }
 
-fn review_tool_context(paths: &Paths, snapshot: &GhostEpisodeSnapshot) -> Result<ToolContext> {
+fn review_tool_context(
+    paths: &Paths,
+    snapshot: &GhostEpisodeSnapshot,
+    config: &Config,
+) -> Result<ToolContext> {
     Ok(ToolContext {
         workspace: paths.workspace(),
         builtin_skills_dir: Some(paths.builtin_skills_dir()),
@@ -356,7 +390,7 @@ fn review_tool_context(paths: &Paths, snapshot: &GhostEpisodeSnapshot) -> Result
         account_id: None,
         sender_id: None,
         chat_id: "ghost_background_review".to_string(),
-        config: Config::default(),
+        config: config.clone(),
         permissions: PermissionSet::new(),
         task_manager: None,
         memory_store: None,
@@ -469,11 +503,9 @@ fn search_score(chunk: &str, tokens: &[String]) -> usize {
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
-    let truncated = text.chars().take(max_chars).collect::<String>();
-    if text.chars().count() > max_chars {
-        format!("{truncated}...")
-    } else {
-        truncated
+    match text.char_indices().nth(max_chars) {
+        Some((idx, _)) => format!("{}...", &text[..idx]),
+        None => text.to_string(),
     }
 }
 
@@ -869,9 +901,15 @@ mod tests {
         let provider_pool =
             ProviderPool::from_single_provider("test/mock", "test", provider.clone());
 
-        let outcome = run_background_review_for_episode(&paths, provider_pool, &episode_id)
-            .await
-            .expect("run background review");
+        let outcome = run_background_review_for_episode(
+            &paths,
+            provider_pool,
+            &episode_id,
+            &Config::default(),
+            &GhostLedger::open(&paths.ghost_ledger_db()).expect("open ledger"),
+        )
+        .await
+        .expect("run background review");
 
         assert_eq!(outcome.status, "completed");
         let mut first_seen = provider.seen_tools.lock().unwrap()[0].clone();
@@ -918,9 +956,15 @@ mod tests {
         let provider_pool =
             ProviderPool::from_single_provider("test/mock", "test", provider.clone());
 
-        let outcome = run_background_review_for_episode(&paths, provider_pool, &episode_id)
-            .await
-            .expect("run background review");
+        let outcome = run_background_review_for_episode(
+            &paths,
+            provider_pool,
+            &episode_id,
+            &Config::default(),
+            &GhostLedger::open(&paths.ghost_ledger_db()).expect("open ledger"),
+        )
+        .await
+        .expect("run background review");
 
         assert_eq!(outcome.status, "completed");
         assert_eq!(provider.review_calls.load(Ordering::SeqCst), 1);
@@ -945,9 +989,15 @@ mod tests {
         let provider_pool =
             ProviderPool::from_single_provider("test/mock", "test", provider.clone());
 
-        let outcome = run_background_review_for_episode(&paths, provider_pool, &episode_id)
-            .await
-            .expect("run background review");
+        let outcome = run_background_review_for_episode(
+            &paths,
+            provider_pool,
+            &episode_id,
+            &Config::default(),
+            &GhostLedger::open(&paths.ghost_ledger_db()).expect("open ledger"),
+        )
+        .await
+        .expect("run background review");
 
         assert_eq!(outcome.status, "completed");
         let durable_memory = std::fs::read_to_string(paths.memory_md()).expect("read MEMORY.md");
@@ -977,9 +1027,15 @@ mod tests {
         let provider_pool =
             ProviderPool::from_single_provider("test/mock", "test", provider.clone());
 
-        let outcome = run_background_review_for_episode(&paths, provider_pool, &episode_id)
-            .await
-            .expect("record failed review");
+        let outcome = run_background_review_for_episode(
+            &paths,
+            provider_pool,
+            &episode_id,
+            &Config::default(),
+            &GhostLedger::open(&paths.ghost_ledger_db()).expect("open ledger"),
+        )
+        .await
+        .expect("record failed review");
 
         assert_eq!(outcome.status, "failed");
         assert_eq!(provider.review_calls.load(Ordering::SeqCst), 1);
@@ -1004,9 +1060,15 @@ mod tests {
         let provider_pool =
             ProviderPool::from_single_provider("test/mock", "test", provider.clone());
 
-        let outcome = run_background_review_for_episode(&paths, provider_pool, &episode_id)
-            .await
-            .expect("record failed review");
+        let outcome = run_background_review_for_episode(
+            &paths,
+            provider_pool,
+            &episode_id,
+            &Config::default(),
+            &GhostLedger::open(&paths.ghost_ledger_db()).expect("open ledger"),
+        )
+        .await
+        .expect("record failed review");
 
         assert_eq!(outcome.status, "failed");
         let ledger = GhostLedger::open(&paths.ghost_ledger_db()).expect("open ghost ledger");
@@ -1039,9 +1101,15 @@ mod tests {
         let provider_pool =
             ProviderPool::from_single_provider("test/mock", "test", provider.clone());
 
-        let outcome = run_background_review_for_episode(&paths, provider_pool, &episode_id)
-            .await
-            .expect("record failed review");
+        let outcome = run_background_review_for_episode(
+            &paths,
+            provider_pool,
+            &episode_id,
+            &Config::default(),
+            &GhostLedger::open(&paths.ghost_ledger_db()).expect("open ledger"),
+        )
+        .await
+        .expect("record failed review");
 
         assert_eq!(outcome.status, "failed");
         assert!(!paths.user_md().exists());
@@ -1066,9 +1134,15 @@ mod tests {
         let provider_pool =
             ProviderPool::from_single_provider("test/mock", "test", provider.clone());
 
-        let outcome = run_background_review_for_episode(&paths, provider_pool, &episode_id)
-            .await
-            .expect("record failed review");
+        let outcome = run_background_review_for_episode(
+            &paths,
+            provider_pool,
+            &episode_id,
+            &Config::default(),
+            &GhostLedger::open(&paths.ghost_ledger_db()).expect("open ledger"),
+        )
+        .await
+        .expect("record failed review");
 
         assert_eq!(outcome.status, "failed");
         assert_eq!(provider.review_calls.load(Ordering::SeqCst), 8);
@@ -1098,9 +1172,15 @@ mod tests {
         let provider_pool =
             ProviderPool::from_single_provider("test/mock", "test", provider.clone());
 
-        let outcome = run_background_review_for_episode(&paths, provider_pool, &episode_id)
-            .await
-            .expect("run background review");
+        let outcome = run_background_review_for_episode(
+            &paths,
+            provider_pool,
+            &episode_id,
+            &Config::default(),
+            &GhostLedger::open(&paths.ghost_ledger_db()).expect("open ledger"),
+        )
+        .await
+        .expect("run background review");
 
         assert_eq!(outcome.status, "completed");
         assert_eq!(provider.review_calls.load(Ordering::SeqCst), 8);
